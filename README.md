@@ -89,6 +89,9 @@ chmod 755 /tmp/mpc_plugin_manager_fb
 2. **`/proc/self/exe`**: Otherwise, the directory containing the running executable is used.
 3. **`getcwd()`**: Fallback to the current working directory.
 
+#### Automatic `<SynthContentLocations>` Verification on Startup:
+Because the Akai MPC OS application periodically cleans up `MPC.settings`, the Plugin Manager automatically verifies on every launch (`ConfigParser::ensureManagerSynthsInMpcSettings()`) that `<Location><ManagerRootDir>/Synths</Location>` is present inside `<VALUE name="SynthContentLocations"><SynthContentLocations>`. If missing, it creates a human-readable backup (`MPC.settings.bak-YYYYMMDDHHMMSS`), validates the XML structure, and restores the `Synths` location so plugins stored on the USB drive remain visible to the MPC.
+
 ---
 
 ## 4. Online Catalog Refresh (`REFRESH`) & `MPC.settings` Integrity Verification
@@ -99,8 +102,8 @@ Pressing the **`[REFRESH]`** button in the top bar performs a complete online sy
 2. **Download All Thumbnails**:
    - Automatically downloads all plugin thumbnails into `plugins/<plugin-id>/thumb.png` during the refresh operation so every card and detail view renders its real screenshot offline.
 3. **Verification of Previously Installed Plugins in `MPC.settings`**:
-   - For every plugin registered or previously detected as installed, scans `/media/az01-internal/Settings/MPC/MPC.settings` inside `<VALUE name="pluginList-arm"><KNOWNPLUGINS><PLUGIN ... file="..."/>` and verifies that the referenced `.so` binary exists on disk so the plugin and its skin load properly.
-   - **Auto-Relocation**: If the `.so` file is missing at the registered path, the manager searches all directories listed in `<SynthContentLocations>`. If the `.so` file is found in another `SynthContentLocations` path, `MPC.settings` is backed up (`Gold Rule`), the `file="..."` attribute is automatically updated to the valid path, and a `[WARNING]` is logged.
+   - For every plugin registered or previously detected as installed, scans `/media/az01-internal/Settings/MPC/MPC.settings` inside `<VALUE name="pluginList-arm"><KNOWNPLUGINS><PLUGIN ... file="..."/>` (supporting both single-line and JUCE multi-line `<PLUGIN>` tags) and verifies that the referenced `.so` binary exists on disk so the plugin and its skin load properly.
+   - **Auto-Relocation**: If the `.so` file is missing at the registered path, the manager searches all directories listed in `<SynthContentLocations>`. If the `.so` file is found in another `SynthContentLocations` path, `MPC.settings` is backed up (`MPC.settings.bak-YYYYMMDDHHMMSS`), the `file="..."` attribute is automatically updated to the valid path, and a `[WARNING]` is logged.
    - **Broken Installation Detection**: If the `.so` file cannot be found in any `SynthContentLocations` directory, the plugin installation is marked as **`BROKEN`** (`! BROKEN (.SO MISSING)`).
 
 ---
@@ -109,8 +112,8 @@ Pressing the **`[REFRESH]`** button in the top bar performs a complete online sy
 
 1. **Target Drive Selection**:
    Scans `SynthContentLocations` from `MPC.settings`, mounted drives under `/media/*/Synths`, and `<PLG_MAN_DIR>/Synths`, displaying available free space for each location.
-2. **Step 1/4 — Safety Backup (Gold Rule)**:
-   Creates a timestamped backup `MPC.settings.bak-<timestamp>` before any modification.
+2. **Step 1/4 — Safety Backup (Gold Rule — `YYYYMMDDHHMMSS`)**:
+   Creates a human-readable timestamped backup `MPC.settings.bak-YYYYMMDDHHMMSS` before any modification, and validates the XML document structure before atomically replacing `MPC.settings`.
 3. **Step 2/4 — `SynthContentLocations` Registration**:
    Ensures the selected `Synths` directory is registered inside `<VALUE name="SynthContentLocations">` in `MPC.settings`.
 4. **Step 3/4 — Native Download via `libcurl.so.4` & Archive Extraction**:
