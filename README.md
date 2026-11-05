@@ -1,5 +1,7 @@
 # The KikGen Labs — MPC & Force Standalone Plugin Manager
 
+<img width="954" height="598" alt="image" src="https://github.com/user-attachments/assets/46fcd497-ada7-407e-bf25-5c4532bf7548" />
+
 Standalone VST2 / Addin / Patch manager for **Akai MPC Live / Live II / One / One+ / X / Key 37 / Key 61 / Force** written in native **C++17** (Linux Framebuffer `/dev/fb0`, ALSA RawMIDI & `evdev` Touchscreen, zero external build dependencies).
 
 ---
