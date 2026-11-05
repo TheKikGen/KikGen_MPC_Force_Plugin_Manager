@@ -833,8 +833,10 @@ struct HuffTree {
 
 static bool inflateZlib(const std::vector<uint8_t>& compressed, std::vector<uint8_t>& out) {
     if (compressed.size() < 6) return false;
-    // Skip 2-byte zlib header
-    BitStream bs{compressed.data() + 2, compressed.size() - 6, 0, 0};
+    // Skip 2-byte zlib header (+4 bytes if FDICT flag is set)
+    size_t hdrLen = ((compressed[1] & 0x20) != 0) ? 6 : 2;
+    if (compressed.size() <= hdrLen) return false;
+    BitStream bs{compressed.data() + hdrLen, compressed.size() - hdrLen, 0, 0};
 
     static const int lenBase[29] = {
         3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
@@ -990,15 +992,18 @@ static bool decodePNG(const std::string& path, DecodedImage& outImg) {
         pos += 12 + len;
     }
 
-    if (width <= 0 || height <= 0 || bitDepth != 8 || interlace != 0 || idat.empty()) return false;
-    int bpp = (colorType == 6) ? 4 : (colorType == 2 ? 3 : (colorType == 4 ? 2 : (colorType == 0 || colorType == 3 ? 1 : 0)));
-    if (bpp == 0) return false;
+    if (width <= 0 || height <= 0 || idat.empty() || interlace != 0) return false;
+    if (bitDepth != 1 && bitDepth != 2 && bitDepth != 4 && bitDepth != 8 && bitDepth != 16) return false;
+    int channels = (colorType == 6) ? 4 : (colorType == 2 ? 3 : (colorType == 4 ? 2 : (colorType == 0 || colorType == 3 ? 1 : 0)));
+    if (channels == 0) return false;
+
+    size_t bitsPerPixel = static_cast<size_t>(channels) * static_cast<size_t>(bitDepth);
+    size_t filterBpp = (bitsPerPixel + 7) / 8;
+    size_t stride = (static_cast<size_t>(width) * bitsPerPixel + 7) / 8;
 
     std::vector<uint8_t> raw;
-    raw.reserve(static_cast<size_t>(height) * (width * bpp + 1));
+    raw.reserve(static_cast<size_t>(height) * (stride + 1));
     if (!inflateZlib(idat, raw)) return false;
-
-    size_t stride = static_cast<size_t>(width) * bpp;
     if (raw.size() < static_cast<size_t>(height) * (stride + 1)) return false;
 
     std::vector<uint8_t> recon(static_cast<size_t>(height) * stride, 0);
@@ -1009,9 +1014,9 @@ static bool decodePNG(const std::string& path, DecodedImage& outImg) {
         const uint8_t* prev = (y > 0) ? &recon[(y - 1) * stride] : nullptr;
 
         for (size_t i = 0; i < stride; ++i) {
-            uint8_t a = (i >= static_cast<size_t>(bpp)) ? dst[i - bpp] : 0;
+            uint8_t a = (i >= filterBpp) ? dst[i - filterBpp] : 0;
             uint8_t b = prev ? prev[i] : 0;
-            uint8_t c = (prev && i >= static_cast<size_t>(bpp)) ? prev[i - bpp] : 0;
+            uint8_t c = (prev && i >= filterBpp) ? prev[i - filterBpp] : 0;
             switch (filter) {
                 case 0: dst[i] = src[i]; break;
                 case 1: dst[i] = static_cast<uint8_t>(src[i] + a); break;
@@ -1027,30 +1032,66 @@ static bool decodePNG(const std::string& path, DecodedImage& outImg) {
     outImg.height = height;
     outImg.rgb.resize(static_cast<size_t>(width) * height * 3);
 
-    for (int i = 0; i < width * height; ++i) {
-        uint8_t r = 18, g = 18, b = 22;
-        if (colorType == 6) {
-            uint8_t a = recon[i * 4 + 3];
-            r = static_cast<uint8_t>((recon[i * 4]     * a + 18 * (255 - a)) / 255);
-            g = static_cast<uint8_t>((recon[i * 4 + 1] * a + 18 * (255 - a)) / 255);
-            b = static_cast<uint8_t>((recon[i * 4 + 2] * a + 22 * (255 - a)) / 255);
-        } else if (colorType == 2) {
-            r = recon[i * 3];
-            g = recon[i * 3 + 1];
-            b = recon[i * 3 + 2];
-        } else if (colorType == 3) {
-            int pidx = recon[i] * 3;
-            if (pidx + 2 < static_cast<int>(palette.size())) {
-                r = palette[pidx];
-                g = palette[pidx + 1];
-                b = palette[pidx + 2];
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* row = &recon[y * stride];
+        for (int x = 0; x < width; ++x) {
+            uint8_t r = 18, g = 18, b = 22;
+            if (bitDepth == 8) {
+                if (colorType == 6) {
+                    uint8_t a = row[x * 4 + 3];
+                    r = static_cast<uint8_t>((row[x * 4]     * a + 18 * (255 - a)) / 255);
+                    g = static_cast<uint8_t>((row[x * 4 + 1] * a + 18 * (255 - a)) / 255);
+                    b = static_cast<uint8_t>((row[x * 4 + 2] * a + 22 * (255 - a)) / 255);
+                } else if (colorType == 2) {
+                    r = row[x * 3];
+                    g = row[x * 3 + 1];
+                    b = row[x * 3 + 2];
+                } else if (colorType == 3) {
+                    int pidx = row[x] * 3;
+                    if (pidx + 2 < static_cast<int>(palette.size())) {
+                        r = palette[pidx];
+                        g = palette[pidx + 1];
+                        b = palette[pidx + 2];
+                    }
+                } else if (colorType == 0 || colorType == 4) {
+                    r = g = b = row[x * channels];
+                }
+            } else if (bitDepth == 16) {
+                if (colorType == 6) {
+                    uint8_t a = row[(x * 4 + 3) * 2];
+                    r = static_cast<uint8_t>((row[(x * 4)     * 2] * a + 18 * (255 - a)) / 255);
+                    g = static_cast<uint8_t>((row[(x * 4 + 1) * 2] * a + 18 * (255 - a)) / 255);
+                    b = static_cast<uint8_t>((row[(x * 4 + 2) * 2] * a + 22 * (255 - a)) / 255);
+                } else if (colorType == 2) {
+                    r = row[(x * 3)     * 2];
+                    g = row[(x * 3 + 1) * 2];
+                    b = row[(x * 3 + 2) * 2];
+                } else {
+                    r = g = b = row[(x * channels) * 2];
+                }
+            } else {
+                // Sub-byte bitDepth (1, 2, 4) for colorType 3 (indexed palette) or 0 (grayscale)
+                uint8_t v = 0;
+                if (bitDepth == 4) v = (row[x >> 1] >> ((1 - (x & 1)) * 4)) & 0x0F;
+                else if (bitDepth == 2) v = (row[x >> 2] >> ((3 - (x & 3)) * 2)) & 0x03;
+                else if (bitDepth == 1) v = (row[x >> 3] >> (7 - (x & 7))) & 0x01;
+                if (colorType == 3) {
+                    int pidx = static_cast<int>(v) * 3;
+                    if (pidx + 2 < static_cast<int>(palette.size())) {
+                        r = palette[pidx];
+                        g = palette[pidx + 1];
+                        b = palette[pidx + 2];
+                    }
+                } else {
+                    int scale = (bitDepth == 4) ? 17 : (bitDepth == 2 ? 85 : 255);
+                    r = g = b = static_cast<uint8_t>(v * scale);
+                }
             }
-        } else if (colorType == 0 || colorType == 4) {
-            r = g = b = recon[i * bpp];
+            size_t outIdx = (static_cast<size_t>(y) * width + x) * 3;
+            outImg.rgb[outIdx]     = r;
+            outImg.rgb[outIdx + 1] = g;
+            outImg.rgb[outIdx + 2] = b;
         }
-        outImg.rgb[i * 3]     = r;
-        outImg.rgb[i * 3 + 1] = g;
-        outImg.rgb[i * 3 + 2] = b;
     }
     outImg.valid = true;
     return true;
@@ -1109,39 +1150,24 @@ bool DrmFramebufferCanvas::drawImageRounded(
 
     auto it = image_cache_.find(cacheKey);
     if (it == image_cache_.end()) {
+        (void)fallbackUrl;
         DecodedImage decoded;
-        // 1. Try local path (e.g. plugins/<id>/thumb.ppm or thumb.png)
-        if (!loadImageFile(path, decoded)) {
-            if (!pluginId.empty()) {
-                std::string pngLocal = "plugins/" + pluginId + "/thumb.png";
-                struct stat stPng;
-                if (stat(pngLocal.c_str(), &stPng) == 0 && stPng.st_size == 0) {
-                    unlink(pngLocal.c_str());
-                }
-                if (!loadImageFile(pngLocal, decoded)) {
-                    std::string ppmLocal = "plugins/" + pluginId + "/thumb.ppm";
-                    loadImageFile(ppmLocal, decoded);
-                }
+        // 1. Always try real downloaded PNG screenshot (plugins/<id>/thumb.png) first
+        if (!pluginId.empty()) {
+            std::string pngLocal = "plugins/" + pluginId + "/thumb.png";
+            struct stat stPng;
+            if (stat(pngLocal.c_str(), &stPng) == 0 && stPng.st_size == 0) {
+                unlink(pngLocal.c_str());
             }
+            loadImageFile(pngLocal, decoded);
         }
-        // 2. If not yet on disk, kick off a non-blocking background fetch into plugins/<id>/thumb.png
-        //    using "/proc/self/exe --fetch" (which dynamically loads libcurl.so.4 / libcurl.so.4.8.0).
-        if (!decoded.valid && !pluginId.empty() && !fallbackUrl.empty()) {
-            static std::unordered_map<std::string, bool> s_bgThumbRequested;
-            if (!s_bgThumbRequested[pluginId]) {
-                s_bgThumbRequested[pluginId] = true;
-                std::string plugDir = "plugins/" + pluginId;
-                mkdir("plugins", 0755);
-                mkdir(plugDir.c_str(), 0755);
-                std::string localPng = plugDir + "/thumb.png";
-                std::string tmpPng = "/tmp/tkgl_thumb_" + pluginId + ".png";
-                std::string bgCmd = "(rm -f \"" + tmpPng + "\"; "
-                    "/proc/self/exe --fetch \"" + fallbackUrl + "\" \"" + tmpPng + "\" 2>/dev/null; "
-                    "if [ ! -s \"" + tmpPng + "\" ] && command -v wget >/dev/null 2>&1; then wget --no-check-certificate -q -O \"" + tmpPng + "\" \"" + fallbackUrl + "\" 2>/dev/null || wget -q -O \"" + tmpPng + "\" \"" + fallbackUrl + "\" 2>/dev/null; fi; "
-                    "if [ -s \"" + tmpPng + "\" ]; then mv -f \"" + tmpPng + "\" \"" + localPng + "\"; else rm -f \"" + tmpPng + "\"; fi) >/dev/null 2>&1 &";
-                int rc = std::system(bgCmd.c_str());
-                (void)rc;
-            }
+        // 2. Fallback to explicit path or local thumb.ppm if thumb.png is not yet downloaded
+        if (!decoded.valid && !path.empty()) {
+            loadImageFile(path, decoded);
+        }
+        if (!decoded.valid && !pluginId.empty()) {
+            std::string ppmLocal = "plugins/" + pluginId + "/thumb.ppm";
+            loadImageFile(ppmLocal, decoded);
         }
         if (decoded.valid) {
             image_cache_[cacheKey] = decoded;

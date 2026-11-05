@@ -53,6 +53,7 @@ private:
     bool                               execFinished_        = false;
     int                                animFrame_           = 0;
     bool                               isRefreshing_        = false;
+    bool                               isOnline_            = false;
     std::vector<config::SynthLocation> synthLocations_;
     int                                selectedSynthLocIdx_ = 0;
 

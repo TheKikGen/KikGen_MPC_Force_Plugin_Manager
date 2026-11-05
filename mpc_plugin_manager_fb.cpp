@@ -1015,8 +1015,10 @@ struct HuffTree {
 
 static bool inflateZlib(const std::vector<uint8_t>& compressed, std::vector<uint8_t>& out) {
     if (compressed.size() < 6) return false;
-    // Skip 2-byte zlib header
-    BitStream bs{compressed.data() + 2, compressed.size() - 6, 0, 0};
+    // Skip 2-byte zlib header (+4 bytes if FDICT flag is set)
+    size_t hdrLen = ((compressed[1] & 0x20) != 0) ? 6 : 2;
+    if (compressed.size() <= hdrLen) return false;
+    BitStream bs{compressed.data() + hdrLen, compressed.size() - hdrLen, 0, 0};
 
     static const int lenBase[29] = {
         3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
@@ -1172,15 +1174,18 @@ static bool decodePNG(const std::string& path, DecodedImage& outImg) {
         pos += 12 + len;
     }
 
-    if (width <= 0 || height <= 0 || bitDepth != 8 || interlace != 0 || idat.empty()) return false;
-    int bpp = (colorType == 6) ? 4 : (colorType == 2 ? 3 : (colorType == 4 ? 2 : (colorType == 0 || colorType == 3 ? 1 : 0)));
-    if (bpp == 0) return false;
+    if (width <= 0 || height <= 0 || idat.empty() || interlace != 0) return false;
+    if (bitDepth != 1 && bitDepth != 2 && bitDepth != 4 && bitDepth != 8 && bitDepth != 16) return false;
+    int channels = (colorType == 6) ? 4 : (colorType == 2 ? 3 : (colorType == 4 ? 2 : (colorType == 0 || colorType == 3 ? 1 : 0)));
+    if (channels == 0) return false;
+
+    size_t bitsPerPixel = static_cast<size_t>(channels) * static_cast<size_t>(bitDepth);
+    size_t filterBpp = (bitsPerPixel + 7) / 8;
+    size_t stride = (static_cast<size_t>(width) * bitsPerPixel + 7) / 8;
 
     std::vector<uint8_t> raw;
-    raw.reserve(static_cast<size_t>(height) * (width * bpp + 1));
+    raw.reserve(static_cast<size_t>(height) * (stride + 1));
     if (!inflateZlib(idat, raw)) return false;
-
-    size_t stride = static_cast<size_t>(width) * bpp;
     if (raw.size() < static_cast<size_t>(height) * (stride + 1)) return false;
 
     std::vector<uint8_t> recon(static_cast<size_t>(height) * stride, 0);
@@ -1191,9 +1196,9 @@ static bool decodePNG(const std::string& path, DecodedImage& outImg) {
         const uint8_t* prev = (y > 0) ? &recon[(y - 1) * stride] : nullptr;
 
         for (size_t i = 0; i < stride; ++i) {
-            uint8_t a = (i >= static_cast<size_t>(bpp)) ? dst[i - bpp] : 0;
+            uint8_t a = (i >= filterBpp) ? dst[i - filterBpp] : 0;
             uint8_t b = prev ? prev[i] : 0;
-            uint8_t c = (prev && i >= static_cast<size_t>(bpp)) ? prev[i - bpp] : 0;
+            uint8_t c = (prev && i >= filterBpp) ? prev[i - filterBpp] : 0;
             switch (filter) {
                 case 0: dst[i] = src[i]; break;
                 case 1: dst[i] = static_cast<uint8_t>(src[i] + a); break;
@@ -1209,30 +1214,66 @@ static bool decodePNG(const std::string& path, DecodedImage& outImg) {
     outImg.height = height;
     outImg.rgb.resize(static_cast<size_t>(width) * height * 3);
 
-    for (int i = 0; i < width * height; ++i) {
-        uint8_t r = 18, g = 18, b = 22;
-        if (colorType == 6) {
-            uint8_t a = recon[i * 4 + 3];
-            r = static_cast<uint8_t>((recon[i * 4]     * a + 18 * (255 - a)) / 255);
-            g = static_cast<uint8_t>((recon[i * 4 + 1] * a + 18 * (255 - a)) / 255);
-            b = static_cast<uint8_t>((recon[i * 4 + 2] * a + 22 * (255 - a)) / 255);
-        } else if (colorType == 2) {
-            r = recon[i * 3];
-            g = recon[i * 3 + 1];
-            b = recon[i * 3 + 2];
-        } else if (colorType == 3) {
-            int pidx = recon[i] * 3;
-            if (pidx + 2 < static_cast<int>(palette.size())) {
-                r = palette[pidx];
-                g = palette[pidx + 1];
-                b = palette[pidx + 2];
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* row = &recon[y * stride];
+        for (int x = 0; x < width; ++x) {
+            uint8_t r = 18, g = 18, b = 22;
+            if (bitDepth == 8) {
+                if (colorType == 6) {
+                    uint8_t a = row[x * 4 + 3];
+                    r = static_cast<uint8_t>((row[x * 4]     * a + 18 * (255 - a)) / 255);
+                    g = static_cast<uint8_t>((row[x * 4 + 1] * a + 18 * (255 - a)) / 255);
+                    b = static_cast<uint8_t>((row[x * 4 + 2] * a + 22 * (255 - a)) / 255);
+                } else if (colorType == 2) {
+                    r = row[x * 3];
+                    g = row[x * 3 + 1];
+                    b = row[x * 3 + 2];
+                } else if (colorType == 3) {
+                    int pidx = row[x] * 3;
+                    if (pidx + 2 < static_cast<int>(palette.size())) {
+                        r = palette[pidx];
+                        g = palette[pidx + 1];
+                        b = palette[pidx + 2];
+                    }
+                } else if (colorType == 0 || colorType == 4) {
+                    r = g = b = row[x * channels];
+                }
+            } else if (bitDepth == 16) {
+                if (colorType == 6) {
+                    uint8_t a = row[(x * 4 + 3) * 2];
+                    r = static_cast<uint8_t>((row[(x * 4)     * 2] * a + 18 * (255 - a)) / 255);
+                    g = static_cast<uint8_t>((row[(x * 4 + 1) * 2] * a + 18 * (255 - a)) / 255);
+                    b = static_cast<uint8_t>((row[(x * 4 + 2) * 2] * a + 22 * (255 - a)) / 255);
+                } else if (colorType == 2) {
+                    r = row[(x * 3)     * 2];
+                    g = row[(x * 3 + 1) * 2];
+                    b = row[(x * 3 + 2) * 2];
+                } else {
+                    r = g = b = row[(x * channels) * 2];
+                }
+            } else {
+                // Sub-byte bitDepth (1, 2, 4) for colorType 3 (indexed palette) or 0 (grayscale)
+                uint8_t v = 0;
+                if (bitDepth == 4) v = (row[x >> 1] >> ((1 - (x & 1)) * 4)) & 0x0F;
+                else if (bitDepth == 2) v = (row[x >> 2] >> ((3 - (x & 3)) * 2)) & 0x03;
+                else if (bitDepth == 1) v = (row[x >> 3] >> (7 - (x & 7))) & 0x01;
+                if (colorType == 3) {
+                    int pidx = static_cast<int>(v) * 3;
+                    if (pidx + 2 < static_cast<int>(palette.size())) {
+                        r = palette[pidx];
+                        g = palette[pidx + 1];
+                        b = palette[pidx + 2];
+                    }
+                } else {
+                    int scale = (bitDepth == 4) ? 17 : (bitDepth == 2 ? 85 : 255);
+                    r = g = b = static_cast<uint8_t>(v * scale);
+                }
             }
-        } else if (colorType == 0 || colorType == 4) {
-            r = g = b = recon[i * bpp];
+            size_t outIdx = (static_cast<size_t>(y) * width + x) * 3;
+            outImg.rgb[outIdx]     = r;
+            outImg.rgb[outIdx + 1] = g;
+            outImg.rgb[outIdx + 2] = b;
         }
-        outImg.rgb[i * 3]     = r;
-        outImg.rgb[i * 3 + 1] = g;
-        outImg.rgb[i * 3 + 2] = b;
     }
     outImg.valid = true;
     return true;
@@ -1291,39 +1332,24 @@ bool DrmFramebufferCanvas::drawImageRounded(
 
     auto it = image_cache_.find(cacheKey);
     if (it == image_cache_.end()) {
+        (void)fallbackUrl;
         DecodedImage decoded;
-        // 1. Try local path (e.g. plugins/<id>/thumb.ppm or thumb.png)
-        if (!loadImageFile(path, decoded)) {
-            if (!pluginId.empty()) {
-                std::string pngLocal = "plugins/" + pluginId + "/thumb.png";
-                struct stat stPng;
-                if (stat(pngLocal.c_str(), &stPng) == 0 && stPng.st_size == 0) {
-                    unlink(pngLocal.c_str());
-                }
-                if (!loadImageFile(pngLocal, decoded)) {
-                    std::string ppmLocal = "plugins/" + pluginId + "/thumb.ppm";
-                    loadImageFile(ppmLocal, decoded);
-                }
+        // 1. Always try real downloaded PNG screenshot (plugins/<id>/thumb.png) first
+        if (!pluginId.empty()) {
+            std::string pngLocal = "plugins/" + pluginId + "/thumb.png";
+            struct stat stPng;
+            if (stat(pngLocal.c_str(), &stPng) == 0 && stPng.st_size == 0) {
+                unlink(pngLocal.c_str());
             }
+            loadImageFile(pngLocal, decoded);
         }
-        // 2. If not yet on disk, kick off a non-blocking background fetch into plugins/<id>/thumb.png
-        //    using "/proc/self/exe --fetch" (which dynamically loads libcurl.so.4 / libcurl.so.4.8.0).
-        if (!decoded.valid && !pluginId.empty() && !fallbackUrl.empty()) {
-            static std::unordered_map<std::string, bool> s_bgThumbRequested;
-            if (!s_bgThumbRequested[pluginId]) {
-                s_bgThumbRequested[pluginId] = true;
-                std::string plugDir = "plugins/" + pluginId;
-                mkdir("plugins", 0755);
-                mkdir(plugDir.c_str(), 0755);
-                std::string localPng = plugDir + "/thumb.png";
-                std::string tmpPng = "/tmp/tkgl_thumb_" + pluginId + ".png";
-                std::string bgCmd = "(rm -f \"" + tmpPng + "\"; "
-                    "/proc/self/exe --fetch \"" + fallbackUrl + "\" \"" + tmpPng + "\" 2>/dev/null; "
-                    "if [ ! -s \"" + tmpPng + "\" ] && command -v wget >/dev/null 2>&1; then wget --no-check-certificate -q -O \"" + tmpPng + "\" \"" + fallbackUrl + "\" 2>/dev/null || wget -q -O \"" + tmpPng + "\" \"" + fallbackUrl + "\" 2>/dev/null; fi; "
-                    "if [ -s \"" + tmpPng + "\" ]; then mv -f \"" + tmpPng + "\" \"" + localPng + "\"; else rm -f \"" + tmpPng + "\"; fi) >/dev/null 2>&1 &";
-                int rc = std::system(bgCmd.c_str());
-                (void)rc;
-            }
+        // 2. Fallback to explicit path or local thumb.ppm if thumb.png is not yet downloaded
+        if (!decoded.valid && !path.empty()) {
+            loadImageFile(path, decoded);
+        }
+        if (!decoded.valid && !pluginId.empty()) {
+            std::string ppmLocal = "plugins/" + pluginId + "/thumb.ppm";
+            loadImageFile(ppmLocal, decoded);
         }
         if (decoded.valid) {
             image_cache_[cacheKey] = decoded;
@@ -1502,6 +1528,7 @@ struct LauncherConfig {
     std::string app_title       = "AKAI MPCs PLUGINS MANAGER";
     int         screen_rotation = 270;
     std::string catalog_url     = "https://sd88me.github.io/mpc-vst-plugins/catalog.json";
+    std::string ping_host       = "github.com";
     std::string usb_mount_path  = "/media/AKAI_FORCE_SSD";
     std::string synth_dir_name  = "/media/AKAI_FORCE_SSD/Synth";
     std::string config_path     = "mpc_plugins.conf";
@@ -1513,6 +1540,10 @@ struct LauncherConfig {
 class ConfigParser {
 public:
     static std::string getManagerRootDir();
+    static bool checkInternetReachable(
+        const std::string& pingHost = "github.com",
+        std::vector<std::string>* outLogs = nullptr
+    );
     static bool downloadFile(
         const std::string& url,
         const std::string& destPath,
@@ -1527,6 +1558,7 @@ public:
     static int  executeItemInstall(const LauncherConfig& cfg, const MenuItem& item, const std::string& targetSynthDir, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
     static int  executeItemUninstall(const LauncherConfig& cfg, const MenuItem& item, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
     static int  executeItemCommand(const LauncherConfig& cfg, const MenuItem& item, std::vector<std::string>& outLogs);
+    static void ensureManagerSynthsInMpcSettings(std::vector<std::string>* outLogs = nullptr);
     static void refreshInstallStates(LauncherConfig& config, std::vector<std::string>* outLogs = nullptr);
 };
 
@@ -1538,9 +1570,9 @@ using PluginCatalogConfig = LauncherConfig;
  * ============================================================================
  * THE KIKGEN LABS - PLUGINS MANAGER FOR MPCs AND FORCE DEVICES
  * File: src/tkgl_config.cpp
- * Description: Block-delimited parser for mpc_plugins.conf AND live online
- *              catalog scraper/parser for catalog.json + native libcurl.so.4
- *              dynamic loader (dlopen/dlsym for libcurl.so.4 / libcurl.so.4.8.0).
+ * Description: Block-delimited parser for mpc_plugins.conf, internet reachability
+ *              check via ping, and exclusive wget downloader for catalog.json,
+ *              plugin thumbnails (thumb.png), and plugin archives.
  * ============================================================================
  */
 
@@ -1550,10 +1582,13 @@ using PluginCatalogConfig = LauncherConfig;
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <csignal>
 #include <ctime>
 #include <chrono>
 #include <dirent.h>
@@ -1564,91 +1599,93 @@ using PluginCatalogConfig = LauncherConfig;
 
 namespace tkgl::config {
 
-// ============================================================================
-// Dynamic libcurl.so.4 / libcurl.so.4.8.0 Loader (Zero build-time curl headers)
-// ============================================================================
 namespace {
 
-struct LibCurlRuntime {
-    void* handle = nullptr;
-    bool  initialized = false;
-    bool  available = false;
-
-    int   (*global_init)(long) = nullptr;
-    void* (*easy_init)(void) = nullptr;
-    int   (*easy_setopt)(void*, int, ...) = nullptr;
-    int   (*easy_perform)(void*) = nullptr;
-    int   (*easy_getinfo)(void*, int, ...) = nullptr;
-    void  (*easy_cleanup)(void*) = nullptr;
-    const char* (*easy_strerror)(int) = nullptr;
-
-    static LibCurlRuntime& get() {
-        static LibCurlRuntime inst;
-        if (!inst.initialized) {
-            inst.initialized = true;
-            const char* soCandidates[] = {
-                "libcurl.so.4",
-                "libcurl.so.4.8.0",
-                "/usr/lib/libcurl.so.4",
-                "/usr/lib/libcurl.so.4.8.0",
-                "/lib/libcurl.so.4",
-                "/lib/libcurl.so.4.8.0",
-                "/usr/lib/arm-linux-gnueabihf/libcurl.so.4",
-                "libcurl.so"
-            };
-            for (const char* name : soCandidates) {
-                inst.handle = dlopen(name, RTLD_LAZY);
-                if (inst.handle) break;
-            }
-            if (inst.handle) {
-                inst.global_init   = reinterpret_cast<int(*)(long)>(dlsym(inst.handle, "curl_global_init"));
-                inst.easy_init     = reinterpret_cast<void*(*)(void)>(dlsym(inst.handle, "curl_easy_init"));
-                inst.easy_setopt   = reinterpret_cast<int(*)(void*, int, ...)>(dlsym(inst.handle, "curl_easy_setopt"));
-                inst.easy_perform  = reinterpret_cast<int(*)(void*)>(dlsym(inst.handle, "curl_easy_perform"));
-                inst.easy_getinfo  = reinterpret_cast<int(*)(void*, int, ...)>(dlsym(inst.handle, "curl_easy_getinfo"));
-                inst.easy_cleanup  = reinterpret_cast<void(*)(void*)>(dlsym(inst.handle, "curl_easy_cleanup"));
-                inst.easy_strerror = reinterpret_cast<const char*(*)(int)>(dlsym(inst.handle, "curl_easy_strerror"));
-                if (inst.easy_init && inst.easy_setopt && inst.easy_perform && inst.easy_cleanup) {
-                    if (inst.global_init) inst.global_init(3L); // CURL_GLOBAL_DEFAULT
-                    inst.available = true;
-                }
-            }
-        }
-        return inst;
+// Reload glibc DNS resolver configuration (handles autorun starting before Wi-Fi DHCP updates /etc/resolv.conf)
+static void reloadSystemDnsResolver() {
+    using ResInitFn = int(*)(void);
+    static ResInitFn fn = nullptr;
+    static bool lookedUp = false;
+    if (!lookedUp) {
+        lookedUp = true;
+        fn = reinterpret_cast<ResInitFn>(dlsym(RTLD_DEFAULT, "__res_init"));
+        if (!fn) fn = reinterpret_cast<ResInitFn>(dlsym(RTLD_DEFAULT, "res_init"));
     }
-};
+    if (fn) fn();
+}
 
-struct CurlStreamCtx {
-    FILE* fp = nullptr;
-    size_t bytesReceived = 0;
-    std::chrono::steady_clock::time_point lastTick;
-    int dotCount = 0;
-    std::function<void(const std::string&)> onProgress;
-    std::string prefix;
-};
+static std::string sanitizePingHost(const std::string& rawHost) {
+    std::string s = rawHost;
+    if (s.rfind("https://", 0) == 0) s = s.substr(8);
+    else if (s.rfind("http://", 0) == 0) s = s.substr(7);
+    size_t slash = s.find_first_of("/:");
+    if (slash != std::string::npos) s = s.substr(0, slash);
 
-static size_t tkgl_libcurl_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
-    size_t total = size * nmemb;
-    CurlStreamCtx* ctx = static_cast<CurlStreamCtx*>(userdata);
-    if (!ctx || !ctx->fp) return 0;
-    size_t written = std::fwrite(ptr, 1, total, ctx->fp);
-    ctx->bytesReceived += written;
-    if (ctx->onProgress) {
-        auto now = std::chrono::steady_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->lastTick).count();
-        if (ms >= 250) {
-            ctx->lastTick = now;
-            ctx->dotCount = (ctx->dotCount % 5) + 1;
-            std::string dots(static_cast<size_t>(ctx->dotCount), '.');
-            char mbBuf[64];
-            std::snprintf(mbBuf, sizeof(mbBuf), "%.2f MB", static_cast<double>(ctx->bytesReceived) / 1048576.0);
-            ctx->onProgress(ctx->prefix + " [ " + dots + " ] " + mbBuf + " received");
+    std::string clean;
+    for (char c : s) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-') {
+            clean += c;
         }
     }
-    return written;
+    return clean.empty() ? "github.com" : clean;
 }
 
 } // anonymous namespace
+
+bool ConfigParser::checkInternetReachable(
+    const std::string& pingHost,
+    std::vector<std::string>* outLogs
+) {
+    reloadSystemDnsResolver();
+    std::string host = sanitizePingHost(pingHost);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        int devNull = open("/dev/null", O_WRONLY);
+        if (devNull >= 0) {
+            dup2(devNull, STDOUT_FILENO);
+            dup2(devNull, STDERR_FILENO);
+            if (devNull > 2) close(devNull);
+        }
+        execlp("ping", "ping", "-c", "1", "-W", "2", host.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    } else if (pid > 0) {
+        auto startWait = std::chrono::steady_clock::now();
+        int status = 0;
+        while (true) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) {
+                bool ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+                if (ok) {
+                    std::string msg = "[TKGL-NET] Online check OK (ping " + host + " succeeded).";
+                    std::printf("%s\n", msg.c_str());
+                    if (outLogs) outLogs->push_back(msg);
+                } else {
+                    std::string msg = "[TKGL-NET] Offline: ping " + host + " failed (no internet access).";
+                    std::fprintf(stderr, "%s\n", msg.c_str());
+                    if (outLogs) outLogs->push_back(msg);
+                }
+                return ok;
+            }
+            if (w < 0) break;
+            usleep(80000);
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startWait
+            ).count();
+            if (elapsedMs >= 3000) {
+                kill(-pid, SIGKILL);
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                std::string msg = "[TKGL-NET] Offline: ping " + host + " timed out.";
+                std::fprintf(stderr, "%s\n", msg.c_str());
+                if (outLogs) outLogs->push_back(msg);
+                return false;
+            }
+        }
+    }
+    return false;
+}
 
 bool ConfigParser::downloadFile(
     const std::string& url,
@@ -1658,95 +1695,126 @@ bool ConfigParser::downloadFile(
     const std::string& progressPrefix
 ) {
     if (url.empty() || destPath.empty()) return false;
+
+    reloadSystemDnsResolver();
+
+    // Sanitize URL (trim whitespace and encode spaces as %20 for wget)
+    std::string cleanUrl;
+    cleanUrl.reserve(url.size() + 16);
+    for (char c : url) {
+        if (c == '\r' || c == '\n' || c == '\t') continue;
+        if (c == ' ') cleanUrl += "%20";
+        else cleanUrl += c;
+    }
+    if (cleanUrl.empty()) return false;
+
+    // Ensure parent directory of destPath exists
+    size_t lastSlash = destPath.find_last_of('/');
+    if (lastSlash != std::string::npos && lastSlash > 0) {
+        std::string parentDir = destPath.substr(0, lastSlash);
+        mkdir(parentDir.c_str(), 0755);
+    }
+
     std::string tmpPath = destPath + ".part";
     unlink(tmpPath.c_str());
 
-    // 1. Primary path on MPC OS: Native dynamic libcurl.so.4 / libcurl.so.4.8.0
-    LibCurlRuntime& curlApi = LibCurlRuntime::get();
-    if (curlApi.available) {
-        void* easy = curlApi.easy_init();
-        if (easy) {
-            FILE* fp = std::fopen(tmpPath.c_str(), "wb");
-            if (fp) {
-                CurlStreamCtx ctx;
-                ctx.fp = fp;
-                ctx.bytesReceived = 0;
-                ctx.lastTick = std::chrono::steady_clock::now();
-                ctx.dotCount = 0;
-                ctx.onProgress = onProgress;
-                ctx.prefix = progressPrefix;
-
-                // Frozen libcurl ABI option constants (stable across all libcurl.so.4.x releases)
-                constexpr int OPT_WRITEDATA      = 10001;
-                constexpr int OPT_URL            = 10002;
-                constexpr int OPT_USERAGENT      = 10018;
-                constexpr int OPT_WRITEFUNCTION  = 20011;
-                constexpr int OPT_TIMEOUT        = 13;
-                constexpr int OPT_FAILONERROR    = 45;
-                constexpr int OPT_FOLLOWLOCATION = 52;
-                constexpr int OPT_SSL_VERIFYPEER = 64;
-                constexpr int OPT_MAXREDIRS      = 68;
-                constexpr int OPT_CONNECTTIMEOUT = 78;
-                constexpr int OPT_SSL_VERIFYHOST = 81;
-                constexpr int OPT_NOSIGNAL       = 99;
-                constexpr int INFO_RESPONSE_CODE = 0x200002;
-
-                curlApi.easy_setopt(easy, OPT_URL, url.c_str());
-                curlApi.easy_setopt(easy, OPT_USERAGENT, "KikGen-MPC-PluginManager/2.0 (libcurl.so.4)");
-                curlApi.easy_setopt(easy, OPT_WRITEFUNCTION, &tkgl_libcurl_write_cb);
-                curlApi.easy_setopt(easy, OPT_WRITEDATA, &ctx);
-                curlApi.easy_setopt(easy, OPT_FOLLOWLOCATION, 1L);
-                curlApi.easy_setopt(easy, OPT_MAXREDIRS, 10L);
-                curlApi.easy_setopt(easy, OPT_SSL_VERIFYPEER, 0L);
-                curlApi.easy_setopt(easy, OPT_SSL_VERIFYHOST, 0L);
-                curlApi.easy_setopt(easy, OPT_CONNECTTIMEOUT, 15L);
-                curlApi.easy_setopt(easy, OPT_TIMEOUT, timeoutSec > 0 ? timeoutSec : 60L);
-                curlApi.easy_setopt(easy, OPT_FAILONERROR, 1L);
-                curlApi.easy_setopt(easy, OPT_NOSIGNAL, 1L);
-
-                int res = curlApi.easy_perform(easy);
-                std::fflush(fp);
-                std::fclose(fp);
-
-                long httpCode = 0;
-                if (curlApi.easy_getinfo) {
-                    curlApi.easy_getinfo(easy, INFO_RESPONSE_CODE, &httpCode);
-                }
-                curlApi.easy_cleanup(easy);
-
-                struct stat st;
-                if (res == 0 && (httpCode == 0 || (httpCode >= 200 && httpCode < 400)) &&
-                    stat(tmpPath.c_str(), &st) == 0 && st.st_size > 0) {
-                    unlink(destPath.c_str());
-                    if ( std::rename(tmpPath.c_str(), destPath.c_str()) == 0 ) {
-                        return true;
-                    }
-                }
+    auto finalizeTempFile = [&]() -> bool {
+        struct stat st;
+        if (stat(tmpPath.c_str(), &st) != 0 || st.st_size <= 0) {
+            unlink(tmpPath.c_str());
+            return false;
+        }
+        // If destination is a .png file, verify the 8-byte PNG signature so a 404 HTML page is never saved as a thumbnail
+        if (destPath.size() >= 4 && destPath.compare(destPath.size() - 4, 4, ".png") == 0) {
+            std::ifstream pngCheck(tmpPath, std::ios::binary);
+            uint8_t sig[8] = {0};
+            pngCheck.read(reinterpret_cast<char*>(sig), 8);
+            pngCheck.close();
+            static const uint8_t kPngSig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+            if (std::memcmp(sig, kPngSig, 8) != 0) {
                 unlink(tmpPath.c_str());
-            } else {
-                curlApi.easy_cleanup(easy);
+                return false;
             }
+        }
+        unlink(destPath.c_str());
+        if (std::rename(tmpPath.c_str(), destPath.c_str()) == 0) {
+            return true;
+        }
+        std::ifstream srcF(tmpPath, std::ios::binary);
+        std::ofstream dstF(destPath, std::ios::binary | std::ios::trunc);
+        if (srcF.is_open() && dstF.is_open()) {
+            dstF << srcF.rdbuf();
+            dstF.close();
+            unlink(tmpPath.c_str());
+            if (stat(destPath.c_str(), &st) == 0 && st.st_size > 0) {
+                return true;
+            }
+        }
+        unlink(tmpPath.c_str());
+        return false;
+    };
+
+    // Exclusive wget downloader with non-blocking live progress & timeout control
+    long maxWaitSec = (timeoutSec > 0) ? timeoutSec : 60L;
+    std::ostringstream wgetCmd;
+    wgetCmd << "rm -f \"" << tmpPath << "\"; ";
+    wgetCmd << "wget --no-check-certificate -q -O \"" << tmpPath << "\" \"" << cleanUrl << "\" 2>/dev/null || ";
+    wgetCmd << "wget -q -O \"" << tmpPath << "\" \"" << cleanUrl << "\" 2>/dev/null";
+
+    std::string cmdStr = wgetCmd.str();
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", cmdStr.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    } else if (pid > 0) {
+        auto startWait = std::chrono::steady_clock::now();
+        auto lastProgTick = startWait;
+        int dotCount = 0;
+        int status = 0;
+
+        while (true) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid || w < 0) {
+                break;
+            }
+            usleep(120000); // Poll every 120ms
+
+            auto now = std::chrono::steady_clock::now();
+            if (onProgress && !progressPrefix.empty()) {
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProgTick).count();
+                if (ms >= 250) {
+                    lastProgTick = now;
+                    dotCount = (dotCount % 5) + 1;
+                    std::string dots(static_cast<size_t>(dotCount), '.');
+                    struct stat stProg;
+                    double mb = 0.0;
+                    if (stat(tmpPath.c_str(), &stProg) == 0 && stProg.st_size > 0) {
+                        mb = static_cast<double>(stProg.st_size) / 1048576.0;
+                    }
+                    char mbBuf[64];
+                    std::snprintf(mbBuf, sizeof(mbBuf), "%.2f MB", mb);
+                    onProgress(progressPrefix + " (wget) [ " + dots + " ] " + mbBuf + " received");
+                }
+            }
+
+            auto elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(now - startWait).count();
+            if (elapsedSec >= maxWaitSec) {
+                kill(-pid, SIGKILL);
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                std::fprintf(stderr, "[TKGL-NET] wget timeout (%lds) reached for %s\n", maxWaitSec, cleanUrl.c_str());
+                break;
+            }
+        }
+
+        if (finalizeTempFile()) {
+            return true;
         }
     }
 
-    // 2. Fallback if libcurl.so.4 failed or is unavailable in a non-MPC environment
-    std::ostringstream fallbackCmd;
-    fallbackCmd << "rm -f \"" << tmpPath << "\"; ";
-    fallbackCmd << "if command -v wget >/dev/null 2>&1; then ";
-    fallbackCmd << "  wget --no-check-certificate -q -O \"" << tmpPath << "\" \"" << url << "\" 2>/dev/null || wget -q -O \"" << tmpPath << "\" \"" << url << "\" 2>/dev/null; ";
-    fallbackCmd << "fi; ";
-    fallbackCmd << "if [ ! -s \"" << tmpPath << "\" ] && command -v python3 >/dev/null 2>&1; then ";
-    fallbackCmd << "  python3 -c 'import urllib.request,ssl,shutil,sys; ctx=ssl._create_unverified_context(); req=urllib.request.Request(sys.argv[1],headers={\"User-Agent\":\"Wget/1.21\"}); r=urllib.request.urlopen(req,context=ctx,timeout=" << (timeoutSec > 0 ? timeoutSec : 60) << "); f=open(sys.argv[2],\"wb\"); shutil.copyfileobj(r,f,65536); f.close()' \"" << url << "\" \"" << tmpPath << "\" 2>/dev/null; ";
-    fallbackCmd << "fi; ";
-    fallbackCmd << "if [ ! -s \"" << tmpPath << "\" ] && command -v curl >/dev/null 2>&1; then ";
-    fallbackCmd << "  curl -k -fsSL --connect-timeout 15 -m " << (timeoutSec > 0 ? timeoutSec : 60) << " \"" << url << "\" -o \"" << tmpPath << "\" 2>/dev/null; ";
-    fallbackCmd << "fi; ";
-    fallbackCmd << "if [ -s \"" << tmpPath << "\" ]; then mv -f \"" << tmpPath << "\" \"" << destPath << "\"; else rm -f \"" << tmpPath << "\"; exit 1; fi";
-
-    int rc = std::system(fallbackCmd.str().c_str());
-    (void)rc;
-    struct stat stFinal;
-    return (stat(destPath.c_str(), &stFinal) == 0 && stFinal.st_size > 0);
+    unlink(tmpPath.c_str());
+    return false;
 }
 
 std::string ConfigParser::getManagerRootDir() {
@@ -1816,11 +1884,11 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tr-6w6", "6W6", "athousanddetails", "v1.2.0", "Drum Machine",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1), MPC Live III (MPC OS 3.10)", "MPC OS 2.x & 3.x", "2026-11-02",
-            "2421", "7.6 MB", "31%",
+            "2437", "7.6 MB", "31%",
             "athousanddetails - VST - 6W6", "tr6w6.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/6w6.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/6w6-vst-v1.2.0/6W6-1.2.0-mpc-armv7.zip", "plugins/tr-6w6/thumb.ppm",
-            "MPC/Force port of athousanddetails' schwung-6W6 TR-606 drum machine: voices fitted against real hardware recordings, with measured-partial hats and cymbal. Touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/athousanddetails - VST - 6W6\" && if [ -f \"./plugins/tr-6w6/tr6w6.so\" ]; then cp -rf ./plugins/tr-6w6/* \"$TARGET_SYNTH_DIR/athousanddetails - VST - 6W6/\"; else (wget -q -O /tmp/tr-6w6.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/6w6-vst-v1.2.0/6W6-1.2.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/tr-6w6.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/6w6-vst-v1.2.0/6W6-1.2.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/6w6-vst-v1.2.0/6W6-1.2.0-mpc-armv7.zip\" -o /tmp/tr-6w6.zip) && unzip -o /tmp/tr-6w6.zip -d \"$TARGET_SYNTH_DIR/athousanddetails - VST - 6W6/\" && rm -f /tmp/tr-6w6.zip; fi && sync", 1,
-            true,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/6w6.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/6w6-vst-v1.2.0/6W6-1.2.0-mpc-armv7.zip", "plugins/tr-6w6/thumb.png",
+            "MPC/Force port of athousanddetails' schwung-6W6 TR-606 drum machine: voices fitted against real hardware recordings, with measured-partial hats and cymbal. Touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/athousanddetails - VST - 6W6\" && if [ -f \"./plugins/tr-6w6/tr6w6.so\" ]; then cp -rf ./plugins/tr-6w6/* \"$TARGET_SYNTH_DIR/athousanddetails - VST - 6W6/\"; else (wget --no-check-certificate -q -O /tmp/tr-6w6.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/6w6-vst-v1.2.0/6W6-1.2.0-mpc-armv7.zip\" || wget -q -O /tmp/tr-6w6.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/6w6-vst-v1.2.0/6W6-1.2.0-mpc-armv7.zip\") && unzip -o /tmp/tr-6w6.zip -d \"$TARGET_SYNTH_DIR/athousanddetails - VST - 6W6/\" && rm -f /tmp/tr-6w6.zip; fi && sync", 1,
+            false,
             false,
             false,
             { "tr-606" }
@@ -1828,9 +1896,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tr-8w8", "8W8", "athousanddetails", "v1.2.0", "Drum Machine",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1), MPC Live III (MPC OS 3.10)", "MPC OS 2.x & 3.x", "2026-11-02",
-            "2518", "5.9 MB", "13%",
+            "2534", "5.9 MB", "13%",
             "athousanddetails - VST - 8W8", "tr8w8.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/8w8.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/8w8-vst-v1.2.0/8W8-1.2.0-mpc-armv7.zip", "plugins/tr-8w8/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/8w8.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/8w8-vst-v1.2.0/8W8-1.2.0-mpc-armv7.zip", "plugins/tr-8w8/thumb.png",
             "MPC/Force port of athousanddetails' schwung-8W8 TR-808 drum machine: 15 of 16 voices circuit-modelled from the service notes. Touchscreen skin and Q-Links.", "./plugins/tr-8w8/install.sh", 0,
             false,
             false,
@@ -1840,10 +1908,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tr-9w9", "9W9", "athousanddetails", "v1.2.0", "Drum Machine",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1), MPC Live III (MPC OS 3.10)", "MPC OS 2.x & 3.x", "2026-11-02",
-            "2457", "5.1 MB", "21%",
+            "2472", "5.1 MB", "21%",
             "athousanddetails - VST - 9W9", "tr9w9.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/9w9.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/9w9-vst-v1.2.0/9W9-1.2.0-mpc-armv7.zip", "plugins/tr-9w9/thumb.ppm",
-            "MPC/Force port of athousanddetails' schwung-9W9 TR-909 drum machine: circuit-modelled kick, snare, toms, rim and clap, with sampled hats, ride and crash (ER-99 derived), as on the original. Touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/athousanddetails - VST - 9W9\" && if [ -f \"./plugins/tr-9w9/tr9w9.so\" ]; then cp -rf ./plugins/tr-9w9/* \"$TARGET_SYNTH_DIR/athousanddetails - VST - 9W9/\"; else (wget -q -O /tmp/tr-9w9.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/9w9-vst-v1.2.0/9W9-1.2.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/tr-9w9.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/9w9-vst-v1.2.0/9W9-1.2.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/9w9-vst-v1.2.0/9W9-1.2.0-mpc-armv7.zip\" -o /tmp/tr-9w9.zip) && unzip -o /tmp/tr-9w9.zip -d \"$TARGET_SYNTH_DIR/athousanddetails - VST - 9W9/\" && rm -f /tmp/tr-9w9.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/9w9.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/9w9-vst-v1.2.0/9W9-1.2.0-mpc-armv7.zip", "plugins/tr-9w9/thumb.png",
+            "MPC/Force port of athousanddetails' schwung-9W9 TR-909 drum machine: circuit-modelled kick, snare, toms, rim and clap, with sampled hats, ride and crash (ER-99 derived), as on the original. Touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/athousanddetails - VST - 9W9\" && if [ -f \"./plugins/tr-9w9/tr9w9.so\" ]; then cp -rf ./plugins/tr-9w9/* \"$TARGET_SYNTH_DIR/athousanddetails - VST - 9W9/\"; else (wget --no-check-certificate -q -O /tmp/tr-9w9.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/9w9-vst-v1.2.0/9W9-1.2.0-mpc-armv7.zip\" || wget -q -O /tmp/tr-9w9.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/9w9-vst-v1.2.0/9W9-1.2.0-mpc-armv7.zip\") && unzip -o /tmp/tr-9w9.zip -d \"$TARGET_SYNTH_DIR/athousanddetails - VST - 9W9/\" && rm -f /tmp/tr-9w9.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -1852,10 +1920,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "acid-303", "Acid-303", "sd88me", "v1.0.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-22",
-            "726", "23.6 MB", "28%",
+            "730", "23.6 MB", "28%",
             "sd88me - VST - Acid-303", "acid303.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-acid303/main/docs/device-303.png", "https://github.com/sd88me/mpc-vst-acid303/releases/download/acid303-vst-v1.0.2/Acid-303-1.0.2-mpc-armv7.zip", "plugins/acid-303/thumb.ppm",
-            "An accurate, circuit-modelled 303 voice, matched to the hardware: the voice (from Lemus) solves the original schematic transistor by transistor and is fitted to 400 notes from a real unit. Switchable Devil Fish mods; Gen1 and Gen2 (WARN for CPU on Gen1: one or two instances, ECO).", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Acid-303\" && if [ -f \"./plugins/acid-303/acid303.so\" ]; then cp -rf ./plugins/acid-303/* \"$TARGET_SYNTH_DIR/sd88me - VST - Acid-303/\"; else (wget -q -O /tmp/acid-303.zip \"https://github.com/sd88me/mpc-vst-acid303/releases/download/acid303-vst-v1.0.2/Acid-303-1.0.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/acid-303.zip \"https://github.com/sd88me/mpc-vst-acid303/releases/download/acid303-vst-v1.0.2/Acid-303-1.0.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-acid303/releases/download/acid303-vst-v1.0.2/Acid-303-1.0.2-mpc-armv7.zip\" -o /tmp/acid-303.zip) && unzip -o /tmp/acid-303.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Acid-303/\" && rm -f /tmp/acid-303.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-acid303/main/docs/device-303.png", "https://github.com/sd88me/mpc-vst-acid303/releases/download/acid303-vst-v1.0.2/Acid-303-1.0.2-mpc-armv7.zip", "plugins/acid-303/thumb.png",
+            "An accurate, circuit-modelled 303 voice, matched to the hardware: the voice (from Lemus) solves the original schematic transistor by transistor and is fitted to 400 notes from a real unit. Switchable Devil Fish mods; Gen1 and Gen2 (WARN for CPU on Gen1: one or two instances, ECO).", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Acid-303\" && if [ -f \"./plugins/acid-303/acid303.so\" ]; then cp -rf ./plugins/acid-303/* \"$TARGET_SYNTH_DIR/sd88me - VST - Acid-303/\"; else (wget --no-check-certificate -q -O /tmp/acid-303.zip \"https://github.com/sd88me/mpc-vst-acid303/releases/download/acid303-vst-v1.0.2/Acid-303-1.0.2-mpc-armv7.zip\" || wget -q -O /tmp/acid-303.zip \"https://github.com/sd88me/mpc-vst-acid303/releases/download/acid303-vst-v1.0.2/Acid-303-1.0.2-mpc-armv7.zip\") && unzip -o /tmp/acid-303.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Acid-303/\" && rm -f /tmp/acid-303.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -1864,10 +1932,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aphex", "Aphex", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1442", "7.4 MB", "14%",
+            "1446", "7.4 MB", "14%",
             "Filliformes - VST - [SYN] Aphex", "aphex.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-aphex/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-aphex/releases/download/v1.1.1/SYN-Aphex-1.1.1-mpc-armv7.zip", "plugins/aphex/thumb.ppm",
-            "Korg MS-10/MS-20 style mono synth with a patch bay, an ESP section and both MS filters.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Filliformes - VST - [SYN] Aphex\" && if [ -f \"./plugins/aphex/aphex.so\" ]; then cp -rf ./plugins/aphex/* \"$TARGET_SYNTH_DIR/Filliformes - VST - [SYN] Aphex/\"; else (wget -q -O /tmp/aphex.zip \"https://github.com/saustin2010/mpc-vst-aphex/releases/download/v1.1.1/SYN-Aphex-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/aphex.zip \"https://github.com/saustin2010/mpc-vst-aphex/releases/download/v1.1.1/SYN-Aphex-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-aphex/releases/download/v1.1.1/SYN-Aphex-1.1.1-mpc-armv7.zip\" -o /tmp/aphex.zip) && unzip -o /tmp/aphex.zip -d \"$TARGET_SYNTH_DIR/Filliformes - VST - [SYN] Aphex/\" && rm -f /tmp/aphex.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-aphex/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-aphex/releases/download/v1.1.1/SYN-Aphex-1.1.1-mpc-armv7.zip", "plugins/aphex/thumb.png",
+            "Korg MS-10/MS-20 style mono synth with a patch bay, an ESP section and both MS filters.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Filliformes - VST - [SYN] Aphex\" && if [ -f \"./plugins/aphex/aphex.so\" ]; then cp -rf ./plugins/aphex/* \"$TARGET_SYNTH_DIR/Filliformes - VST - [SYN] Aphex/\"; else (wget --no-check-certificate -q -O /tmp/aphex.zip \"https://github.com/saustin2010/mpc-vst-aphex/releases/download/v1.1.1/SYN-Aphex-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/aphex.zip \"https://github.com/saustin2010/mpc-vst-aphex/releases/download/v1.1.1/SYN-Aphex-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/aphex.zip -d \"$TARGET_SYNTH_DIR/Filliformes - VST - [SYN] Aphex/\" && rm -f /tmp/aphex.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -1876,9 +1944,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "chordism", "Chordism", "saustin2010", "v1.0.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1460", "2.3 MB", "14%",
+            "1463", "2.3 MB", "14%",
             "Charles Vestal - VST - [SYN] Chordism", "chordism.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-chordism/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-chordism/releases/download/v1.0.2/SYN-Chordism-1.0.2-mpc-armv7.zip", "plugins/chordism/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-chordism/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-chordism/releases/download/v1.0.2/SYN-Chordism-1.0.2-mpc-armv7.zip", "plugins/chordism/thumb.png",
             "One key in, a four-voice chord out: morphing oscillators, FM, filter, lo-fi, delay, reverb and an arpeggiator.", "./plugins/chordism/install.sh", 0,
             false,
             false,
@@ -1888,9 +1956,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "clementine-xt", "Clementine-XT", "sd88me", "v0.9.7", "Synth",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "3946", "2.5 MB", "14%",
+            "3954", "2.5 MB", "14%",
             "sd88me - VST - Clementine-XT", "clementine_xt.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-clementineXT/main/docs/img/clementine-xt.png", "https://github.com/sd88me/mpc-vst-clementineXT/releases/download/clementine-xt-v0.9.7/Clementine-XT-0.9.7-mpc-armv7.zip", "plugins/clementine-xt/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-clementineXT/main/docs/img/clementine-xt.png", "https://github.com/sd88me/mpc-vst-clementineXT/releases/download/clementine-xt-v0.9.7/Clementine-XT-0.9.7-mpc-armv7.zip", "plugins/clementine-xt/thumb.png",
             "Ten-voice wavetable synthesizer modelled exactly on the Microwave II/XT with a ten-page touchscreen skin and Q-Links. Needs your own ROM files in its ROMS folder.", "./plugins/clementine-xt/install.sh", 0,
             false,
             false,
@@ -1900,9 +1968,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-cluster", "Cluster", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "90", "3.5 MB", "14%",
+            "93", "3.5 MB", "14%",
             "bombest - VST - Cluster", "cluster.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/cluster.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cluster-0.4.1-mpc-armv7.zip", "plugins/op1fx-cluster/thumb.ppm",
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/cluster.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cluster-0.4.1-mpc-armv7.zip", "plugins/op1fx-cluster/thumb.png",
             "Eight self-feedback sine oscillators that drift apart over a note. OP-1 inspired.", "./plugins/op1fx-cluster/install.sh", 0,
             false,
             false,
@@ -1912,10 +1980,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "crate-digger", "Crate Digger", "sd88me", "v1.3.0", "Sample Browser",
             "INST", "Stable", "MPC Live III (Gen2) (az01 base 5.0.17), Akai Force (az01 base 5.0.17)", "MPC OS 2.x & 3.x", "2026-10-28",
-            "8876", "67.8 MB", "3%",
+            "8892", "67.8 MB", "3%",
             "sd88me - VST - Crate Digger", "cratedigger.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-cratedigger/main/docs/img/crate-digger.png", "https://github.com/sd88me/mpc-vst-cratedigger/releases/download/cratedigger-vst-v1.3.0/Crate-Digger-1.3.0-mpc-armv7.zip", "plugins/crate-digger/thumb.ppm",
-            "Dig for records by genre, style, decade, region and country on Discogs, then stream and play them into an MPC track, with its own screen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Crate Digger\" && if [ -f \"./plugins/crate-digger/cratedigger.so\" ]; then cp -rf ./plugins/crate-digger/* \"$TARGET_SYNTH_DIR/sd88me - VST - Crate Digger/\"; else (wget -q -O /tmp/crate-digger.zip \"https://github.com/sd88me/mpc-vst-cratedigger/releases/download/cratedigger-vst-v1.3.0/Crate-Digger-1.3.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/crate-digger.zip \"https://github.com/sd88me/mpc-vst-cratedigger/releases/download/cratedigger-vst-v1.3.0/Crate-Digger-1.3.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-cratedigger/releases/download/cratedigger-vst-v1.3.0/Crate-Digger-1.3.0-mpc-armv7.zip\" -o /tmp/crate-digger.zip) && unzip -o /tmp/crate-digger.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Crate Digger/\" && rm -f /tmp/crate-digger.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-cratedigger/main/docs/img/crate-digger.png", "https://github.com/sd88me/mpc-vst-cratedigger/releases/download/cratedigger-vst-v1.3.0/Crate-Digger-1.3.0-mpc-armv7.zip", "plugins/crate-digger/thumb.png",
+            "Dig for records by genre, style, decade, region and country on Discogs, then stream and play them into an MPC track, with its own screen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Crate Digger\" && if [ -f \"./plugins/crate-digger/cratedigger.so\" ]; then cp -rf ./plugins/crate-digger/* \"$TARGET_SYNTH_DIR/sd88me - VST - Crate Digger/\"; else (wget --no-check-certificate -q -O /tmp/crate-digger.zip \"https://github.com/sd88me/mpc-vst-cratedigger/releases/download/cratedigger-vst-v1.3.0/Crate-Digger-1.3.0-mpc-armv7.zip\" || wget -q -O /tmp/crate-digger.zip \"https://github.com/sd88me/mpc-vst-cratedigger/releases/download/cratedigger-vst-v1.3.0/Crate-Digger-1.3.0-mpc-armv7.zip\") && unzip -o /tmp/crate-digger.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Crate Digger/\" && rm -f /tmp/crate-digger.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -1924,9 +1992,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tr-cw78", "CW-78", "athousanddetails", "v1.2.0", "Drum Machine",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1), MPC Live III (MPC OS 3.10)", "MPC OS 2.x & 3.x", "2026-11-02",
-            "2313", "6.9 MB", "8%",
+            "2328", "6.9 MB", "8%",
             "athousanddetails - VST - CW-78", "trcw78.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/cw78.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/cw78-vst-v1.2.0/CW-78-1.2.0-mpc-armv7.zip", "plugins/tr-cw78/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/ba525167c18bb0961dfd60d5989a033f737fe517/docs/screenshots/cw78.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/cw78-vst-v1.2.0/CW-78-1.2.0-mpc-armv7.zip", "plugins/tr-cw78/thumb.png",
             "MPC/Force port of athousanddetails' schwung-CW-78 CR-78 drum machine: voices modelled from the 1979 service notes, with the preset rhythms. Touchscreen skin and Q-Links.", "./plugins/tr-cw78/install.sh", 0,
             false,
             false,
@@ -1936,9 +2004,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-dbox", "DBox", "Bombest", "v0.4.1", "Drum Machine",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "81", "8.6 MB", "14%",
+            "84", "8.6 MB", "14%",
             "bombest - VST - DBox", "dbox.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/dbox.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DBox-0.4.1-mpc-armv7.zip", "plugins/op1fx-dbox/thumb.ppm",
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/dbox.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DBox-0.4.1-mpc-armv7.zip", "plugins/op1fx-dbox/thumb.png",
             "A 24-key synthesized drum kit: two oscillators and noise per hit, 12 voices. OP-1 inspired.", "./plugins/op1fx-dbox/install.sh", 0,
             false,
             false,
@@ -1948,9 +2016,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "denis", "Denis", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1364", "5.4 MB", "14%",
+            "1368", "5.4 MB", "14%",
             "Filliformes - VST - [SYN] Denis", "denis.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-denis/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-denis/releases/download/v1.1.1/SYN-Denis-1.1.1-mpc-armv7.zip", "plugins/denis/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-denis/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-denis/releases/download/v1.1.1/SYN-Denis-1.1.1-mpc-armv7.zip", "plugins/denis/thumb.png",
             "West Coast / Serge-inspired mono synth: complex oscillators, a wavefolder and a modulation matrix.", "./plugins/denis/install.sh", 0,
             false,
             false,
@@ -1960,11 +2028,11 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dexed-dx7", "Dexed", "sd88me", "v1.0.7", "Fm Synth",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "6145", "3.7 MB", "14%",
+            "6154", "3.7 MB", "14%",
             "sd88me - VST - Dexed (DX7)", "dx7_dexed.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-dx7/main/docs/img/dexed-dx7.png", "https://github.com/sd88me/mpc-vst-dx7/releases/download/dx7-v1.0.7/Dexed-DX7-1.0.7-mpc-armv7.zip", "plugins/dexed-dx7/thumb.ppm",
-            "DX7-style 6-operator FM synth (Dexed/MSFA engine) as a native instrument, with .syx bank browsing, all 32 algorithm diagrams and a touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Dexed (DX7)\" && if [ -f \"./plugins/dexed-dx7/dx7_dexed.so\" ]; then cp -rf ./plugins/dexed-dx7/* \"$TARGET_SYNTH_DIR/sd88me - VST - Dexed (DX7)/\"; else (wget -q -O /tmp/dexed-dx7.zip \"https://github.com/sd88me/mpc-vst-dx7/releases/download/dx7-v1.0.7/Dexed-DX7-1.0.7-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/dexed-dx7.zip \"https://github.com/sd88me/mpc-vst-dx7/releases/download/dx7-v1.0.7/Dexed-DX7-1.0.7-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-dx7/releases/download/dx7-v1.0.7/Dexed-DX7-1.0.7-mpc-armv7.zip\" -o /tmp/dexed-dx7.zip) && unzip -o /tmp/dexed-dx7.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Dexed (DX7)/\" && rm -f /tmp/dexed-dx7.zip; fi && sync", 1,
-            true,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-dx7/main/docs/img/dexed-dx7.png", "https://github.com/sd88me/mpc-vst-dx7/releases/download/dx7-v1.0.7/Dexed-DX7-1.0.7-mpc-armv7.zip", "plugins/dexed-dx7/thumb.png",
+            "DX7-style 6-operator FM synth (Dexed/MSFA engine) as a native instrument, with .syx bank browsing, all 32 algorithm diagrams and a touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Dexed (DX7)\" && if [ -f \"./plugins/dexed-dx7/dx7_dexed.so\" ]; then cp -rf ./plugins/dexed-dx7/* \"$TARGET_SYNTH_DIR/sd88me - VST - Dexed (DX7)/\"; else (wget --no-check-certificate -q -O /tmp/dexed-dx7.zip \"https://github.com/sd88me/mpc-vst-dx7/releases/download/dx7-v1.0.7/Dexed-DX7-1.0.7-mpc-armv7.zip\" || wget -q -O /tmp/dexed-dx7.zip \"https://github.com/sd88me/mpc-vst-dx7/releases/download/dx7-v1.0.7/Dexed-DX7-1.0.7-mpc-armv7.zip\") && unzip -o /tmp/dexed-dx7.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Dexed (DX7)/\" && rm -f /tmp/dexed-dx7.zip; fi && sync", 1,
+            false,
             false,
             false,
             { "dx7", "emulation" }
@@ -1972,9 +2040,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-digital", "Digital", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "75", "5.7 MB", "14%",
+            "78", "5.7 MB", "14%",
             "bombest - VST - Digital", "digital.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/digital.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Digital-0.4.1-mpc-armv7.zip", "plugins/op1fx-digital/thumb.ppm",
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/digital.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Digital-0.4.1-mpc-armv7.zip", "plugins/op1fx-digital/thumb.png",
             "Feedback sine oscillator, a second sine with sync, and a bit-flipping XOR stage. Eight voices. OP-1 inspired.", "./plugins/op1fx-digital/install.sh", 0,
             false,
             false,
@@ -1984,10 +2052,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dinxxl", "DINXXL", "L'Cronx", "v1.0.0", "Drum Machine",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "177", "4.5 MB", "14%",
+            "178", "4.5 MB", "14%",
             "L'Cronx - VST - DINXXL", "dinxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/dinxxl/v1.0.0/docs/img/keys.png", "https://github.com/sunskiefer/DINXXL/releases/download/v1.0.0/DINXXL-1.0.0-mpc-armv7.zip", "plugins/dinxxl/thumb.ppm",
-            "BlastBeats-style OPL3 FM groovebox: the published v7.1 firmware by Twisted Electrons runs unmodified on a software model of its board (YMF262 via ymfm). 6 drums, 4 four-op synths, 64-step sequencer with p-locks and songs, factory card inside. By L'Cronx; not made or endorsed by Twisted Electrons.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - DINXXL\" && if [ -f \"./plugins/dinxxl/dinxxl.so\" ]; then cp -rf ./plugins/dinxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - DINXXL/\"; else (wget -q -O /tmp/dinxxl.zip \"https://github.com/sunskiefer/DINXXL/releases/download/v1.0.0/DINXXL-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/dinxxl.zip \"https://github.com/sunskiefer/DINXXL/releases/download/v1.0.0/DINXXL-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/DINXXL/releases/download/v1.0.0/DINXXL-1.0.0-mpc-armv7.zip\" -o /tmp/dinxxl.zip) && unzip -o /tmp/dinxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - DINXXL/\" && rm -f /tmp/dinxxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/dinxxl/v1.0.0/docs/img/keys.png", "https://github.com/sunskiefer/DINXXL/releases/download/v1.0.0/DINXXL-1.0.0-mpc-armv7.zip", "plugins/dinxxl/thumb.png",
+            "BlastBeats-style OPL3 FM groovebox: the published v7.1 firmware by Twisted Electrons runs unmodified on a software model of its board (YMF262 via ymfm). 6 drums, 4 four-op synths, 64-step sequencer with p-locks and songs, factory card inside. By L'Cronx; not made or endorsed by Twisted Electrons.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - DINXXL\" && if [ -f \"./plugins/dinxxl/dinxxl.so\" ]; then cp -rf ./plugins/dinxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - DINXXL/\"; else (wget --no-check-certificate -q -O /tmp/dinxxl.zip \"https://github.com/sunskiefer/DINXXL/releases/download/v1.0.0/DINXXL-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/dinxxl.zip \"https://github.com/sunskiefer/DINXXL/releases/download/v1.0.0/DINXXL-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/dinxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - DINXXL/\" && rm -f /tmp/dinxxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -1996,9 +2064,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-dna", "DNA", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "90", "4.7 MB", "14%",
+            "93", "4.7 MB", "14%",
             "bombest - VST - DNA", "dna.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/dna.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DNA-0.4.1-mpc-armv7.zip", "plugins/op1fx-dna/thumb.ppm",
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/dna.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DNA-0.4.1-mpc-armv7.zip", "plugins/op1fx-dna/thumb.png",
             "A 128-bit genome played as a one-bit wave through an anti-aliased reader. Eight voices. OP-1 inspired.", "./plugins/op1fx-dna/install.sh", 0,
             false,
             false,
@@ -2008,9 +2076,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "drloguexxl", "DrLogueXXL", "L'Cronx", "v0.2.1", "Drum Machine",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "467", "7.8 MB", "14%",
+            "469", "7.8 MB", "14%",
             "L'Cronx - VST - DrLogueXXL", "drloguexxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/DrLogueXXL/v0.2.0/docs/img/perform.png", "https://github.com/sunskiefer/DrLogueXXL/releases/download/v0.2.1/DrLogueXXL-0.2.1-mpc-armv7.zip", "plugins/drloguexxl/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/DrLogueXXL/v0.2.0/docs/img/perform.png", "https://github.com/sunskiefer/DrLogueXXL/releases/download/v0.2.1/DrLogueXXL-0.2.1-mpc-armv7.zip", "plugins/drloguexxl/thumb.png",
             "Hybrid drum machine modelled on the KORG drumlogue (not affiliated with KORG): analogue-style kick, snare and toms, six sample parts with 192 synthesised sounds and your own WAVs, a MULTI part with VPM, noise and six open logue SDK units, delay, reverb and master effects, choke groups, a mixer and four macros, on a panel in the machine's look.", "./plugins/drloguexxl/install.sh", 0,
             false,
             false,
@@ -2020,10 +2088,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dronexxl", "DroneXXL", "L'Cronx", "v0.1.0", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-25",
-            "358", "83.7 MB", "14%",
+            "359", "83.7 MB", "14%",
             "L'Cronx - VST - DroneXXL", "dronexxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/DroneXXL/v0.1.0/docs/img/overview.png", "https://github.com/sunskiefer/DroneXXL/releases/download/v0.1.0/DroneXXL-0.1.0-mpc-armv7.zip", "plugins/dronexxl/thumb.ppm",
-            "Drone and experimental synth, after the Solar 42, built on Neil Baumberger's AmbientModules: a 15-module rack (4 drones, mixer, filter, pads, 2 PapaSrapa, 2 VCOs, LFOs, joystick, sequencer, detector) patched by touch, with 8 macros, an XY pad, a randomizer that never repeats and a brickwall limiter.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - DroneXXL\" && if [ -f \"./plugins/dronexxl/dronexxl.so\" ]; then cp -rf ./plugins/dronexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - DroneXXL/\"; else (wget -q -O /tmp/dronexxl.zip \"https://github.com/sunskiefer/DroneXXL/releases/download/v0.1.0/DroneXXL-0.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/dronexxl.zip \"https://github.com/sunskiefer/DroneXXL/releases/download/v0.1.0/DroneXXL-0.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/DroneXXL/releases/download/v0.1.0/DroneXXL-0.1.0-mpc-armv7.zip\" -o /tmp/dronexxl.zip) && unzip -o /tmp/dronexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - DroneXXL/\" && rm -f /tmp/dronexxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/DroneXXL/v0.1.0/docs/img/overview.png", "https://github.com/sunskiefer/DroneXXL/releases/download/v0.1.0/DroneXXL-0.1.0-mpc-armv7.zip", "plugins/dronexxl/thumb.png",
+            "Drone and experimental synth, after the Solar 42, built on Neil Baumberger's AmbientModules: a 15-module rack (4 drones, mixer, filter, pads, 2 PapaSrapa, 2 VCOs, LFOs, joystick, sequencer, detector) patched by touch, with 8 macros, an XY pad, a randomizer that never repeats and a brickwall limiter.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - DroneXXL\" && if [ -f \"./plugins/dronexxl/dronexxl.so\" ]; then cp -rf ./plugins/dronexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - DroneXXL/\"; else (wget --no-check-certificate -q -O /tmp/dronexxl.zip \"https://github.com/sunskiefer/DroneXXL/releases/download/v0.1.0/DroneXXL-0.1.0-mpc-armv7.zip\" || wget -q -O /tmp/dronexxl.zip \"https://github.com/sunskiefer/DroneXXL/releases/download/v0.1.0/DroneXXL-0.1.0-mpc-armv7.zip\") && unzip -o /tmp/dronexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - DroneXXL/\" && rm -f /tmp/dronexxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2032,10 +2100,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-drwave", "DrWave", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "84", "6.7 MB", "14%",
+            "86", "6.7 MB", "14%",
             "bombest - VST - DrWave", "drwave.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/drwave.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DrWave-0.4.1-mpc-armv7.zip", "plugins/op1fx-drwave/thumb.ppm",
-            "Wave, blend, motion and fold controls over eight voices. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - DrWave\" && if [ -f \"./plugins/op1fx-drwave/drwave.so\" ]; then cp -rf ./plugins/op1fx-drwave/* \"$TARGET_SYNTH_DIR/bombest - VST - DrWave/\"; else (wget -q -O /tmp/op1fx-drwave.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DrWave-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-drwave.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DrWave-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DrWave-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-drwave.zip) && unzip -o /tmp/op1fx-drwave.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - DrWave/\" && rm -f /tmp/op1fx-drwave.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/drwave.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DrWave-0.4.1-mpc-armv7.zip", "plugins/op1fx-drwave/thumb.png",
+            "Wave, blend, motion and fold controls over eight voices. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - DrWave\" && if [ -f \"./plugins/op1fx-drwave/drwave.so\" ]; then cp -rf ./plugins/op1fx-drwave/* \"$TARGET_SYNTH_DIR/bombest - VST - DrWave/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-drwave.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DrWave-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-drwave.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DrWave-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-drwave.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - DrWave/\" && rm -f /tmp/op1fx-drwave.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2044,9 +2112,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-dsynth", "DSynth", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "80", "4.8 MB", "14%",
+            "82", "4.8 MB", "14%",
             "bombest - VST - DSynth", "dsynth.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/dsynth.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DSynth-0.4.1-mpc-armv7.zip", "plugins/op1fx-dsynth/thumb.ppm",
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/dsynth.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/DSynth-0.4.1-mpc-armv7.zip", "plugins/op1fx-dsynth/thumb.png",
             "Two oscillators with FM, a pitch drop for drum thump and an eight-mode filter. OP-1 inspired.", "./plugins/op1fx-dsynth/install.sh", 0,
             false,
             false,
@@ -2056,9 +2124,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dub-force-siren", "Dub Force Siren", "no3z", "v2.1.0", "Synth",
             "INST", "Stable", "Akai Force (3.9.1.2)", "MPC OS 3.x", "2026-10-26",
-            "1088", "117 KB", "14%",
+            "1090", "117 KB", "14%",
             "Dub Force - VST - Dub Force Siren", "dub_force_siren.so",
-            "https://raw.githubusercontent.com/no3z/mpc-dubsiren/v2.0.0/resources/preview.png", "https://github.com/no3z/mpc-dubsiren/releases/download/v2.1.0/Dub-Force-Siren-2.1.0-mpc-armv7.zip", "plugins/dub-force-siren/thumb.ppm",
+            "https://raw.githubusercontent.com/no3z/mpc-dubsiren/v2.0.0/resources/preview.png", "https://github.com/no3z/mpc-dubsiren/releases/download/v2.1.0/Dub-Force-Siren-2.1.0-mpc-armv7.zip", "plugins/dub-force-siren/thumb.png",
             "Dub siren with tape echo: siren and zap modes, LFO, filter and ping-pong delay on one page mirroring two banks of eight Q-Links.", "./plugins/dub-force-siren/install.sh", 0,
             false,
             false,
@@ -2068,10 +2136,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "evil-tuner-xxl", "Evil Tuner XXL", "L'Cronx", "v0.2.0", "Radio Granular",
             "INST", "Stable", "Akai Force (3.9.1)", "MPC OS 3.x", "2026-10-22",
-            "1055", "12.8 MB", "14%",
+            "1058", "12.8 MB", "14%",
             "L'Cronx - VST - Evil Tuner XXL", "evil_tuner_xxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/Evil-Tuner-XXL/main/docs/img/RADIO.png", "https://github.com/sunskiefer/Evil-Tuner-XXL/releases/download/v0.2.0/Evil-Tuner-XXL-0.2.0-mpc-armv7.zip", "plugins/evil-tuner-xxl/thumb.ppm",
-            "Internet radio (30,000+ stations), or a phone over Wi-Fi or AirPlay, played into an MPC track through a granular engine, filter, character stages, delay, reverb, trance gate, stutter, tempo-synced looper and three LFOs. Inspired by the Endorphin.es Evil Pet (no affiliation, no code). Needs a network.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - Evil Tuner XXL\" && if [ -f \"./plugins/evil-tuner-xxl/evil_tuner_xxl.so\" ]; then cp -rf ./plugins/evil-tuner-xxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - Evil Tuner XXL/\"; else (wget -q -O /tmp/evil-tuner-xxl.zip \"https://github.com/sunskiefer/Evil-Tuner-XXL/releases/download/v0.2.0/Evil-Tuner-XXL-0.2.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/evil-tuner-xxl.zip \"https://github.com/sunskiefer/Evil-Tuner-XXL/releases/download/v0.2.0/Evil-Tuner-XXL-0.2.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/Evil-Tuner-XXL/releases/download/v0.2.0/Evil-Tuner-XXL-0.2.0-mpc-armv7.zip\" -o /tmp/evil-tuner-xxl.zip) && unzip -o /tmp/evil-tuner-xxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - Evil Tuner XXL/\" && rm -f /tmp/evil-tuner-xxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/Evil-Tuner-XXL/main/docs/img/RADIO.png", "https://github.com/sunskiefer/Evil-Tuner-XXL/releases/download/v0.2.0/Evil-Tuner-XXL-0.2.0-mpc-armv7.zip", "plugins/evil-tuner-xxl/thumb.png",
+            "Internet radio (30,000+ stations), or a phone over Wi-Fi or AirPlay, played into an MPC track through a granular engine, filter, character stages, delay, reverb, trance gate, stutter, tempo-synced looper and three LFOs. Inspired by the Endorphin.es Evil Pet (no affiliation, no code). Needs a network.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - Evil Tuner XXL\" && if [ -f \"./plugins/evil-tuner-xxl/evil_tuner_xxl.so\" ]; then cp -rf ./plugins/evil-tuner-xxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - Evil Tuner XXL/\"; else (wget --no-check-certificate -q -O /tmp/evil-tuner-xxl.zip \"https://github.com/sunskiefer/Evil-Tuner-XXL/releases/download/v0.2.0/Evil-Tuner-XXL-0.2.0-mpc-armv7.zip\" || wget -q -O /tmp/evil-tuner-xxl.zip \"https://github.com/sunskiefer/Evil-Tuner-XXL/releases/download/v0.2.0/Evil-Tuner-XXL-0.2.0-mpc-armv7.zip\") && unzip -o /tmp/evil-tuner-xxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - Evil Tuner XXL/\" && rm -f /tmp/evil-tuner-xxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2080,9 +2148,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "fizzik", "Fizzik", "saustin2010", "v1.0.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1366", "1.8 MB", "14%",
+            "1369", "1.8 MB", "14%",
             "Filliformes - VST - [SYN] Fizzik", "fizzik.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-fizzik/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-fizzik/releases/download/v1.0.2/SYN-Fizzik-1.0.2-mpc-armv7.zip", "plugins/fizzik/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-fizzik/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-fizzik/releases/download/v1.0.2/SYN-Fizzik-1.0.2-mpc-armv7.zip", "plugins/fizzik/thumb.png",
             "Physical modelling: an exciter and two coupled resonators (string, beam, plate, membrane).", "./plugins/fizzik/install.sh", 0,
             false,
             false,
@@ -2092,10 +2160,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-fm", "Fm", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "89", "8.3 MB", "14%",
+            "91", "8.3 MB", "14%",
             "bombest - VST - Fm", "fm.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/fm.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Fm-0.4.1-mpc-armv7.zip", "plugins/op1fx-fm/thumb.ppm",
-            "Four-operator FM synth with eight voices and four screen knobs. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Fm\" && if [ -f \"./plugins/op1fx-fm/fm.so\" ]; then cp -rf ./plugins/op1fx-fm/* \"$TARGET_SYNTH_DIR/bombest - VST - Fm/\"; else (wget -q -O /tmp/op1fx-fm.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Fm-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-fm.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Fm-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Fm-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-fm.zip) && unzip -o /tmp/op1fx-fm.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Fm/\" && rm -f /tmp/op1fx-fm.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/fm.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Fm-0.4.1-mpc-armv7.zip", "plugins/op1fx-fm/thumb.png",
+            "Four-operator FM synth with eight voices and four screen knobs. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Fm\" && if [ -f \"./plugins/op1fx-fm/fm.so\" ]; then cp -rf ./plugins/op1fx-fm/* \"$TARGET_SYNTH_DIR/bombest - VST - Fm/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-fm.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Fm-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-fm.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Fm-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-fm.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Fm/\" && rm -f /tmp/op1fx-fm.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2104,10 +2172,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "fretty", "Fretty", "3dthc", "v0.8.5", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "1124", "69.8 MB", "14%",
+            "1131", "69.8 MB", "14%",
             "3dthc - VST - Fretty", "fretty.so",
-            "https://raw.githubusercontent.com/3dthc/fretty-mpc/main/docs/images/play_sunburst.png", "https://github.com/3dthc/fretty-mpc/releases/download/v0.8.5/Fretty-0.8.5-mpc-armv7.zip", "plugins/fretty/thumb.ppm",
-            "A guitar instrument for Akai MPC OS standalone devices (native VST2), featuring refined selector typography, 110 presets, and a synth layer.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3dthc - VST - Fretty\" && if [ -f \"./plugins/fretty/fretty.so\" ]; then cp -rf ./plugins/fretty/* \"$TARGET_SYNTH_DIR/3dthc - VST - Fretty/\"; else (wget -q -O /tmp/fretty.zip \"https://github.com/3dthc/fretty-mpc/releases/download/v0.8.5/Fretty-0.8.5-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/fretty.zip \"https://github.com/3dthc/fretty-mpc/releases/download/v0.8.5/Fretty-0.8.5-mpc-armv7.zip\" || curl -k -sL \"https://github.com/3dthc/fretty-mpc/releases/download/v0.8.5/Fretty-0.8.5-mpc-armv7.zip\" -o /tmp/fretty.zip) && unzip -o /tmp/fretty.zip -d \"$TARGET_SYNTH_DIR/3dthc - VST - Fretty/\" && rm -f /tmp/fretty.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/3dthc/fretty-mpc/main/docs/images/play_sunburst.png", "https://github.com/3dthc/fretty-mpc/releases/download/v0.8.5/Fretty-0.8.5-mpc-armv7.zip", "plugins/fretty/thumb.png",
+            "A guitar instrument for Akai MPC OS standalone devices (native VST2), featuring refined selector typography, 110 presets, and a synth layer.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3dthc - VST - Fretty\" && if [ -f \"./plugins/fretty/fretty.so\" ]; then cp -rf ./plugins/fretty/* \"$TARGET_SYNTH_DIR/3dthc - VST - Fretty/\"; else (wget --no-check-certificate -q -O /tmp/fretty.zip \"https://github.com/3dthc/fretty-mpc/releases/download/v0.8.5/Fretty-0.8.5-mpc-armv7.zip\" || wget -q -O /tmp/fretty.zip \"https://github.com/3dthc/fretty-mpc/releases/download/v0.8.5/Fretty-0.8.5-mpc-armv7.zip\") && unzip -o /tmp/fretty.zip -d \"$TARGET_SYNTH_DIR/3dthc - VST - Fretty/\" && rm -f /tmp/fretty.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2116,9 +2184,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "gaiaxxl", "GAIAXXL", "L'Cronx", "v0.1.3", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-22",
-            "832", "7.7 MB", "14%",
+            "836", "7.7 MB", "14%",
             "L'Cronx - VST - GAIAXXL", "gaiaxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/GAIAXXL/v0.1.2/docs/img/tone.png", "https://github.com/sunskiefer/GAIAXXL/releases/download/v0.1.3/GAIAXXL-0.1.3-mpc-armv7.zip", "plugins/gaiaxxl/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/GAIAXXL/v0.1.2/docs/img/tone.png", "https://github.com/sunskiefer/GAIAXXL/releases/download/v0.1.3/GAIAXXL-0.1.3-mpc-armv7.zip", "plugins/gaiaxxl/thumb.png",
             "Three-tone virtual-analog synth modelled on the discontinued Roland GAIA SH-01 (not affiliated with Roland): the editor's parameters over six full-screen pages, 21 oscillator variations (with KORG logue-sdk wave tables), SYNC/RING, the GAIA's effects chain and arpeggiator, two beams, a musical randomizer and 64 patches.", "./plugins/gaiaxxl/install.sh", 0,
             false,
             false,
@@ -2128,10 +2196,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "hank", "Hank", "saustin2010", "v1.1.1", "Fm Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1084", "2.1 MB", "14%",
+            "1089", "2.1 MB", "14%",
             "Charles Vestal - VST - [SYN] Hank", "hank.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-hank/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-hank/releases/download/v1.1.1/SYN-Hank-1.1.1-mpc-armv7.zip", "plugins/hank/thumb.ppm",
-            "Small, immediate two-operator FM synth on one page: ratio, brightness, bite, envelopes, noise; 32 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] Hank\" && if [ -f \"./plugins/hank/hank.so\" ]; then cp -rf ./plugins/hank/* \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] Hank/\"; else (wget -q -O /tmp/hank.zip \"https://github.com/saustin2010/mpc-vst-hank/releases/download/v1.1.1/SYN-Hank-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/hank.zip \"https://github.com/saustin2010/mpc-vst-hank/releases/download/v1.1.1/SYN-Hank-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-hank/releases/download/v1.1.1/SYN-Hank-1.1.1-mpc-armv7.zip\" -o /tmp/hank.zip) && unzip -o /tmp/hank.zip -d \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] Hank/\" && rm -f /tmp/hank.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-hank/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-hank/releases/download/v1.1.1/SYN-Hank-1.1.1-mpc-armv7.zip", "plugins/hank/thumb.png",
+            "Small, immediate two-operator FM synth on one page: ratio, brightness, bite, envelopes, noise; 32 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] Hank\" && if [ -f \"./plugins/hank/hank.so\" ]; then cp -rf ./plugins/hank/* \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] Hank/\"; else (wget --no-check-certificate -q -O /tmp/hank.zip \"https://github.com/saustin2010/mpc-vst-hank/releases/download/v1.1.1/SYN-Hank-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/hank.zip \"https://github.com/saustin2010/mpc-vst-hank/releases/download/v1.1.1/SYN-Hank-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/hank.zip -d \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] Hank/\" && rm -f /tmp/hank.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2140,9 +2208,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "helm", "Helm", "Lewinator56", "v1.0.0", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-04",
-            "1095", "12.3 MB", "14%",
+            "1096", "12.3 MB", "14%",
             "Matt Tytel - VST - Helm", "helm.so",
-            "https://github.com/user-attachments/assets/b537127a-22e6-4e21-b9f1-48e473c892b8", "https://github.com/Lewinator56/mpc-vst-helm/releases/download/1.0.0/Helm-1.0.0-mpc-armv7.zip", "plugins/helm/thumb.ppm",
+            "https://github.com/user-attachments/assets/b537127a-22e6-4e21-b9f1-48e473c892b8", "https://github.com/Lewinator56/mpc-vst-helm/releases/download/1.0.0/Helm-1.0.0-mpc-armv7.zip", "plugins/helm/thumb.png",
             "32-voice polyphonic synthesizer (Helm engine by Matt Tytel) with 2 cross-mod oscillators, sub, noise, multi-mode filter, 3 LFOs, 3 envelopes, 32-step sequencer & arpeggiator, built-in effects and touchscreen skin with Q-Links.", "./plugins/helm/install.sh", 0,
             false,
             false,
@@ -2152,10 +2220,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "hera", "Hera", "saustin2010", "v1.1.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-24",
-            "2183", "3.3 MB", "14%",
+            "2188", "3.3 MB", "14%",
             "jpcima - VST - [SYN] Hera", "hera.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-hera/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-hera/releases/download/v1.1.2/SYN-Hera-1.1.2-mpc-armv7.zip", "plugins/hera/thumb.ppm",
-            "Roland Juno-60: jpcima's Hera engine with its 56 presets, the BBD chorus and a touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jpcima - VST - [SYN] Hera\" && if [ -f \"./plugins/hera/hera.so\" ]; then cp -rf ./plugins/hera/* \"$TARGET_SYNTH_DIR/jpcima - VST - [SYN] Hera/\"; else (wget -q -O /tmp/hera.zip \"https://github.com/saustin2010/mpc-vst-hera/releases/download/v1.1.2/SYN-Hera-1.1.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/hera.zip \"https://github.com/saustin2010/mpc-vst-hera/releases/download/v1.1.2/SYN-Hera-1.1.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-hera/releases/download/v1.1.2/SYN-Hera-1.1.2-mpc-armv7.zip\" -o /tmp/hera.zip) && unzip -o /tmp/hera.zip -d \"$TARGET_SYNTH_DIR/jpcima - VST - [SYN] Hera/\" && rm -f /tmp/hera.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-hera/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-hera/releases/download/v1.1.2/SYN-Hera-1.1.2-mpc-armv7.zip", "plugins/hera/thumb.png",
+            "Roland Juno-60: jpcima's Hera engine with its 56 presets, the BBD chorus and a touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jpcima - VST - [SYN] Hera\" && if [ -f \"./plugins/hera/hera.so\" ]; then cp -rf ./plugins/hera/* \"$TARGET_SYNTH_DIR/jpcima - VST - [SYN] Hera/\"; else (wget --no-check-certificate -q -O /tmp/hera.zip \"https://github.com/saustin2010/mpc-vst-hera/releases/download/v1.1.2/SYN-Hera-1.1.2-mpc-armv7.zip\" || wget -q -O /tmp/hera.zip \"https://github.com/saustin2010/mpc-vst-hera/releases/download/v1.1.2/SYN-Hera-1.1.2-mpc-armv7.zip\") && unzip -o /tmp/hera.zip -d \"$TARGET_SYNTH_DIR/jpcima - VST - [SYN] Hera/\" && rm -f /tmp/hera.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2164,9 +2232,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "hexachord-73", "HexChord 73", "Eurikon", "v1.0.0", "Synth",
             "INST", "Stable", "MPC Live II Retro (3.9.1), MPC Live II Retro (3.10)", "MPC OS 3.x", "2026-10-27",
-            "257", "2.9 MB", "23%",
+            "258", "2.9 MB", "23%",
             "Twisted Cable - VST - HexChord 73", "hexachord-73.so",
-            "https://raw.githubusercontent.com/Eurikon/mpc-vst-plugins/9eed16e63f97e5ad87621a21cead85b6a7fee35b/media/hexachord-73.png", "https://github.com/Eurikon/mpc-vst-plugins/releases/download/hexachord-73-v1.0.0/HexChord-73-1.0.0-mpc-armv7.zip", "plugins/hexachord-73/thumb.ppm",
+            "https://raw.githubusercontent.com/Eurikon/mpc-vst-plugins/9eed16e63f97e5ad87621a21cead85b6a7fee35b/media/hexachord-73.png", "https://github.com/Eurikon/mpc-vst-plugins/releases/download/hexachord-73-v1.0.0/HexChord-73-1.0.0-mpc-armv7.zip", "plugins/hexachord-73/thumb.png",
             "Stereo chord synthesizer with four engines, eight chords, four voicings and a touchscreen chord diagram.", "./plugins/hexachord-73/install.sh", 0,
             false,
             false,
@@ -2176,10 +2244,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "incipience", "Incipience", "saustin2010", "v1.1.1", "Drum Machine",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "777", "7.0 MB", "14%",
+            "782", "7.0 MB", "14%",
             "Steve A - VST - [DRUM] Incipience", "incipience.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-incipience/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-incipience/releases/download/v1.1.1/DRUM-Incipience-1.1.1-mpc-armv7.zip", "plugins/incipience/thumb.ppm",
-            "Eleven-instrument drum synth laid out like the Jomox AlphaBase Mk II (kick, MBrane, hats, clap, rim, cymbals, two sample players, 4-op FM, reverb, delay), with RANDOMISE per instrument and a mod matrix; each instrument chromatic on its own MIDI channel and on its own track with Incipience OUT; plays the AlphaBase's free samples and your own WAVs.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Incipience\" && if [ -f \"./plugins/incipience/incipience.so\" ]; then cp -rf ./plugins/incipience/* \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Incipience/\"; else (wget -q -O /tmp/incipience.zip \"https://github.com/saustin2010/mpc-vst-incipience/releases/download/v1.1.1/DRUM-Incipience-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/incipience.zip \"https://github.com/saustin2010/mpc-vst-incipience/releases/download/v1.1.1/DRUM-Incipience-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-incipience/releases/download/v1.1.1/DRUM-Incipience-1.1.1-mpc-armv7.zip\" -o /tmp/incipience.zip) && unzip -o /tmp/incipience.zip -d \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Incipience/\" && rm -f /tmp/incipience.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-incipience/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-incipience/releases/download/v1.1.1/DRUM-Incipience-1.1.1-mpc-armv7.zip", "plugins/incipience/thumb.png",
+            "Eleven-instrument drum synth laid out like the Jomox AlphaBase Mk II (kick, MBrane, hats, clap, rim, cymbals, two sample players, 4-op FM, reverb, delay), with RANDOMISE per instrument and a mod matrix; each instrument chromatic on its own MIDI channel and on its own track with Incipience OUT; plays the AlphaBase's free samples and your own WAVs.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Incipience\" && if [ -f \"./plugins/incipience/incipience.so\" ]; then cp -rf ./plugins/incipience/* \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Incipience/\"; else (wget --no-check-certificate -q -O /tmp/incipience.zip \"https://github.com/saustin2010/mpc-vst-incipience/releases/download/v1.1.1/DRUM-Incipience-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/incipience.zip \"https://github.com/saustin2010/mpc-vst-incipience/releases/download/v1.1.1/DRUM-Incipience-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/incipience.zip -d \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Incipience/\" && rm -f /tmp/incipience.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2188,10 +2256,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "interzonexxl", "InterzoneXXL", "L'Cronx", "v0.1.3", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-22",
-            "1626", "13.6 MB", "14%",
+            "1632", "13.6 MB", "14%",
             "L'Cronx - VST - InterzoneXXL", "interzonexxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/InterzoneXXL/v0.1.0/docs/img/vco.png", "https://github.com/sunskiefer/InterzoneXXL/releases/download/v0.1.3/InterzoneXXL-0.1.3-mpc-armv7.zip", "plugins/interzonexxl/thumb.ppm",
-            "Valley Audio's Interzone synth voice from VCV Rack, played from MIDI in mono or up to 16-voice poly on the module's own panel. Every input jack is patched to a built-in source (LFOs, sequencers, random) on the MPC tempo, with a brickwall limiter and 16 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - InterzoneXXL\" && if [ -f \"./plugins/interzonexxl/interzonexxl.so\" ]; then cp -rf ./plugins/interzonexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - InterzoneXXL/\"; else (wget -q -O /tmp/interzonexxl.zip \"https://github.com/sunskiefer/InterzoneXXL/releases/download/v0.1.3/InterzoneXXL-0.1.3-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/interzonexxl.zip \"https://github.com/sunskiefer/InterzoneXXL/releases/download/v0.1.3/InterzoneXXL-0.1.3-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/InterzoneXXL/releases/download/v0.1.3/InterzoneXXL-0.1.3-mpc-armv7.zip\" -o /tmp/interzonexxl.zip) && unzip -o /tmp/interzonexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - InterzoneXXL/\" && rm -f /tmp/interzonexxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/InterzoneXXL/v0.1.0/docs/img/vco.png", "https://github.com/sunskiefer/InterzoneXXL/releases/download/v0.1.3/InterzoneXXL-0.1.3-mpc-armv7.zip", "plugins/interzonexxl/thumb.png",
+            "Valley Audio's Interzone synth voice from VCV Rack, played from MIDI in mono or up to 16-voice poly on the module's own panel. Every input jack is patched to a built-in source (LFOs, sequencers, random) on the MPC tempo, with a brickwall limiter and 16 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - InterzoneXXL\" && if [ -f \"./plugins/interzonexxl/interzonexxl.so\" ]; then cp -rf ./plugins/interzonexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - InterzoneXXL/\"; else (wget --no-check-certificate -q -O /tmp/interzonexxl.zip \"https://github.com/sunskiefer/InterzoneXXL/releases/download/v0.1.3/InterzoneXXL-0.1.3-mpc-armv7.zip\" || wget -q -O /tmp/interzonexxl.zip \"https://github.com/sunskiefer/InterzoneXXL/releases/download/v0.1.3/InterzoneXXL-0.1.3-mpc-armv7.zip\") && unzip -o /tmp/interzonexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - InterzoneXXL/\" && rm -f /tmp/interzonexxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2200,9 +2268,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "j106", "JN-106", "sd88me", "v0.2.0", "Synth",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1), Akai MPC Live III (aarch64) (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-28",
-            "716", "25.3 MB", "14%",
+            "720", "25.3 MB", "14%",
             "sd88me - VST - JN-106", "kr106.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-jn106/9053529f679d2a5f07781f002004e27cc12959e0/docs/img/screenshot-lfo-dco.png", "https://github.com/sd88me/mpc-vst-jn106/releases/download/jn-106-vst-v0.2.0/JN-106-0.2.0-mpc-armv7.zip", "plugins/j106/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-jn106/9053529f679d2a5f07781f002004e27cc12959e0/docs/img/screenshot-lfo-dco.png", "https://github.com/sd88me/mpc-vst-jn106/releases/download/jn-106-vst-v0.2.0/JN-106-0.2.0-mpc-armv7.zip", "plugins/j106/thumb.png",
             "Faithful, circuit-modelled and hardware-profiled six-voice Juno emulation (Ultramaster KR-106 DSP): IR3109 filter, BA662 VCA and MN3009 BBD chorus modelled from the circuits, the 106 CPU firmware reimplemented from its disassembly, curves fitted to real hardware and checked against the service notes. 256 factory presets, realistic panel skin.", "./plugins/j106/install.sh", 0,
             false,
             false,
@@ -2212,9 +2280,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "kutilxxl", "KutilXXL", "L'Cronx", "v0.2.1", "Groovebox",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-01",
-            "227", "85.3 MB", "14%",
+            "230", "85.3 MB", "14%",
             "L'Cronx - VST - KutilXXL", "kutilxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/BUSTEDXXL/v0.2.1/docs/img/screen1.png", "https://github.com/sunskiefer/BUSTEDXXL/releases/download/v0.2.1/KutilXXL-0.2.1-mpc-armv7.zip", "plugins/kutilxxl/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/BUSTEDXXL/v0.2.1/docs/img/screen1.png", "https://github.com/sunskiefer/BUSTEDXXL/releases/download/v0.2.1/KutilXXL-0.2.1-mpc-armv7.zip", "plugins/kutilxxl/thumb.png",
             "Groovebox of Bastl-style modules patched with touch cables across three screens: Wave Bard on Bastl's open-source Kastle 2 DSP plus Kompas, Crust 2, Pizza, Alchemist, Basil and ABC. Tap a module to open a window with just its jacks, big and named, and patch between modules.", "./plugins/kutilxxl/install.sh", 0,
             false,
             false,
@@ -2224,9 +2292,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "lucky-dip", "Lucky Dip", "sd88me", "v0.9.2", "Sampler",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 2.x & 3.x", "2026-10-21",
-            "1761", "2.0 MB", "14%",
+            "1764", "2.0 MB", "14%",
             "sd88me - VST - Lucky Dip", "lucky_dip.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-luckydip/main/docs/img/lucky-dip.png", "https://github.com/sd88me/mpc-vst-luckydip/releases/download/v0.9.2/Lucky-Dip-0.9.2-mpc-armv7.zip", "plugins/lucky-dip/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-luckydip/main/docs/img/lucky-dip.png", "https://github.com/sd88me/mpc-vst-luckydip/releases/download/v0.9.2/Lucky-Dip-0.9.2-mpc-armv7.zip", "plugins/lucky-dip/thumb.png",
             "A random 16-pad drum-kit builder and inspiration machine: dips into your sample library, fills the pads at random, plays the kit and exports it as an MPC drum program.", "./plugins/lucky-dip/install.sh", 0,
             false,
             false,
@@ -2236,10 +2304,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "lxrxxl", "LXRXXL", "L'Cronx", "v0.6.1", "Drum Machine",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "3351", "10.2 MB", "14%",
+            "3366", "10.2 MB", "14%",
             "L'Cronx - VST - LXRXXL", "lxrxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/LXR02XXL/v0.6.0/docs/img/page.png", "https://github.com/sunskiefer/LXR02XXL/releases/download/v0.6.1/LXRXXL-0.6.1-mpc-armv7.zip", "plugins/lxrxxl/thumb.ppm",
-            "Inspired by the LXR-02: its open-source sound engine (GPL-3.0) with the real FX unit and the plate reverb, the whole panel on one page, 64-step sequencer with songs, rolls and a euclidean generator, Force pads playing the voices, randomizers and the Hrtl LXR-02 DLC presets old and new. Artwork by Suns Kiefer.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL\" && if [ -f \"./plugins/lxrxxl/lxrxxl.so\" ]; then cp -rf ./plugins/lxrxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL/\"; else (wget -q -O /tmp/lxrxxl.zip \"https://github.com/sunskiefer/LXR02XXL/releases/download/v0.6.1/LXRXXL-0.6.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/lxrxxl.zip \"https://github.com/sunskiefer/LXR02XXL/releases/download/v0.6.1/LXRXXL-0.6.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/LXR02XXL/releases/download/v0.6.1/LXRXXL-0.6.1-mpc-armv7.zip\" -o /tmp/lxrxxl.zip) && unzip -o /tmp/lxrxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL/\" && rm -f /tmp/lxrxxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/LXR02XXL/v0.6.0/docs/img/page.png", "https://github.com/sunskiefer/LXR02XXL/releases/download/v0.6.1/LXRXXL-0.6.1-mpc-armv7.zip", "plugins/lxrxxl/thumb.png",
+            "Inspired by the LXR-02: its open-source sound engine (GPL-3.0) with the real FX unit and the plate reverb, the whole panel on one page, 64-step sequencer with songs, rolls and a euclidean generator, Force pads playing the voices, randomizers and the Hrtl LXR-02 DLC presets old and new. Artwork by Suns Kiefer.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL\" && if [ -f \"./plugins/lxrxxl/lxrxxl.so\" ]; then cp -rf ./plugins/lxrxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL/\"; else (wget --no-check-certificate -q -O /tmp/lxrxxl.zip \"https://github.com/sunskiefer/LXR02XXL/releases/download/v0.6.1/LXRXXL-0.6.1-mpc-armv7.zip\" || wget -q -O /tmp/lxrxxl.zip \"https://github.com/sunskiefer/LXR02XXL/releases/download/v0.6.1/LXRXXL-0.6.1-mpc-armv7.zip\") && unzip -o /tmp/lxrxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL/\" && rm -f /tmp/lxrxxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2248,9 +2316,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "lxrxxl-bazzline", "LXRXXL BAZZLINE", "L'Cronx", "v0.2.10", "Bass Synth",
             "INST", "Stable", "Akai Force (3.9.1)", "MPC OS 3.x", "2026-10-22",
-            "3025", "16.2 MB", "14%",
+            "3039", "16.2 MB", "14%",
             "L'Cronx - VST - LXRXXL BAZZLINE", "lxrxxl_bazzline.so",
-            "https://raw.githubusercontent.com/sunskiefer/LXRXXL-BAZZLINE/v0.2.2/docs/img/panel.png", "https://github.com/sunskiefer/LXRXXL-BAZZLINE/releases/download/v0.2.10/LXRXXL-BAZZLINE-0.2.10-mpc-armv7.zip", "plugins/lxrxxl-bazzline/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/LXRXXL-BAZZLINE/v0.2.2/docs/img/panel.png", "https://github.com/sunskiefer/LXRXXL-BAZZLINE/releases/download/v0.2.10/LXRXXL-BAZZLINE-0.2.10-mpc-armv7.zip", "plugins/lxrxxl-bazzline/thumb.png",
             "An 8-track bass synth: a variation of LXRXXL with bass voices inspired by the Erica Synths Bassline DB-01 on the LXR's oscillators, the LXR-02 style sequencer with the DB-01's step functions, a tape/digital delay, a MIDI gate/duck, an 8-track mixer and sound / performance presets saved on the device.", "./plugins/lxrxxl-bazzline/install.sh", 0,
             false,
             false,
@@ -2260,10 +2328,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "lxrxxl-zynth", "LXRXXL ZYNTH", "L'Cronx", "v0.2.2", "Synth",
             "INST", "Stable", "Akai Force (3.9.1)", "MPC OS 3.x", "2026-10-22",
-            "1201", "22.4 MB", "14%",
+            "1207", "22.4 MB", "14%",
             "L'Cronx - VST - LXRXXL ZYNTH", "lxrxxl_zynth.so",
-            "https://raw.githubusercontent.com/sunskiefer/LXRXXL-ZYNTH/v0.2.0/docs/img/panel.png", "https://github.com/sunskiefer/LXRXXL-ZYNTH/releases/download/v0.2.2/LXRXXL-ZYNTH-0.2.2-mpc-armv7.zip", "plugins/lxrxxl-zynth/thumb.ppm",
-            "An experimental 8-track synth with 19 voices on unconventional maths (Lorenz chaos, Hilbert frequency shifter, Euclidean rhythms) and voices coded after the DX7, CZ, Minimoog, Hammond, NES chips, Braids and Plaits. LXR-02 style sequencer with random functions, tape/digital delay, mixer and presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL ZYNTH\" && if [ -f \"./plugins/lxrxxl-zynth/lxrxxl_zynth.so\" ]; then cp -rf ./plugins/lxrxxl-zynth/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL ZYNTH/\"; else (wget -q -O /tmp/lxrxxl-zynth.zip \"https://github.com/sunskiefer/LXRXXL-ZYNTH/releases/download/v0.2.2/LXRXXL-ZYNTH-0.2.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/lxrxxl-zynth.zip \"https://github.com/sunskiefer/LXRXXL-ZYNTH/releases/download/v0.2.2/LXRXXL-ZYNTH-0.2.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/LXRXXL-ZYNTH/releases/download/v0.2.2/LXRXXL-ZYNTH-0.2.2-mpc-armv7.zip\" -o /tmp/lxrxxl-zynth.zip) && unzip -o /tmp/lxrxxl-zynth.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL ZYNTH/\" && rm -f /tmp/lxrxxl-zynth.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/LXRXXL-ZYNTH/v0.2.0/docs/img/panel.png", "https://github.com/sunskiefer/LXRXXL-ZYNTH/releases/download/v0.2.2/LXRXXL-ZYNTH-0.2.2-mpc-armv7.zip", "plugins/lxrxxl-zynth/thumb.png",
+            "An experimental 8-track synth with 19 voices on unconventional maths (Lorenz chaos, Hilbert frequency shifter, Euclidean rhythms) and voices coded after the DX7, CZ, Minimoog, Hammond, NES chips, Braids and Plaits. LXR-02 style sequencer with random functions, tape/digital delay, mixer and presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL ZYNTH\" && if [ -f \"./plugins/lxrxxl-zynth/lxrxxl_zynth.so\" ]; then cp -rf ./plugins/lxrxxl-zynth/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL ZYNTH/\"; else (wget --no-check-certificate -q -O /tmp/lxrxxl-zynth.zip \"https://github.com/sunskiefer/LXRXXL-ZYNTH/releases/download/v0.2.2/LXRXXL-ZYNTH-0.2.2-mpc-armv7.zip\" || wget -q -O /tmp/lxrxxl-zynth.zip \"https://github.com/sunskiefer/LXRXXL-ZYNTH/releases/download/v0.2.2/LXRXXL-ZYNTH-0.2.2-mpc-armv7.zip\") && unzip -o /tmp/lxrxxl-zynth.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - LXRXXL ZYNTH/\" && rm -f /tmp/lxrxxl-zynth.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2271,10 +2339,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         },
         {
             "machinemodule", "Machinemodule", "sd88me", "v1.0.3", "Drum Machine",
-            "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
+            "INST", "Stable", "MPC Live III (Gen2) (MPC OS 3.10.1)", "MPC OS 2.x & 3.x", "2026-11-04",
             "100", "2.0 MB", "14%",
             "sd88me - VST - Machinemodule", "machinemodule.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-machinedrum/main/docs/img/machinemodule.png", "", "plugins/machinemodule/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-machinedrum/main/docs/img/machinemodule.png", "", "plugins/machinemodule/thumb.png",
             "The Elektron Machinedrum SPS-1 UW sound engine as a native instrument: all 16 tracks from one plugin instance, with its own touchscreen skin and Q-Links.", "./plugins/machinemodule/install.sh", 0,
             false,
             false,
@@ -2283,11 +2351,11 @@ void LauncherConfig::loadEmbeddedDefaults() {
         },
         {
             "machinemodule-gen2", "Machinemodule (Gen2)", "sd88me", "v1.0.3", "Drum Machine",
-            "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-04",
-            "406", "7.7 MB", "14%",
+            "INST", "Stable", "MPC Live III (Gen2) (MPC OS 3.10.1)", "MPC OS 3.x", "2026-11-04",
+            "413", "7.7 MB", "14%",
             "sd88me - VST - Machinemodule", "machinedrum_one.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-machinedrum/main/docs/img/machinemodule-gen2.png", "https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-1.0.3-mpc-aarch64.zip", "plugins/machinemodule-gen2/thumb.ppm",
-            "The Elektron Machinedrum UW sound engine as an instrument for Gen2 MPC devices: 16 tracks in one plugin, touchscreen skin, bank and kit lists, Q-Links. A ready-made download with nothing of Elektron's in it: you add your own OS file (and optionally your flash image) in the plugin folder. Gen2 only.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Machinemodule\" && if [ -f \"./plugins/machinemodule-gen2/machinedrum_one.so\" ]; then cp -rf ./plugins/machinemodule-gen2/* \"$TARGET_SYNTH_DIR/sd88me - VST - Machinemodule/\"; else (wget -q -O /tmp/machinemodule-gen2.zip \"https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-1.0.3-mpc-aarch64.zip\" || wget --no-check-certificate -q -O /tmp/machinemodule-gen2.zip \"https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-1.0.3-mpc-aarch64.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-1.0.3-mpc-aarch64.zip\" -o /tmp/machinemodule-gen2.zip) && unzip -o /tmp/machinemodule-gen2.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Machinemodule/\" && rm -f /tmp/machinemodule-gen2.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-machinedrum/main/docs/img/machinemodule-gen2.png", "https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-1.0.3-mpc-aarch64.zip", "plugins/machinemodule-gen2/thumb.png",
+            "The Elektron Machinedrum UW sound engine as an instrument for Gen2 MPC devices: 16 tracks in one plugin, touchscreen skin, bank and kit lists, Q-Links. A ready-made download with nothing of Elektron's in it: you add your own OS file (and optionally your flash image) in the plugin folder. Gen2 only.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Machinemodule\" && if [ -f \"./plugins/machinemodule-gen2/machinedrum_one.so\" ]; then cp -rf ./plugins/machinemodule-gen2/* \"$TARGET_SYNTH_DIR/sd88me - VST - Machinemodule/\"; else (wget --no-check-certificate -q -O /tmp/machinemodule-gen2.zip \"https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-1.0.3-mpc-aarch64.zip\" || wget -q -O /tmp/machinemodule-gen2.zip \"https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-1.0.3-mpc-aarch64.zip\") && unzip -o /tmp/machinemodule-gen2.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Machinemodule/\" && rm -f /tmp/machinemodule-gen2.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2296,10 +2364,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "braids", "Macro Osc", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1849", "8.0 MB", "14%",
+            "1853", "8.0 MB", "14%",
             "Émilie Gillet - VST - [SYN] Macro Osc", "braids.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-macro-osc/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-macro-osc/releases/download/v1.1.1/SYN-Macro-Osc-1.1.1-mpc-armv7.zip", "plugins/braids/thumb.ppm",
-            "Macro Osc: a macro oscillator with 47 synthesis models, from Émilie Gillet's open-source Braids.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Macro Osc\" && if [ -f \"./plugins/braids/braids.so\" ]; then cp -rf ./plugins/braids/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Macro Osc/\"; else (wget -q -O /tmp/braids.zip \"https://github.com/saustin2010/mpc-vst-macro-osc/releases/download/v1.1.1/SYN-Macro-Osc-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/braids.zip \"https://github.com/saustin2010/mpc-vst-macro-osc/releases/download/v1.1.1/SYN-Macro-Osc-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-macro-osc/releases/download/v1.1.1/SYN-Macro-Osc-1.1.1-mpc-armv7.zip\" -o /tmp/braids.zip) && unzip -o /tmp/braids.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Macro Osc/\" && rm -f /tmp/braids.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-macro-osc/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-macro-osc/releases/download/v1.1.1/SYN-Macro-Osc-1.1.1-mpc-armv7.zip", "plugins/braids/thumb.png",
+            "Macro Osc: a macro oscillator with 47 synthesis models, from Émilie Gillet's open-source Braids.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Macro Osc\" && if [ -f \"./plugins/braids/braids.so\" ]; then cp -rf ./plugins/braids/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Macro Osc/\"; else (wget --no-check-certificate -q -O /tmp/braids.zip \"https://github.com/saustin2010/mpc-vst-macro-osc/releases/download/v1.1.1/SYN-Macro-Osc-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/braids.zip \"https://github.com/saustin2010/mpc-vst-macro-osc/releases/download/v1.1.1/SYN-Macro-Osc-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/braids.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Macro Osc/\" && rm -f /tmp/braids.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2308,10 +2376,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "maschine-group", "Maschine Group", "mmiroshnikov", "v1.0.0", "Sampler",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-13",
-            "517", "169 KB", "14%",
+            "518", "169 KB", "14%",
             "mmiroshnikov - VST - Maschine Group", "maschine_group.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-maschine-group/main/docs/group.png", "https://github.com/mmiroshnikov/mpc-maschine-group/releases/download/maschine-group-v1.0.0/Maschine-Group-1.0.0-mpc-armv7.zip", "plugins/maschine-group/thumb.ppm",
-            "Opens a Native Instruments Maschine 2 drum group (.mxgrp) and plays its pads and stored patterns, with a three-page touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/mmiroshnikov - VST - Maschine Group\" && if [ -f \"./plugins/maschine-group/maschine_group.so\" ]; then cp -rf ./plugins/maschine-group/* \"$TARGET_SYNTH_DIR/mmiroshnikov - VST - Maschine Group/\"; else (wget -q -O /tmp/maschine-group.zip \"https://github.com/mmiroshnikov/mpc-maschine-group/releases/download/maschine-group-v1.0.0/Maschine-Group-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/maschine-group.zip \"https://github.com/mmiroshnikov/mpc-maschine-group/releases/download/maschine-group-v1.0.0/Maschine-Group-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-maschine-group/releases/download/maschine-group-v1.0.0/Maschine-Group-1.0.0-mpc-armv7.zip\" -o /tmp/maschine-group.zip) && unzip -o /tmp/maschine-group.zip -d \"$TARGET_SYNTH_DIR/mmiroshnikov - VST - Maschine Group/\" && rm -f /tmp/maschine-group.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-maschine-group/main/docs/group.png", "https://github.com/mmiroshnikov/mpc-maschine-group/releases/download/maschine-group-v1.0.0/Maschine-Group-1.0.0-mpc-armv7.zip", "plugins/maschine-group/thumb.png",
+            "Opens a Native Instruments Maschine 2 drum group (.mxgrp) and plays its pads and stored patterns, with a three-page touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/mmiroshnikov - VST - Maschine Group\" && if [ -f \"./plugins/maschine-group/maschine_group.so\" ]; then cp -rf ./plugins/maschine-group/* \"$TARGET_SYNTH_DIR/mmiroshnikov - VST - Maschine Group/\"; else (wget --no-check-certificate -q -O /tmp/maschine-group.zip \"https://github.com/mmiroshnikov/mpc-maschine-group/releases/download/maschine-group-v1.0.0/Maschine-Group-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/maschine-group.zip \"https://github.com/mmiroshnikov/mpc-maschine-group/releases/download/maschine-group-v1.0.0/Maschine-Group-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/maschine-group.zip -d \"$TARGET_SYNTH_DIR/mmiroshnikov - VST - Maschine Group/\" && rm -f /tmp/maschine-group.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2320,10 +2388,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "maze-voice", "Maze Voice", "sd88me", "v1.0.5", "Synth",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1), Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "3495", "4.2 MB", "14%",
+            "3501", "4.2 MB", "14%",
             "sd88me - VST - Maze Voice", "maze_voice.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-maze/main/docs/img/maze-voice.png", "https://github.com/sd88me/mpc-vst-maze/releases/download/maze-voice-vst-v1.0.5/Maze-Voice-1.0.5-mpc-armv7.zip", "plugins/maze-voice/thumb.ppm",
-            "Monophonic Moog Labyrinth-style thru-zero oscillator, wavefolder and state-variable filter voice with two LFOs, a page randomiser and a three-page touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Maze Voice\" && if [ -f \"./plugins/maze-voice/maze_voice.so\" ]; then cp -rf ./plugins/maze-voice/* \"$TARGET_SYNTH_DIR/sd88me - VST - Maze Voice/\"; else (wget -q -O /tmp/maze-voice.zip \"https://github.com/sd88me/mpc-vst-maze/releases/download/maze-voice-vst-v1.0.5/Maze-Voice-1.0.5-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/maze-voice.zip \"https://github.com/sd88me/mpc-vst-maze/releases/download/maze-voice-vst-v1.0.5/Maze-Voice-1.0.5-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-maze/releases/download/maze-voice-vst-v1.0.5/Maze-Voice-1.0.5-mpc-armv7.zip\" -o /tmp/maze-voice.zip) && unzip -o /tmp/maze-voice.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Maze Voice/\" && rm -f /tmp/maze-voice.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-maze/main/docs/img/maze-voice.png", "https://github.com/sd88me/mpc-vst-maze/releases/download/maze-voice-vst-v1.0.5/Maze-Voice-1.0.5-mpc-armv7.zip", "plugins/maze-voice/thumb.png",
+            "Monophonic Moog Labyrinth-style thru-zero oscillator, wavefolder and state-variable filter voice with two LFOs, a page randomiser and a three-page touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Maze Voice\" && if [ -f \"./plugins/maze-voice/maze_voice.so\" ]; then cp -rf ./plugins/maze-voice/* \"$TARGET_SYNTH_DIR/sd88me - VST - Maze Voice/\"; else (wget --no-check-certificate -q -O /tmp/maze-voice.zip \"https://github.com/sd88me/mpc-vst-maze/releases/download/maze-voice-vst-v1.0.5/Maze-Voice-1.0.5-mpc-armv7.zip\" || wget -q -O /tmp/maze-voice.zip \"https://github.com/sd88me/mpc-vst-maze/releases/download/maze-voice-vst-v1.0.5/Maze-Voice-1.0.5-mpc-armv7.zip\") && unzip -o /tmp/maze-voice.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Maze Voice/\" && rm -f /tmp/maze-voice.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2332,9 +2400,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "meowsynth", "MeowSynth", "mcardonaserrano", "v1.0.2", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-10-22",
-            "1275", "4.5 MB", "14%",
+            "1277", "4.5 MB", "14%",
             "knobster - VST - MeowSynth", "meowsynth.so",
-            "https://raw.githubusercontent.com/mcardonaserrano/meowsynth-mpc/main/previews/meow_page_meowing.png", "https://github.com/mcardonaserrano/meowsynth-mpc/releases/download/v1.0.2/MeowSynth-1.0.2-mpc-armv7.zip", "plugins/meowsynth/thumb.ppm",
+            "https://raw.githubusercontent.com/mcardonaserrano/meowsynth-mpc/main/previews/meow_page_meowing.png", "https://github.com/mcardonaserrano/meowsynth-mpc/releases/download/v1.0.2/MeowSynth-1.0.2-mpc-armv7.zip", "plugins/meowsynth/thumb.png",
             "knobster's MeowSynth rebuilt natively from the original's SynthEdit patch: a ramp oscillator through an envelope-following resonant filter that meows, five cats, vibrato and chorus, with the original's look and a meowing cat on the touchscreen and Q-Links.", "./plugins/meowsynth/install.sh", 0,
             false,
             false,
@@ -2344,9 +2412,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "meta4mpcxxl", "Meta4MPCXXL", "L'Cronx", "v0.1.2", "Modular",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "397", "11.2 MB", "14%",
+            "399", "11.2 MB", "14%",
             "L'Cronx - VST - Meta4MPCXXL", "meta4mpcxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/Meta4MPCXXL/v0.1.1/docs/img/meta4mpcxxl.png", "https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-0.1.2-mpc-armv7.zip", "plugins/meta4mpcxxl/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/Meta4MPCXXL/v0.1.1/docs/img/meta4mpcxxl.png", "https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-0.1.2-mpc-armv7.zip", "plugins/meta4mpcxxl/thumb.png",
             "Plays 4ms MetaModule-format patches (VCV Rack patches exported with the MetaModule hub) with 4ms's own open-source patch player and 215 built-in modules: every parameter on Q-Link pages, MIDI and the Force's clock into the patch, pads and keys to the hub's gate/CV inputs, patch outs 3-8 as MIDI for a CV track, and Wi-Fi patch upload from VCV Rack.", "./plugins/meta4mpcxxl/install.sh", 0,
             false,
             false,
@@ -2356,10 +2424,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "jv-880", "Mini-JV", "sd88me", "v1.0.9", "Rompler",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 2.x & 3.x", "2026-11-01",
-            "6058", "1.7 MB", "14%",
+            "6070", "1.7 MB", "14%",
             "sd88me - VST - JV-880", "jv880.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-jv880/f24bd1c922f2e8b2cf56eb497c6e13465ef8dad3/docs/screenshots/jv880.png", "https://github.com/sd88me/mpc-vst-jv880/releases/download/v1.0.9/JV-880-1.0.9-mpc-armv7.zip", "plugins/jv-880/thumb.ppm",
-            "An emulation of the Roland JV-880 sample-based sound engine as a native instrument, with the original reverb and chorus, a Play page with eight macros and a touchscreen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - JV-880\" && if [ -f \"./plugins/jv-880/jv880.so\" ]; then cp -rf ./plugins/jv-880/* \"$TARGET_SYNTH_DIR/sd88me - VST - JV-880/\"; else (wget -q -O /tmp/jv-880.zip \"https://github.com/sd88me/mpc-vst-jv880/releases/download/v1.0.9/JV-880-1.0.9-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/jv-880.zip \"https://github.com/sd88me/mpc-vst-jv880/releases/download/v1.0.9/JV-880-1.0.9-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-jv880/releases/download/v1.0.9/JV-880-1.0.9-mpc-armv7.zip\" -o /tmp/jv-880.zip) && unzip -o /tmp/jv-880.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - JV-880/\" && rm -f /tmp/jv-880.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-jv880/f24bd1c922f2e8b2cf56eb497c6e13465ef8dad3/docs/screenshots/jv880.png", "https://github.com/sd88me/mpc-vst-jv880/releases/download/v1.0.9/JV-880-1.0.9-mpc-armv7.zip", "plugins/jv-880/thumb.png",
+            "An emulation of the Roland JV-880 sample-based sound engine as a native instrument, with the original reverb and chorus, a Play page with eight macros and a touchscreen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - JV-880\" && if [ -f \"./plugins/jv-880/jv880.so\" ]; then cp -rf ./plugins/jv-880/* \"$TARGET_SYNTH_DIR/sd88me - VST - JV-880/\"; else (wget --no-check-certificate -q -O /tmp/jv-880.zip \"https://github.com/sd88me/mpc-vst-jv880/releases/download/v1.0.9/JV-880-1.0.9-mpc-armv7.zip\" || wget -q -O /tmp/jv-880.zip \"https://github.com/sd88me/mpc-vst-jv880/releases/download/v1.0.9/JV-880-1.0.9-mpc-armv7.zip\") && unzip -o /tmp/jv-880.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - JV-880/\" && rm -f /tmp/jv-880.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2368,9 +2436,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "elements", "Modal Voice", "saustin2010", "v1.2.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1692", "1.2 MB", "14%",
+            "1698", "1.2 MB", "14%",
             "Émilie Gillet - VST - [SYN] Modal Voice", "elements.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-modal-voice/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-modal-voice/releases/download/v1.2.1/SYN-Modal-Voice-1.2.1-mpc-armv7.zip", "plugins/elements/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-modal-voice/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-modal-voice/releases/download/v1.2.1/SYN-Modal-Voice-1.2.1-mpc-armv7.zip", "plugins/elements/thumb.png",
             "Modal Voice: a modal synthesis voice you bow, blow and strike, with 12 presets, from Émilie Gillet's open-source Elements.", "./plugins/elements/install.sh", 0,
             false,
             false,
@@ -2380,10 +2448,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "model-72", "Model-72", "sd88me", "v1.0.1", "Synth",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "856", "31.6 MB", "14%",
+            "859", "31.6 MB", "14%",
             "sd88me - VST - Model-72", "model72.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-model72/main/docs/img/mixer_filter.png", "https://github.com/sd88me/mpc-vst-model72/releases/download/model72-v1.0.1/Model-72-1.0.1-mpc-armv7.zip", "plugins/model-72/thumb.ppm",
-            "A port of Idle Foundry's CA-72, a circuit-modelled 1970s Minimoog Model-D: three oscillators, the ladder filter and contours, mono, poly or unison with stereo and 19 presets. LO is the fitted light model; HI runs the circuit's own filter in real time.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Model-72\" && if [ -f \"./plugins/model-72/model72.so\" ]; then cp -rf ./plugins/model-72/* \"$TARGET_SYNTH_DIR/sd88me - VST - Model-72/\"; else (wget -q -O /tmp/model-72.zip \"https://github.com/sd88me/mpc-vst-model72/releases/download/model72-v1.0.1/Model-72-1.0.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/model-72.zip \"https://github.com/sd88me/mpc-vst-model72/releases/download/model72-v1.0.1/Model-72-1.0.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-model72/releases/download/model72-v1.0.1/Model-72-1.0.1-mpc-armv7.zip\" -o /tmp/model-72.zip) && unzip -o /tmp/model-72.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Model-72/\" && rm -f /tmp/model-72.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-model72/main/docs/img/mixer_filter.png", "https://github.com/sd88me/mpc-vst-model72/releases/download/model72-v1.0.1/Model-72-1.0.1-mpc-armv7.zip", "plugins/model-72/thumb.png",
+            "A port of Idle Foundry's CA-72, a circuit-modelled 1970s Minimoog Model-D: three oscillators, the ladder filter and contours, mono, poly or unison with stereo and 19 presets. LO is the fitted light model; HI runs the circuit's own filter in real time.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Model-72\" && if [ -f \"./plugins/model-72/model72.so\" ]; then cp -rf ./plugins/model-72/* \"$TARGET_SYNTH_DIR/sd88me - VST - Model-72/\"; else (wget --no-check-certificate -q -O /tmp/model-72.zip \"https://github.com/sd88me/mpc-vst-model72/releases/download/model72-v1.0.1/Model-72-1.0.1-mpc-armv7.zip\" || wget -q -O /tmp/model-72.zip \"https://github.com/sd88me/mpc-vst-model72/releases/download/model72-v1.0.1/Model-72-1.0.1-mpc-armv7.zip\") && unzip -o /tmp/model-72.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Model-72/\" && rm -f /tmp/model-72.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2392,9 +2460,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "monksynth", "MonkSynth", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1211", "1.6 MB", "14%",
+            "1215", "1.6 MB", "14%",
             "Jonathan Taylor - VST - [SYN] MonkSynth", "monksynth.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-monksynth/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-monksynth/releases/download/v1.1.1/SYN-MonkSynth-1.1.1-mpc-armv7.zip", "plugins/monksynth/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-monksynth/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-monksynth/releases/download/v1.1.1/SYN-MonkSynth-1.1.1-mpc-armv7.zip", "plugins/monksynth/thumb.png",
             "A formant (FOF) singing voice with 12 characters and a choir.", "./plugins/monksynth/install.sh", 0,
             false,
             false,
@@ -2404,10 +2472,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mono-voice", "Mono Voice", "saustin2010", "v1.0.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1378", "250 KB", "14%",
+            "1381", "250 KB", "14%",
             "timncox - VST - [SYN] Mono Voice", "monovoice.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-monovoice/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-monovoice/releases/download/v1.0.2/SYN-Mono-Voice-1.0.2-mpc-armv7.zip", "plugins/mono-voice/thumb.ppm",
-            "Elektron Monomachine-style digital voice: SuperWave, SID, DigiPRO, FM and more machines; 12 factory patches.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/timncox - VST - [SYN] Mono Voice\" && if [ -f \"./plugins/mono-voice/monovoice.so\" ]; then cp -rf ./plugins/mono-voice/* \"$TARGET_SYNTH_DIR/timncox - VST - [SYN] Mono Voice/\"; else (wget -q -O /tmp/mono-voice.zip \"https://github.com/saustin2010/mpc-vst-monovoice/releases/download/v1.0.2/SYN-Mono-Voice-1.0.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/mono-voice.zip \"https://github.com/saustin2010/mpc-vst-monovoice/releases/download/v1.0.2/SYN-Mono-Voice-1.0.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-monovoice/releases/download/v1.0.2/SYN-Mono-Voice-1.0.2-mpc-armv7.zip\" -o /tmp/mono-voice.zip) && unzip -o /tmp/mono-voice.zip -d \"$TARGET_SYNTH_DIR/timncox - VST - [SYN] Mono Voice/\" && rm -f /tmp/mono-voice.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-monovoice/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-monovoice/releases/download/v1.0.2/SYN-Mono-Voice-1.0.2-mpc-armv7.zip", "plugins/mono-voice/thumb.png",
+            "Elektron Monomachine-style digital voice: SuperWave, SID, DigiPRO, FM and more machines; 12 factory patches.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/timncox - VST - [SYN] Mono Voice\" && if [ -f \"./plugins/mono-voice/monovoice.so\" ]; then cp -rf ./plugins/mono-voice/* \"$TARGET_SYNTH_DIR/timncox - VST - [SYN] Mono Voice/\"; else (wget --no-check-certificate -q -O /tmp/mono-voice.zip \"https://github.com/saustin2010/mpc-vst-monovoice/releases/download/v1.0.2/SYN-Mono-Voice-1.0.2-mpc-armv7.zip\" || wget -q -O /tmp/mono-voice.zip \"https://github.com/saustin2010/mpc-vst-monovoice/releases/download/v1.0.2/SYN-Mono-Voice-1.0.2-mpc-armv7.zip\") && unzip -o /tmp/mono-voice.zip -d \"$TARGET_SYNTH_DIR/timncox - VST - [SYN] Mono Voice/\" && rm -f /tmp/mono-voice.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2415,11 +2483,11 @@ void LauncherConfig::loadEmbeddedDefaults() {
         },
         {
             "monomodule-one-gen2", "Monomodule One (Gen2)", "sd88me", "v1.0.4", "Synth",
-            "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-04",
-            "264", "4.2 MB", "14%",
+            "INST", "Stable", "MPC Live III (Gen2) (MPC OS 3.10.1)", "MPC OS 3.x", "2026-11-04",
+            "271", "4.2 MB", "14%",
             "sd88me - VST - Monomodule One", "monomodule_one.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-monomodule/main/docs/img/monomodule-gen2.png", "https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-One-1.0.4-mpc-aarch64.zip", "plugins/monomodule-one-gen2/thumb.ppm",
-            "The Elektron Monomachine's synth engine (15 machines) as an instrument for Gen2 MPC devices, with a touchscreen skin, banks and preset lists, and Q-Links. A ready-made download: nothing of Elektron's is in the zip; you put your own Monomachine OS file in the plugin folder and it makes its skin and sound from that. Gen2 (aarch64) only.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Monomodule One\" && if [ -f \"./plugins/monomodule-one-gen2/monomodule_one.so\" ]; then cp -rf ./plugins/monomodule-one-gen2/* \"$TARGET_SYNTH_DIR/sd88me - VST - Monomodule One/\"; else (wget -q -O /tmp/monomodule-one-gen2.zip \"https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-One-1.0.4-mpc-aarch64.zip\" || wget --no-check-certificate -q -O /tmp/monomodule-one-gen2.zip \"https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-One-1.0.4-mpc-aarch64.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-One-1.0.4-mpc-aarch64.zip\" -o /tmp/monomodule-one-gen2.zip) && unzip -o /tmp/monomodule-one-gen2.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Monomodule One/\" && rm -f /tmp/monomodule-one-gen2.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-monomodule/main/docs/img/monomodule-gen2.png", "https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-One-1.0.4-mpc-aarch64.zip", "plugins/monomodule-one-gen2/thumb.png",
+            "The Elektron Monomachine's synth engine (15 machines) as an instrument for Gen2 MPC devices, with a touchscreen skin, banks and preset lists, and Q-Links. A ready-made download: nothing of Elektron's is in the zip; you put your own Monomachine OS file in the plugin folder and it makes its skin and sound from that. Gen2 (aarch64) only.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Monomodule One\" && if [ -f \"./plugins/monomodule-one-gen2/monomodule_one.so\" ]; then cp -rf ./plugins/monomodule-one-gen2/* \"$TARGET_SYNTH_DIR/sd88me - VST - Monomodule One/\"; else (wget --no-check-certificate -q -O /tmp/monomodule-one-gen2.zip \"https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-One-1.0.4-mpc-aarch64.zip\" || wget -q -O /tmp/monomodule-one-gen2.zip \"https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-One-1.0.4-mpc-aarch64.zip\") && unzip -o /tmp/monomodule-one-gen2.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Monomodule One/\" && rm -f /tmp/monomodule-one-gen2.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2427,10 +2495,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         },
         {
             "monomodule", "Monomodule One + FX", "sd88me", "v1.0.4", "Synth",
-            "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
+            "INST", "Stable", "MPC Live III (Gen2) (MPC OS 3.10.1)", "MPC OS 2.x & 3.x", "2026-11-04",
             "100", "2.0 MB", "14%",
             "sd88me - VST - Monomodule One + FX", "monomodule.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-monomodule/main/docs/img/monomodule.png", "", "plugins/monomodule/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-monomodule/main/docs/img/monomodule.png", "", "plugins/monomodule/thumb.png",
             "The Elektron Monomachine's synth engine (15 machines) as an instrument, plus its 7 effect machines as an audio effect, each with a touchscreen skin and Q-Links.", "./plugins/monomodule/install.sh", 0,
             false,
             false,
@@ -2440,10 +2508,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "monoslide", "MonoSlide", "Eurikon", "v1.0.3", "Synth",
             "INST", "Stable", "MPC Live II Retro (3.9.1), MPC Live II Retro (3.10)", "MPC OS 3.x", "2026-10-27",
-            "245", "4.5 MB", "11%",
+            "246", "4.5 MB", "11%",
             "Twisted Cable - VST - MonoSlide", "monoslide.so",
-            "https://raw.githubusercontent.com/Eurikon/mpc-vst-plugins/0b9a58444c7d84a78e38d95818eeb53172195782/media/monoslide.png", "https://github.com/Eurikon/mpc-vst-plugins/releases/download/monoslide-v1.0.3/MonoSlide-1.0.3-mpc-armv7.zip", "plugins/monoslide/thumb.ppm",
-            "Monophonic acid bass voice with overlapping-note slide, velocity accents and an MPC touchscreen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Twisted Cable - VST - MonoSlide\" && if [ -f \"./plugins/monoslide/monoslide.so\" ]; then cp -rf ./plugins/monoslide/* \"$TARGET_SYNTH_DIR/Twisted Cable - VST - MonoSlide/\"; else (wget -q -O /tmp/monoslide.zip \"https://github.com/Eurikon/mpc-vst-plugins/releases/download/monoslide-v1.0.3/MonoSlide-1.0.3-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/monoslide.zip \"https://github.com/Eurikon/mpc-vst-plugins/releases/download/monoslide-v1.0.3/MonoSlide-1.0.3-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Eurikon/mpc-vst-plugins/releases/download/monoslide-v1.0.3/MonoSlide-1.0.3-mpc-armv7.zip\" -o /tmp/monoslide.zip) && unzip -o /tmp/monoslide.zip -d \"$TARGET_SYNTH_DIR/Twisted Cable - VST - MonoSlide/\" && rm -f /tmp/monoslide.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Eurikon/mpc-vst-plugins/0b9a58444c7d84a78e38d95818eeb53172195782/media/monoslide.png", "https://github.com/Eurikon/mpc-vst-plugins/releases/download/monoslide-v1.0.3/MonoSlide-1.0.3-mpc-armv7.zip", "plugins/monoslide/thumb.png",
+            "Monophonic acid bass voice with overlapping-note slide, velocity accents and an MPC touchscreen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Twisted Cable - VST - MonoSlide\" && if [ -f \"./plugins/monoslide/monoslide.so\" ]; then cp -rf ./plugins/monoslide/* \"$TARGET_SYNTH_DIR/Twisted Cable - VST - MonoSlide/\"; else (wget --no-check-certificate -q -O /tmp/monoslide.zip \"https://github.com/Eurikon/mpc-vst-plugins/releases/download/monoslide-v1.0.3/MonoSlide-1.0.3-mpc-armv7.zip\" || wget -q -O /tmp/monoslide.zip \"https://github.com/Eurikon/mpc-vst-plugins/releases/download/monoslide-v1.0.3/MonoSlide-1.0.3-mpc-armv7.zip\") && unzip -o /tmp/monoslide.zip -d \"$TARGET_SYNTH_DIR/Twisted Cable - VST - MonoSlide/\" && rm -f /tmp/monoslide.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2452,9 +2520,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "morpho-pe", "Morpho-PE", "sd88me", "v1.0.2", "Synth",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "1568", "2.2 MB", "14%",
+            "1571", "2.2 MB", "14%",
             "sd88me - VST - Morpho-PE", "morpho_pe.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-morpho-PE/main/docs/img/morpho-pe.png", "https://github.com/sd88me/mpc-vst-morpho-PE/releases/download/morpho-pe-v1.0.2/Morpho-PE-1.0.2-mpc-armv7.zip", "plugins/morpho-pe/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-morpho-PE/main/docs/img/morpho-pe.png", "https://github.com/sd88me/mpc-vst-morpho-PE/releases/download/morpho-pe-v1.0.2/Morpho-PE-1.0.2-mpc-armv7.zip", "plugins/morpho-pe/thumb.png",
             "Four-voice synthesizer modelled on the Poly Evolver's voice: analog-style and digital waveshape oscillators, 2/4-pole lowpass, delay, feedback, distortion, 4 x 16 step sequencer, a bank browser and a touchscreen skin with Q-Links. Loads Poly Evolver program dumps and, from your own Prophet VS ROM chip images, the 95 factory waves.", "./plugins/morpho-pe/install.sh", 0,
             false,
             false,
@@ -2464,10 +2532,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mpc-plaits", "MPC Plaits", "poloq", "v1.0.1", "Synth",
             "INST", "Stable", "Akai MPC One (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-05",
-            "2085", "5.5 MB", "24%",
+            "2087", "5.5 MB", "24%",
             "poloq - VST - MPC Plaits", "plaits.so",
-            "https://raw.githubusercontent.com/poloq-instruments/mpc-vst-plaits/a30c24b83663a5efead73bbaca674ba4502a3eb5/docs/screenshots/card.png", "https://github.com/poloq-instruments/mpc-vst-plaits/releases/download/v1.0.1/MPC-Plaits-1.0.1-mpc-armv7.zip", "plugins/mpc-plaits/thumb.ppm",
-            "Mutable Instruments Plaits, all 24 models, with LFOs, envelopes, two mod matrices, tempo sync and a touchscreen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/poloq - VST - MPC Plaits\" && if [ -f \"./plugins/mpc-plaits/plaits.so\" ]; then cp -rf ./plugins/mpc-plaits/* \"$TARGET_SYNTH_DIR/poloq - VST - MPC Plaits/\"; else (wget -q -O /tmp/mpc-plaits.zip \"https://github.com/poloq-instruments/mpc-vst-plaits/releases/download/v1.0.1/MPC-Plaits-1.0.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/mpc-plaits.zip \"https://github.com/poloq-instruments/mpc-vst-plaits/releases/download/v1.0.1/MPC-Plaits-1.0.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/poloq-instruments/mpc-vst-plaits/releases/download/v1.0.1/MPC-Plaits-1.0.1-mpc-armv7.zip\" -o /tmp/mpc-plaits.zip) && unzip -o /tmp/mpc-plaits.zip -d \"$TARGET_SYNTH_DIR/poloq - VST - MPC Plaits/\" && rm -f /tmp/mpc-plaits.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/poloq-instruments/mpc-vst-plaits/a30c24b83663a5efead73bbaca674ba4502a3eb5/docs/screenshots/card.png", "https://github.com/poloq-instruments/mpc-vst-plaits/releases/download/v1.0.1/MPC-Plaits-1.0.1-mpc-armv7.zip", "plugins/mpc-plaits/thumb.png",
+            "Mutable Instruments Plaits, all 24 models, with LFOs, envelopes, two mod matrices, tempo sync and a touchscreen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/poloq - VST - MPC Plaits\" && if [ -f \"./plugins/mpc-plaits/plaits.so\" ]; then cp -rf ./plugins/mpc-plaits/* \"$TARGET_SYNTH_DIR/poloq - VST - MPC Plaits/\"; else (wget --no-check-certificate -q -O /tmp/mpc-plaits.zip \"https://github.com/poloq-instruments/mpc-vst-plaits/releases/download/v1.0.1/MPC-Plaits-1.0.1-mpc-armv7.zip\" || wget -q -O /tmp/mpc-plaits.zip \"https://github.com/poloq-instruments/mpc-vst-plaits/releases/download/v1.0.1/MPC-Plaits-1.0.1-mpc-armv7.zip\") && unzip -o /tmp/mpc-plaits.zip -d \"$TARGET_SYNTH_DIR/poloq - VST - MPC Plaits/\" && rm -f /tmp/mpc-plaits.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2476,9 +2544,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mr-drums", "Mr Drums", "saustin2010", "v1.1.1", "Sampler",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1111", "464 KB", "14%",
+            "1116", "464 KB", "14%",
             "Move Everything - VST - [DRUM] Mr Drums", "mrdrums.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-mrdrums/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-mrdrums/releases/download/v1.1.1/DRUM-Mr-Drums-1.1.1-mpc-armv7.zip", "plugins/mr-drums/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-mrdrums/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-mrdrums/releases/download/v1.1.1/DRUM-Mr-Drums-1.1.1-mpc-armv7.zip", "plugins/mr-drums/thumb.png",
             "A 16-pad drum sampler: kits of samples on pads 36-51.", "./plugins/mr-drums/install.sh", 0,
             false,
             false,
@@ -2488,10 +2556,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mr-hyde", "Mr Hyde", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1588", "1.9 MB", "14%",
+            "1592", "1.9 MB", "14%",
             "Move Everything - VST - [SYN] Mr Hyde", "mrhyde.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-mrhyde/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-mrhyde/releases/download/v1.1.1/SYN-Mr-Hyde-1.1.1-mpc-armv7.zip", "plugins/mr-hyde/thumb.ppm",
-            "MicroFreak-style voice on Plaits' 17 models, with a low-pass gate, filter, cycling envelope and a 6x6 mod matrix; 19 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Move Everything - VST - [SYN] Mr Hyde\" && if [ -f \"./plugins/mr-hyde/mrhyde.so\" ]; then cp -rf ./plugins/mr-hyde/* \"$TARGET_SYNTH_DIR/Move Everything - VST - [SYN] Mr Hyde/\"; else (wget -q -O /tmp/mr-hyde.zip \"https://github.com/saustin2010/mpc-vst-mrhyde/releases/download/v1.1.1/SYN-Mr-Hyde-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/mr-hyde.zip \"https://github.com/saustin2010/mpc-vst-mrhyde/releases/download/v1.1.1/SYN-Mr-Hyde-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-mrhyde/releases/download/v1.1.1/SYN-Mr-Hyde-1.1.1-mpc-armv7.zip\" -o /tmp/mr-hyde.zip) && unzip -o /tmp/mr-hyde.zip -d \"$TARGET_SYNTH_DIR/Move Everything - VST - [SYN] Mr Hyde/\" && rm -f /tmp/mr-hyde.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-mrhyde/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-mrhyde/releases/download/v1.1.1/SYN-Mr-Hyde-1.1.1-mpc-armv7.zip", "plugins/mr-hyde/thumb.png",
+            "MicroFreak-style voice on Plaits' 17 models, with a low-pass gate, filter, cycling envelope and a 6x6 mod matrix; 19 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Move Everything - VST - [SYN] Mr Hyde\" && if [ -f \"./plugins/mr-hyde/mrhyde.so\" ]; then cp -rf ./plugins/mr-hyde/* \"$TARGET_SYNTH_DIR/Move Everything - VST - [SYN] Mr Hyde/\"; else (wget --no-check-certificate -q -O /tmp/mr-hyde.zip \"https://github.com/saustin2010/mpc-vst-mrhyde/releases/download/v1.1.1/SYN-Mr-Hyde-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/mr-hyde.zip \"https://github.com/saustin2010/mpc-vst-mrhyde/releases/download/v1.1.1/SYN-Mr-Hyde-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/mr-hyde.zip -d \"$TARGET_SYNTH_DIR/Move Everything - VST - [SYN] Mr Hyde/\" && rm -f /tmp/mr-hyde.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2500,9 +2568,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "ms20xxl", "MS20XXL", "L'Cronx", "v0.1.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-27",
-            "655", "19.3 MB", "14%",
+            "658", "19.3 MB", "14%",
             "L'Cronx - VST - MS20XXL", "ms20xxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/MS20XXL/v0.1.1/docs/img/patch.png", "https://github.com/sunskiefer/MS20XXL/releases/download/v0.1.2/MS20XXL-0.1.2-mpc-armv7.zip", "plugins/ms20xxl/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/MS20XXL/v0.1.1/docs/img/patch.png", "https://github.com/sunskiefer/MS20XXL/releases/download/v0.1.2/MS20XXL-0.1.2-mpc-armv7.zip", "plugins/ms20xxl/thumb.png",
             "Korg MS-20-style semi-modular mono synth, circuit-modelled from the MS-20 schematics: the KLM-307 (MK2) and KORG35 (MK1) filter boards solved from their circuit equations, Hz/V sockets, the panel's voltage laws. Every MS-20 patch jack in its place, normalled like the hardware, patched by touch; an SQ-10-style sequencer; 63 patches with cables.", "./plugins/ms20xxl/install.sh", 0,
             false,
             false,
@@ -2512,10 +2580,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mutable-vibe", "Mutable Vibe MPC", "nachtaktiv303", "v0.9.3", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "2365", "1.1 MB", "14%",
+            "2371", "1.1 MB", "14%",
             "nachtaktiv303 - VST - Mutable Vibe MPC", "mutable_vibe_mpc.so",
-            "https://raw.githubusercontent.com/nachtaktiv303/mpc-vst-mutable-vibe/main/preview_0.png", "https://github.com/nachtaktiv303/mpc-vst-mutable-vibe/releases/download/mutable-vibe-vst-v0.9.3/Mutable-Vibe-MPC-0.9.3-mpc-armv7.zip", "plugins/mutable-vibe/thumb.ppm",
-            "Mutable Instruments Rings + Plaits in one synth: 6 resonator models and 14 melodic macro-oscillator engines, with filter, FX, 4 envelopes, 4 LFOs, a mod matrix and tempo sync, plus a touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/nachtaktiv303 - VST - Mutable Vibe MPC\" && if [ -f \"./plugins/mutable-vibe/mutable_vibe_mpc.so\" ]; then cp -rf ./plugins/mutable-vibe/* \"$TARGET_SYNTH_DIR/nachtaktiv303 - VST - Mutable Vibe MPC/\"; else (wget -q -O /tmp/mutable-vibe.zip \"https://github.com/nachtaktiv303/mpc-vst-mutable-vibe/releases/download/mutable-vibe-vst-v0.9.3/Mutable-Vibe-MPC-0.9.3-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/mutable-vibe.zip \"https://github.com/nachtaktiv303/mpc-vst-mutable-vibe/releases/download/mutable-vibe-vst-v0.9.3/Mutable-Vibe-MPC-0.9.3-mpc-armv7.zip\" || curl -k -sL \"https://github.com/nachtaktiv303/mpc-vst-mutable-vibe/releases/download/mutable-vibe-vst-v0.9.3/Mutable-Vibe-MPC-0.9.3-mpc-armv7.zip\" -o /tmp/mutable-vibe.zip) && unzip -o /tmp/mutable-vibe.zip -d \"$TARGET_SYNTH_DIR/nachtaktiv303 - VST - Mutable Vibe MPC/\" && rm -f /tmp/mutable-vibe.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/nachtaktiv303/mpc-vst-mutable-vibe/main/preview_0.png", "https://github.com/nachtaktiv303/mpc-vst-mutable-vibe/releases/download/mutable-vibe-vst-v0.9.3/Mutable-Vibe-MPC-0.9.3-mpc-armv7.zip", "plugins/mutable-vibe/thumb.png",
+            "Mutable Instruments Rings + Plaits in one synth: 6 resonator models and 14 melodic macro-oscillator engines, with filter, FX, 4 envelopes, 4 LFOs, a mod matrix and tempo sync, plus a touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/nachtaktiv303 - VST - Mutable Vibe MPC\" && if [ -f \"./plugins/mutable-vibe/mutable_vibe_mpc.so\" ]; then cp -rf ./plugins/mutable-vibe/* \"$TARGET_SYNTH_DIR/nachtaktiv303 - VST - Mutable Vibe MPC/\"; else (wget --no-check-certificate -q -O /tmp/mutable-vibe.zip \"https://github.com/nachtaktiv303/mpc-vst-mutable-vibe/releases/download/mutable-vibe-vst-v0.9.3/Mutable-Vibe-MPC-0.9.3-mpc-armv7.zip\" || wget -q -O /tmp/mutable-vibe.zip \"https://github.com/nachtaktiv303/mpc-vst-mutable-vibe/releases/download/mutable-vibe-vst-v0.9.3/Mutable-Vibe-MPC-0.9.3-mpc-armv7.zip\") && unzip -o /tmp/mutable-vibe.zip -d \"$TARGET_SYNTH_DIR/nachtaktiv303 - VST - Mutable Vibe MPC/\" && rm -f /tmp/mutable-vibe.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2524,9 +2592,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "noisemaker", "Noisemaker", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1170", "5.3 MB", "14%",
+            "1173", "5.3 MB", "14%",
             "TAL - VST - [SYN] Noisemaker", "noisemaker.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-noisemaker/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-noisemaker/releases/download/v1.1.1/SYN-Noisemaker-1.1.1-mpc-armv7.zip", "plugins/noisemaker/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-noisemaker/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-noisemaker/releases/download/v1.1.1/SYN-Noisemaker-1.1.1-mpc-armv7.zip", "plugins/noisemaker/thumb.png",
             "TAL-NoiseMaker: a virtual-analog polysynth with 12 filter types, three envelopes and effects; all 256 factory presets built in, and folders of .noisemakerpreset files load as banks (the README links a free collection of 442).", "./plugins/noisemaker/install.sh", 0,
             false,
             false,
@@ -2536,10 +2604,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "nusaw", "NuSaw", "saustin2010", "v1.0.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1287", "2.2 MB", "14%",
+            "1292", "2.2 MB", "14%",
             "Charles Vestal - VST - [SYN] NuSaw", "nusaw.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-nusaw/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-nusaw/releases/download/v1.0.2/SYN-NuSaw-1.0.2-mpc-armv7.zip", "plugins/nusaw/thumb.ppm",
-            "Detuned supersaw polysynth with a sub, resonant filter, chorus and delay; 27 presets for pads, stabs and leads.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] NuSaw\" && if [ -f \"./plugins/nusaw/nusaw.so\" ]; then cp -rf ./plugins/nusaw/* \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] NuSaw/\"; else (wget -q -O /tmp/nusaw.zip \"https://github.com/saustin2010/mpc-vst-nusaw/releases/download/v1.0.2/SYN-NuSaw-1.0.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/nusaw.zip \"https://github.com/saustin2010/mpc-vst-nusaw/releases/download/v1.0.2/SYN-NuSaw-1.0.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-nusaw/releases/download/v1.0.2/SYN-NuSaw-1.0.2-mpc-armv7.zip\" -o /tmp/nusaw.zip) && unzip -o /tmp/nusaw.zip -d \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] NuSaw/\" && rm -f /tmp/nusaw.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-nusaw/v1.0.2/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-nusaw/releases/download/v1.0.2/SYN-NuSaw-1.0.2-mpc-armv7.zip", "plugins/nusaw/thumb.png",
+            "Detuned supersaw polysynth with a sub, resonant filter, chorus and delay; 27 presets for pads, stabs and leads.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] NuSaw\" && if [ -f \"./plugins/nusaw/nusaw.so\" ]; then cp -rf ./plugins/nusaw/* \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] NuSaw/\"; else (wget --no-check-certificate -q -O /tmp/nusaw.zip \"https://github.com/saustin2010/mpc-vst-nusaw/releases/download/v1.0.2/SYN-NuSaw-1.0.2-mpc-armv7.zip\" || wget -q -O /tmp/nusaw.zip \"https://github.com/saustin2010/mpc-vst-nusaw/releases/download/v1.0.2/SYN-NuSaw-1.0.2-mpc-armv7.zip\") && unzip -o /tmp/nusaw.zip -d \"$TARGET_SYNTH_DIR/Charles Vestal - VST - [SYN] NuSaw/\" && rm -f /tmp/nusaw.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2548,9 +2616,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "obxd", "OB-Xd", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1503", "1.5 MB", "14%",
+            "1507", "1.5 MB", "14%",
             "reales - VST - [SYN] OB-Xd", "obxd.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-obxd/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-obxd/releases/download/v1.1.1/SYN-OB-Xd-1.1.1-mpc-armv7.zip", "plugins/obxd/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-obxd/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-obxd/releases/download/v1.1.1/SYN-OB-Xd-1.1.1-mpc-armv7.zip", "plugins/obxd/thumb.png",
             "OB-Xd, the Oberheim OB-X emulation: two oscillators with sync and cross-mod, a 12/24 dB filter, voice variation; 128 presets.", "./plugins/obxd/install.sh", 0,
             false,
             false,
@@ -2560,10 +2628,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "obxdmpc", "OB-Xd MPC", "3dthc", "v0.4.5", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "1424", "10.7 MB", "14%",
+            "1431", "10.7 MB", "14%",
             "sd88me - VST - OB-Xd", "obxd.so",
-            "https://raw.githubusercontent.com/3dthc/OB-XD-MPC/master/docs/screenshots/obxd-mpc-black.png", "https://github.com/3dthc/OB-XD-MPC/releases/download/ob-xd-mpc-0.4.5/OB-Xd-0.4.5-mpc-armv7.zip", "plugins/obxdmpc/thumb.ppm",
-            "OB-Xd, the Oberheim OB-X emulation: two oscillators with sync and cross-mod, a 12/24 dB filter, voice variation; 128 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - OB-Xd\" && if [ -f \"./plugins/obxdmpc/obxd.so\" ]; then cp -rf ./plugins/obxdmpc/* \"$TARGET_SYNTH_DIR/sd88me - VST - OB-Xd/\"; else (wget -q -O /tmp/obxdmpc.zip \"https://github.com/3dthc/OB-XD-MPC/releases/download/ob-xd-mpc-0.4.5/OB-Xd-0.4.5-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/obxdmpc.zip \"https://github.com/3dthc/OB-XD-MPC/releases/download/ob-xd-mpc-0.4.5/OB-Xd-0.4.5-mpc-armv7.zip\" || curl -k -sL \"https://github.com/3dthc/OB-XD-MPC/releases/download/ob-xd-mpc-0.4.5/OB-Xd-0.4.5-mpc-armv7.zip\" -o /tmp/obxdmpc.zip) && unzip -o /tmp/obxdmpc.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - OB-Xd/\" && rm -f /tmp/obxdmpc.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/3dthc/OB-XD-MPC/master/docs/screenshots/obxd-mpc-black.png", "https://github.com/3dthc/OB-XD-MPC/releases/download/ob-xd-mpc-0.4.5/OB-Xd-0.4.5-mpc-armv7.zip", "plugins/obxdmpc/thumb.png",
+            "OB-Xd, the Oberheim OB-X emulation: two oscillators with sync and cross-mod, a 12/24 dB filter, voice variation; 128 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - OB-Xd\" && if [ -f \"./plugins/obxdmpc/obxd.so\" ]; then cp -rf ./plugins/obxdmpc/* \"$TARGET_SYNTH_DIR/sd88me - VST - OB-Xd/\"; else (wget --no-check-certificate -q -O /tmp/obxdmpc.zip \"https://github.com/3dthc/OB-XD-MPC/releases/download/ob-xd-mpc-0.4.5/OB-Xd-0.4.5-mpc-armv7.zip\" || wget -q -O /tmp/obxdmpc.zip \"https://github.com/3dthc/OB-XD-MPC/releases/download/ob-xd-mpc-0.4.5/OB-Xd-0.4.5-mpc-armv7.zip\") && unzip -o /tmp/obxdmpc.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - OB-Xd/\" && rm -f /tmp/obxdmpc.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2572,9 +2640,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "odin2", "Odin 2", "3dthc", "v1.4.6", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "1326", "17.6 MB", "14%",
+            "1332", "17.6 MB", "14%",
             "3dthc - VST - Odin 2", "odin2.so",
-            "https://raw.githubusercontent.com/3dthc/Odin2-MPC/main/odin2-mpc-main.png", "https://github.com/3dthc/Odin2-MPC/releases/download/odin2-v1.4.6/Odin-2-1.4.6-mpc-armv7.zip", "plugins/odin2/thumb.ppm",
+            "https://raw.githubusercontent.com/3dthc/Odin2-MPC/main/odin2-mpc-main.png", "https://github.com/3dthc/Odin2-MPC/releases/download/odin2-v1.4.6/Odin-2-1.4.6-mpc-armv7.zip", "plugins/odin2/thumb.png",
             "Odin 2 synthesizer ported to standalone Akai MPC devices as a native VST2 plugin. Features Odin's original engine, 261 factory patches, touchscreen pages, automatic voice management and a CPU meter. Tested on an Akai MPC Live II; unofficial port.", "./plugins/odin2/install.sh", 0,
             false,
             false,
@@ -2584,10 +2652,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "omni-sampler", "Omni Sampler", "MrHighMan", "v1.8.1", "Sampler",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-02",
-            "2796", "5.0 MB", "20%",
+            "2802", "5.0 MB", "20%",
             "MR HighMan - VST - Omni Sampler", "omni_sampler.so",
-            "https://raw.githubusercontent.com/B0ss-M/MrHighMan/main/docs/screenshot.png", "https://github.com/B0ss-M/MrHighMan/releases/download/v1.8.1/Omni-Sampler-1.8.1-mpc-armv7.zip", "plugins/omni-sampler/thumb.ppm",
-            "Multi-format sampler: plays Akai, E-mu, Roland, Kontakt/Maschine, SF2 and SFZ instruments straight from their files or sampler disk images, with layers, keyswitching, a mod matrix and its own screen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MR HighMan - VST - Omni Sampler\" && if [ -f \"./plugins/omni-sampler/omni_sampler.so\" ]; then cp -rf ./plugins/omni-sampler/* \"$TARGET_SYNTH_DIR/MR HighMan - VST - Omni Sampler/\"; else (wget -q -O /tmp/omni-sampler.zip \"https://github.com/B0ss-M/MrHighMan/releases/download/v1.8.1/Omni-Sampler-1.8.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/omni-sampler.zip \"https://github.com/B0ss-M/MrHighMan/releases/download/v1.8.1/Omni-Sampler-1.8.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/B0ss-M/MrHighMan/releases/download/v1.8.1/Omni-Sampler-1.8.1-mpc-armv7.zip\" -o /tmp/omni-sampler.zip) && unzip -o /tmp/omni-sampler.zip -d \"$TARGET_SYNTH_DIR/MR HighMan - VST - Omni Sampler/\" && rm -f /tmp/omni-sampler.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/B0ss-M/MrHighMan/main/docs/screenshot.png", "https://github.com/B0ss-M/MrHighMan/releases/download/v1.8.1/Omni-Sampler-1.8.1-mpc-armv7.zip", "plugins/omni-sampler/thumb.png",
+            "Multi-format sampler: plays Akai, E-mu, Roland, Kontakt/Maschine, SF2 and SFZ instruments straight from their files or sampler disk images, with layers, keyswitching, a mod matrix and its own screen skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MR HighMan - VST - Omni Sampler\" && if [ -f \"./plugins/omni-sampler/omni_sampler.so\" ]; then cp -rf ./plugins/omni-sampler/* \"$TARGET_SYNTH_DIR/MR HighMan - VST - Omni Sampler/\"; else (wget --no-check-certificate -q -O /tmp/omni-sampler.zip \"https://github.com/B0ss-M/MrHighMan/releases/download/v1.8.1/Omni-Sampler-1.8.1-mpc-armv7.zip\" || wget -q -O /tmp/omni-sampler.zip \"https://github.com/B0ss-M/MrHighMan/releases/download/v1.8.1/Omni-Sampler-1.8.1-mpc-armv7.zip\") && unzip -o /tmp/omni-sampler.zip -d \"$TARGET_SYNTH_DIR/MR HighMan - VST - Omni Sampler/\" && rm -f /tmp/omni-sampler.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2596,9 +2664,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "plugin-manager-g2", "Open MPC Plugin Manager G2", "sd88me", "v0.2.5", "Utility",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-31",
-            "843", "18.6 MB", "14%",
+            "851", "18.6 MB", "14%",
             "OpenMPC - VST - Plugin Manager G2", "openmpc_pm_g2.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/588466d/tools/plugin_manager_g2/docs/screenshots/manager-discover-light.png", "https://github.com/open-mpc/mpc-vst-plugins/releases/download/plugin-manager-g2-v0.2.5/Plugin-Manager-G2-0.2.5-mpc-armv7.zip", "plugins/plugin-manager-g2/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/588466d/tools/plugin_manager_g2/docs/screenshots/manager-discover-light.png", "https://github.com/open-mpc/mpc-vst-plugins/releases/download/plugin-manager-g2-v0.2.5/Plugin-Manager-G2-0.2.5-mpc-armv7.zip", "plugins/plugin-manager-g2/thumb.png",
             "The official OpenMPC plugin manager for Gen1 and Gen2 MPCs (32-bit build for Force, Live, One, X, Key; 64-bit for the Live III and kin). Browse this catalog and install, update and remove plugins on the MPC itself, with rollback if an install fails. Built on poloq's mpc-vst-manager.", "./plugins/plugin-manager-g2/install.sh", 0,
             false,
             false,
@@ -2608,10 +2676,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "open303", "Open303", "saustin2010", "v1.2.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1999", "2.0 MB", "14%",
+            "2011", "2.0 MB", "14%",
             "Robin Schmidt - VST - [SYN] Open303", "acid303.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-open303/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-open303/releases/download/v1.2.1/SYN-Open303-1.2.1-mpc-armv7.zip", "plugins/open303/thumb.ppm",
-            "TB-303 bass line: Open303 with the Devilfish mods, a drive stage and 13 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Robin Schmidt - VST - [SYN] Open303\" && if [ -f \"./plugins/open303/acid303.so\" ]; then cp -rf ./plugins/open303/* \"$TARGET_SYNTH_DIR/Robin Schmidt - VST - [SYN] Open303/\"; else (wget -q -O /tmp/open303.zip \"https://github.com/saustin2010/mpc-vst-open303/releases/download/v1.2.1/SYN-Open303-1.2.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/open303.zip \"https://github.com/saustin2010/mpc-vst-open303/releases/download/v1.2.1/SYN-Open303-1.2.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-open303/releases/download/v1.2.1/SYN-Open303-1.2.1-mpc-armv7.zip\" -o /tmp/open303.zip) && unzip -o /tmp/open303.zip -d \"$TARGET_SYNTH_DIR/Robin Schmidt - VST - [SYN] Open303/\" && rm -f /tmp/open303.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-open303/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-open303/releases/download/v1.2.1/SYN-Open303-1.2.1-mpc-armv7.zip", "plugins/open303/thumb.png",
+            "TB-303 bass line: Open303 with the Devilfish mods, a drive stage and 13 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Robin Schmidt - VST - [SYN] Open303\" && if [ -f \"./plugins/open303/acid303.so\" ]; then cp -rf ./plugins/open303/* \"$TARGET_SYNTH_DIR/Robin Schmidt - VST - [SYN] Open303/\"; else (wget --no-check-certificate -q -O /tmp/open303.zip \"https://github.com/saustin2010/mpc-vst-open303/releases/download/v1.2.1/SYN-Open303-1.2.1-mpc-armv7.zip\" || wget -q -O /tmp/open303.zip \"https://github.com/saustin2010/mpc-vst-open303/releases/download/v1.2.1/SYN-Open303-1.2.1-mpc-armv7.zip\") && unzip -o /tmp/open303.zip -d \"$TARGET_SYNTH_DIR/Robin Schmidt - VST - [SYN] Open303/\" && rm -f /tmp/open303.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2620,9 +2688,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "osirus", "Osirus", "sd88me", "v0.2.10", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-03",
-            "681", "4.3 MB", "14%",
+            "691", "4.3 MB", "14%",
             "sd88me - VST - Osirus", "osirus.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-osirus/e39d03c538f4fde79d558cd4c423b18964cc5ffc/docs/screenshots/osirus-osc.png", "https://github.com/sd88me/mpc-vst-osirus/releases/download/v0.2.10/Osirus-0.2.10-mpc-aarch64.zip", "plugins/osirus/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-osirus/e39d03c538f4fde79d558cd4c423b18964cc5ffc/docs/screenshots/osirus-osc.png", "https://github.com/sd88me/mpc-vst-osirus/releases/download/v0.2.10/Osirus-0.2.10-mpc-aarch64.zip", "plugins/osirus/thumb.png",
             "An emulation of the Access Virus A, B and C synthesizers' original firmware (gearmulator's DSP56300 emulator) as a native instrument for Gen2 MPC devices, with a touchscreen skin, banks and patch browser, Q-Link control and knob values on every page. Gen2 (aarch64) only; you need your own Virus ROM.", "./plugins/osirus/install.sh", 0,
             false,
             false,
@@ -2632,10 +2700,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "percolator", "Percolator", "saustin2010", "v2.1.0", "Drum Machine",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "2363", "6.6 MB", "14%",
+            "2379", "6.6 MB", "14%",
             "Steve A - VST - [DRUM] Percolator", "percolator.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-percolator/v2.1.0/screenshots/page_1.png", "https://github.com/saustin2010/mpc-vst-percolator/releases/download/v2.1.0/DRUM-Percolator-2.1.0-mpc-armv7.zip", "plugins/percolator/thumb.ppm",
-            "Four-voice percussion synth laid out like the Erica Synths Pērkons HD-01 (three algorithms per voice, BBD delay, LFO to every knob), with envelope displays; each voice on its own MIDI channel with the Pērkons' CCs, and on its own track with Percolator OUT; plays the Pērkons' free kit packs.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Percolator\" && if [ -f \"./plugins/percolator/percolator.so\" ]; then cp -rf ./plugins/percolator/* \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Percolator/\"; else (wget -q -O /tmp/percolator.zip \"https://github.com/saustin2010/mpc-vst-percolator/releases/download/v2.1.0/DRUM-Percolator-2.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/percolator.zip \"https://github.com/saustin2010/mpc-vst-percolator/releases/download/v2.1.0/DRUM-Percolator-2.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-percolator/releases/download/v2.1.0/DRUM-Percolator-2.1.0-mpc-armv7.zip\" -o /tmp/percolator.zip) && unzip -o /tmp/percolator.zip -d \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Percolator/\" && rm -f /tmp/percolator.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-percolator/v2.1.0/screenshots/page_1.png", "https://github.com/saustin2010/mpc-vst-percolator/releases/download/v2.1.0/DRUM-Percolator-2.1.0-mpc-armv7.zip", "plugins/percolator/thumb.png",
+            "Four-voice percussion synth laid out like the Erica Synths Pērkons HD-01 (three algorithms per voice, BBD delay, LFO to every knob), with envelope displays; each voice on its own MIDI channel with the Pērkons' CCs, and on its own track with Percolator OUT; plays the Pērkons' free kit packs.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Percolator\" && if [ -f \"./plugins/percolator/percolator.so\" ]; then cp -rf ./plugins/percolator/* \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Percolator/\"; else (wget --no-check-certificate -q -O /tmp/percolator.zip \"https://github.com/saustin2010/mpc-vst-percolator/releases/download/v2.1.0/DRUM-Percolator-2.1.0-mpc-armv7.zip\" || wget -q -O /tmp/percolator.zip \"https://github.com/saustin2010/mpc-vst-percolator/releases/download/v2.1.0/DRUM-Percolator-2.1.0-mpc-armv7.zip\") && unzip -o /tmp/percolator.zip -d \"$TARGET_SYNTH_DIR/Steve A - VST - [DRUM] Percolator/\" && rm -f /tmp/percolator.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2644,10 +2712,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-phase", "Phase", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "84", "7.5 MB", "14%",
+            "86", "7.5 MB", "14%",
             "bombest - VST - Phase", "phase.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/phase.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phase-0.4.1-mpc-armv7.zip", "plugins/op1fx-phase/thumb.ppm",
-            "Eight-voice phase-distortion synth, designed from the OP-1 screen.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Phase\" && if [ -f \"./plugins/op1fx-phase/phase.so\" ]; then cp -rf ./plugins/op1fx-phase/* \"$TARGET_SYNTH_DIR/bombest - VST - Phase/\"; else (wget -q -O /tmp/op1fx-phase.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phase-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-phase.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phase-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phase-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-phase.zip) && unzip -o /tmp/op1fx-phase.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Phase/\" && rm -f /tmp/op1fx-phase.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/phase.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phase-0.4.1-mpc-armv7.zip", "plugins/op1fx-phase/thumb.png",
+            "Eight-voice phase-distortion synth, designed from the OP-1 screen.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Phase\" && if [ -f \"./plugins/op1fx-phase/phase.so\" ]; then cp -rf ./plugins/op1fx-phase/* \"$TARGET_SYNTH_DIR/bombest - VST - Phase/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-phase.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phase-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-phase.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phase-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-phase.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Phase/\" && rm -f /tmp/op1fx-phase.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2656,9 +2724,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "polywerk", "PolyWerk", "Devko", "v0.0.6", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "195", "6.3 MB", "14%",
+            "196", "6.3 MB", "14%",
             "Devko - VST - PolyWerk", "polywerk.so",
-            "https://raw.githubusercontent.com/Devko/PolyWerk/main/docs/img/waves.png", "https://github.com/Devko/PolyWerk/releases/download/v0.0.6/PolyWerk-0.0.6-mpc-armv7.zip", "plugins/polywerk/thumb.ppm",
+            "https://raw.githubusercontent.com/Devko/PolyWerk/main/docs/img/waves.png", "https://github.com/Devko/PolyWerk/releases/download/v0.0.6/PolyWerk-0.0.6-mpc-armv7.zip", "plugins/polywerk/thumb.png",
             "Eight-voice wavetable synth: two wavetable oscillators with 8x unison and subs, 30 built-in tables plus your own Serum-format WAVs, two filters with comb and vowel, two LFOs, a 12-slot mod matrix, arpeggiator and sequencers, 205 presets and a seven-tab touchscreen skin with Q-Links.", "./plugins/polywerk/install.sh", 0,
             false,
             false,
@@ -2668,10 +2736,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "potentialbreaks", "PotentialBreaks", "PotentialBreaks", "v1.1.1", "Sampler",
             "INST", "Stable", "MPC One (HAKAI 3.10)", "MPC OS 3.x", "2026-11-05",
-            "4", "230 KB", "14%",
+            "6", "230 KB", "14%",
             "PotentialBreaks - VST - PotentialBreaks", "potentialbreaks.so",
-            "https://raw.githubusercontent.com/PotentialBreakfast/mpc-vst-potentialbreaks/0a21900bf9b95201f10e0b4106a5303e6ce3d60e/docs/images/potentialbreaks.png", "https://github.com/PotentialBreakfast/mpc-vst-potentialbreaks/releases/download/v1.1.1/PotentialBreaks-1.1.1-mpc-armv7.zip", "plugins/potentialbreaks/thumb.ppm",
-            "Drum-break slicer: picks a random break from your own break folders (WAV or FLAC), chops it to 8 or 16 slices or by hits across the pads and matches it to the project tempo, by re-pitching or stretching. Shuffle the slices and save the groove as MIDI.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/PotentialBreaks - VST - PotentialBreaks\" && if [ -f \"./plugins/potentialbreaks/potentialbreaks.so\" ]; then cp -rf ./plugins/potentialbreaks/* \"$TARGET_SYNTH_DIR/PotentialBreaks - VST - PotentialBreaks/\"; else (wget -q -O /tmp/potentialbreaks.zip \"https://github.com/PotentialBreakfast/mpc-vst-potentialbreaks/releases/download/v1.1.1/PotentialBreaks-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/potentialbreaks.zip \"https://github.com/PotentialBreakfast/mpc-vst-potentialbreaks/releases/download/v1.1.1/PotentialBreaks-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/PotentialBreakfast/mpc-vst-potentialbreaks/releases/download/v1.1.1/PotentialBreaks-1.1.1-mpc-armv7.zip\" -o /tmp/potentialbreaks.zip) && unzip -o /tmp/potentialbreaks.zip -d \"$TARGET_SYNTH_DIR/PotentialBreaks - VST - PotentialBreaks/\" && rm -f /tmp/potentialbreaks.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/PotentialBreakfast/mpc-vst-potentialbreaks/0a21900bf9b95201f10e0b4106a5303e6ce3d60e/docs/images/potentialbreaks.png", "https://github.com/PotentialBreakfast/mpc-vst-potentialbreaks/releases/download/v1.1.1/PotentialBreaks-1.1.1-mpc-armv7.zip", "plugins/potentialbreaks/thumb.png",
+            "Drum-break slicer: picks a random break from your own break folders (WAV or FLAC), chops it to 8 or 16 slices or by hits across the pads and matches it to the project tempo, by re-pitching or stretching. Shuffle the slices and save the groove as MIDI.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/PotentialBreaks - VST - PotentialBreaks\" && if [ -f \"./plugins/potentialbreaks/potentialbreaks.so\" ]; then cp -rf ./plugins/potentialbreaks/* \"$TARGET_SYNTH_DIR/PotentialBreaks - VST - PotentialBreaks/\"; else (wget --no-check-certificate -q -O /tmp/potentialbreaks.zip \"https://github.com/PotentialBreakfast/mpc-vst-potentialbreaks/releases/download/v1.1.1/PotentialBreaks-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/potentialbreaks.zip \"https://github.com/PotentialBreakfast/mpc-vst-potentialbreaks/releases/download/v1.1.1/PotentialBreaks-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/potentialbreaks.zip -d \"$TARGET_SYNTH_DIR/PotentialBreaks - VST - PotentialBreaks/\" && rm -f /tmp/potentialbreaks.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2680,10 +2748,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "prloguexxl", "PrLogueXXL", "L'Cronx", "v0.1.1", "Synth",
             "INST", "Stable", "Akai Force (3.9.1)", "MPC OS 3.x", "2026-10-23",
-            "475", "18.0 MB", "14%",
+            "479", "18.0 MB", "14%",
             "L'Cronx - VST - PrLogueXXL", "prloguexxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/PrLogueXXL/v0.1.1/docs/img/osc.png", "https://github.com/sunskiefer/PrLogueXXL/releases/download/v0.1.1/PrLogueXXL-0.1.1-mpc-armv7.zip", "plugins/prloguexxl/thumb.ppm",
-            "16-voice poly synth modelled on the KORG prologue-16 (not affiliated with KORG): two VCOs, a multi engine (noise, 16 VPM types, KORG's logue-sdk waves oscillator), Poly/Duo/Mono/Unison/Chord, Main and Sub timbres, arpeggiator on MPC's grid, mod FX, delay/reverb and a low-frequency compressor with a live meter, over four pages.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - PrLogueXXL\" && if [ -f \"./plugins/prloguexxl/prloguexxl.so\" ]; then cp -rf ./plugins/prloguexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - PrLogueXXL/\"; else (wget -q -O /tmp/prloguexxl.zip \"https://github.com/sunskiefer/PrLogueXXL/releases/download/v0.1.1/PrLogueXXL-0.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/prloguexxl.zip \"https://github.com/sunskiefer/PrLogueXXL/releases/download/v0.1.1/PrLogueXXL-0.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/PrLogueXXL/releases/download/v0.1.1/PrLogueXXL-0.1.1-mpc-armv7.zip\" -o /tmp/prloguexxl.zip) && unzip -o /tmp/prloguexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - PrLogueXXL/\" && rm -f /tmp/prloguexxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/PrLogueXXL/v0.1.1/docs/img/osc.png", "https://github.com/sunskiefer/PrLogueXXL/releases/download/v0.1.1/PrLogueXXL-0.1.1-mpc-armv7.zip", "plugins/prloguexxl/thumb.png",
+            "16-voice poly synth modelled on the KORG prologue-16 (not affiliated with KORG): two VCOs, a multi engine (noise, 16 VPM types, KORG's logue-sdk waves oscillator), Poly/Duo/Mono/Unison/Chord, Main and Sub timbres, arpeggiator on MPC's grid, mod FX, delay/reverb and a low-frequency compressor with a live meter, over four pages.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - PrLogueXXL\" && if [ -f \"./plugins/prloguexxl/prloguexxl.so\" ]; then cp -rf ./plugins/prloguexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - PrLogueXXL/\"; else (wget --no-check-certificate -q -O /tmp/prloguexxl.zip \"https://github.com/sunskiefer/PrLogueXXL/releases/download/v0.1.1/PrLogueXXL-0.1.1-mpc-armv7.zip\" || wget -q -O /tmp/prloguexxl.zip \"https://github.com/sunskiefer/PrLogueXXL/releases/download/v0.1.1/PrLogueXXL-0.1.1-mpc-armv7.zip\") && unzip -o /tmp/prloguexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - PrLogueXXL/\" && rm -f /tmp/prloguexxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2692,9 +2760,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "profit-08", "Profit-08", "sd88me", "v0.1.3", "Synth",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "1951", "4.5 MB", "14%",
+            "1965", "4.5 MB", "14%",
             "sd88me - VST - Profit-08", "profit_08.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-profit8/main/docs/img/screenshot-program.png", "https://github.com/sd88me/mpc-vst-profit8/releases/download/profit-08-v0.1.3/Profit-08-0.1.3-mpc-armv7.zip", "plugins/profit-08/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-profit8/main/docs/img/screenshot-program.png", "https://github.com/sd88me/mpc-vst-profit8/releases/download/profit-08-v0.1.3/Profit-08-0.1.3-mpc-armv7.zip", "plugins/profit-08/thumb.png",
             "Eight-voice, two-layer analog-style synthesizer: stack and split layers, a gated sequencer and arpeggiator, a resonant 2/4-pole filter and a banks browser for your own program and bank SysEx dumps.", "./plugins/profit-08/install.sh", 0,
             false,
             false,
@@ -2704,10 +2772,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "profit-5", "Profit-5", "sd88me", "v0.2.1", "Synth",
             "INST", "Stable", "Akai MPC Live III (Gen2) (3.10)", "MPC OS 3.x", "2026-10-28",
-            "891", "20.4 MB", "31%",
+            "899", "20.4 MB", "31%",
             "sd88me - VST - Profit-5", "profit_5.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-profit5/5724d1fe8fdb0aab2c72837228a7fd77f1980ec1/docs/img/screenshot-osc.png", "https://github.com/sd88me/mpc-vst-profit5/releases/download/profit-5-vst-v0.2.1/Profit-5-0.2.1-mpc-armv7.zip", "plugins/profit-5/thumb.ppm",
-            "Five-voice analog polysynth modelled on an early SSM-chip classic: two oscillators, a four-pole resonant filter, Poly-Mod, wheel-mod, glide and unison, 38 factory programs, a Rev 2 / Rev 4 voicing switch, and an importer for Repro-5 .h2p patches.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Profit-5\" && if [ -f \"./plugins/profit-5/profit_5.so\" ]; then cp -rf ./plugins/profit-5/* \"$TARGET_SYNTH_DIR/sd88me - VST - Profit-5/\"; else (wget -q -O /tmp/profit-5.zip \"https://github.com/sd88me/mpc-vst-profit5/releases/download/profit-5-vst-v0.2.1/Profit-5-0.2.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/profit-5.zip \"https://github.com/sd88me/mpc-vst-profit5/releases/download/profit-5-vst-v0.2.1/Profit-5-0.2.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-profit5/releases/download/profit-5-vst-v0.2.1/Profit-5-0.2.1-mpc-armv7.zip\" -o /tmp/profit-5.zip) && unzip -o /tmp/profit-5.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Profit-5/\" && rm -f /tmp/profit-5.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-profit5/5724d1fe8fdb0aab2c72837228a7fd77f1980ec1/docs/img/screenshot-osc.png", "https://github.com/sd88me/mpc-vst-profit5/releases/download/profit-5-vst-v0.2.1/Profit-5-0.2.1-mpc-armv7.zip", "plugins/profit-5/thumb.png",
+            "Five-voice analog polysynth modelled on an early SSM-chip classic: two oscillators, a four-pole resonant filter, Poly-Mod, wheel-mod, glide and unison, 38 factory programs, a Rev 2 / Rev 4 voicing switch, and an importer for Repro-5 .h2p patches.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Profit-5\" && if [ -f \"./plugins/profit-5/profit_5.so\" ]; then cp -rf ./plugins/profit-5/* \"$TARGET_SYNTH_DIR/sd88me - VST - Profit-5/\"; else (wget --no-check-certificate -q -O /tmp/profit-5.zip \"https://github.com/sd88me/mpc-vst-profit5/releases/download/profit-5-vst-v0.2.1/Profit-5-0.2.1-mpc-armv7.zip\" || wget -q -O /tmp/profit-5.zip \"https://github.com/sd88me/mpc-vst-profit5/releases/download/profit-5-vst-v0.2.1/Profit-5-0.2.1-mpc-armv7.zip\") && unzip -o /tmp/profit-5.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Profit-5/\" && rm -f /tmp/profit-5.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2716,9 +2784,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "ps3100xxl", "PS3100XXL", "L'Cronx", "v0.1.5", "Synth",
             "INST", "Stable", "Akai Force (3.9.1)", "MPC OS 3.x", "2026-10-23",
-            "550", "15.9 MB", "14%",
+            "554", "15.9 MB", "14%",
             "L'Cronx - VST - PS3100XXL", "ps3100xxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/PS3100XXL/v0.1.5/docs/img/overview.png", "https://github.com/sunskiefer/PS3100XXL/releases/download/v0.1.5/PS3100XXL-0.1.5-mpc-armv7.zip", "plugins/ps3100xxl/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/PS3100XXL/v0.1.5/docs/img/overview.png", "https://github.com/sunskiefer/PS3100XXL/releases/download/v0.1.5/PS3100XXL-0.1.5-mpc-armv7.zip", "plugins/ps3100xxl/thumb.png",
             "Semi-modular poly synth modelled on the 1977 Korg PS-3100 (not affiliated with Korg): one oscillator, filter and envelope per key up to 48 voices, three-peak resonators, ensemble, two modulation generators, sample & hold, twelve temperament knobs and a patch bay you patch by touch, on one zoomable page.", "./plugins/ps3100xxl/install.sh", 0,
             false,
             false,
@@ -2728,10 +2796,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-pulse", "Pulse", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "80", "5.1 MB", "14%",
+            "82", "5.1 MB", "14%",
             "bombest - VST - Pulse", "pulse.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/pulse.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Pulse-0.4.1-mpc-armv7.zip", "plugins/op1fx-pulse/thumb.ppm",
-            "Two PWM pulse oscillators per voice, eight voices. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Pulse\" && if [ -f \"./plugins/op1fx-pulse/pulse.so\" ]; then cp -rf ./plugins/op1fx-pulse/* \"$TARGET_SYNTH_DIR/bombest - VST - Pulse/\"; else (wget -q -O /tmp/op1fx-pulse.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Pulse-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-pulse.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Pulse-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Pulse-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-pulse.zip) && unzip -o /tmp/op1fx-pulse.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Pulse/\" && rm -f /tmp/op1fx-pulse.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/pulse.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Pulse-0.4.1-mpc-armv7.zip", "plugins/op1fx-pulse/thumb.png",
+            "Two PWM pulse oscillators per voice, eight voices. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Pulse\" && if [ -f \"./plugins/op1fx-pulse/pulse.so\" ]; then cp -rf ./plugins/op1fx-pulse/* \"$TARGET_SYNTH_DIR/bombest - VST - Pulse/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-pulse.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Pulse-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-pulse.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Pulse-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-pulse.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Pulse/\" && rm -f /tmp/op1fx-pulse.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2740,9 +2808,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "raffosynth", "RaffoSynth", "saustin2010", "v1.3.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1845", "6.4 MB", "14%",
+            "1857", "6.4 MB", "14%",
             "Raffo - VST - [SYN] RaffoSynth", "moog.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-raffosynth/v1.3.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-raffosynth/releases/download/v1.3.1/SYN-RaffoSynth-1.3.1-mpc-armv7.zip", "plugins/raffosynth/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-raffosynth/v1.3.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-raffosynth/releases/download/v1.3.1/SYN-RaffoSynth-1.3.1-mpc-armv7.zip", "plugins/raffosynth/thumb.png",
             "RaffoSynth: a Minimoog-style mono synth with four oscillators and a ladder filter.", "./plugins/raffosynth/install.sh", 0,
             false,
             false,
@@ -2752,10 +2820,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "rings", "Resonator", "saustin2010", "v1.2.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1853", "4.1 MB", "14%",
+            "1864", "4.1 MB", "14%",
             "Émilie Gillet - VST - [SYN] Resonator", "rings.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-resonator/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-resonator/releases/download/v1.2.1/SYN-Resonator-1.2.1-mpc-armv7.zip", "plugins/rings/thumb.ppm",
-            "Resonator: seven resonator models (strings, modal, FM, chords) strummed by the notes you play; 14 presets, from Émilie Gillet's open-source Rings.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Resonator\" && if [ -f \"./plugins/rings/rings.so\" ]; then cp -rf ./plugins/rings/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Resonator/\"; else (wget -q -O /tmp/rings.zip \"https://github.com/saustin2010/mpc-vst-resonator/releases/download/v1.2.1/SYN-Resonator-1.2.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/rings.zip \"https://github.com/saustin2010/mpc-vst-resonator/releases/download/v1.2.1/SYN-Resonator-1.2.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-resonator/releases/download/v1.2.1/SYN-Resonator-1.2.1-mpc-armv7.zip\" -o /tmp/rings.zip) && unzip -o /tmp/rings.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Resonator/\" && rm -f /tmp/rings.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-resonator/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-resonator/releases/download/v1.2.1/SYN-Resonator-1.2.1-mpc-armv7.zip", "plugins/rings/thumb.png",
+            "Resonator: seven resonator models (strings, modal, FM, chords) strummed by the notes you play; 14 presets, from Émilie Gillet's open-source Rings.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Resonator\" && if [ -f \"./plugins/rings/rings.so\" ]; then cp -rf ./plugins/rings/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Resonator/\"; else (wget --no-check-certificate -q -O /tmp/rings.zip \"https://github.com/saustin2010/mpc-vst-resonator/releases/download/v1.2.1/SYN-Resonator-1.2.1-mpc-armv7.zip\" || wget -q -O /tmp/rings.zip \"https://github.com/saustin2010/mpc-vst-resonator/releases/download/v1.2.1/SYN-Resonator-1.2.1-mpc-armv7.zip\") && unzip -o /tmp/rings.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [SYN] Resonator/\" && rm -f /tmp/rings.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2764,9 +2832,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "setbfree-organ", "setBfree Organ", "SamplingHigh", "v0.3.0", "Organ",
             "INST", "Stable", "Akai Force (3.9.1.2)", "MPC OS 3.x", "2026-10-24",
-            "982", "2.2 MB", "8120%",
+            "993", "2.2 MB", "8120%",
             "Force Runtime - VST - setBfree Organ", "setbfree.so",
-            "https://raw.githubusercontent.com/SamplingHigh/mpc-vst-setbfree/v0.3.0/docs/images/setbfree-organ.png", "https://github.com/SamplingHigh/mpc-vst-setbfree/releases/download/v0.3.0/setBfree-Organ-0.3.0-mpc-armv7.zip", "plugins/setbfree-organ/thumb.ppm",
+            "https://raw.githubusercontent.com/SamplingHigh/mpc-vst-setbfree/v0.3.0/docs/images/setbfree-organ.png", "https://github.com/SamplingHigh/mpc-vst-setbfree/releases/download/v0.3.0/setBfree-Organ-0.3.0-mpc-armv7.zip", "plugins/setbfree-organ/thumb.png",
             "Tonewheel organ with drawbars, percussion, scanner, editable Leslie and keyboard splits.", "./plugins/setbfree-organ/install.sh", 0,
             false,
             false,
@@ -2776,10 +2844,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "sfizz", "sfizz", "gmorb (MPC port); sfizz by sfztools", "v1.1.1", "Sampler",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "619", "1.4 MB", "14%",
+            "626", "1.4 MB", "14%",
             "sfztools - VST - sfizz", "sfizz_mpc.so",
-            "https://raw.githubusercontent.com/gmorb/mpc-vst-sfizz/6d9e627281779f087898521cd27caabf9b7a75f2/docs/screen.png", "https://github.com/gmorb/mpc-vst-sfizz/releases/download/v1.1.1/sfizz-1.1.1-mpc-armv7.zip", "plugins/sfizz/thumb.ppm",
-            "The sfizz 1.2.3 sampler: plays SFZ libraries and SoundFont 2 (.sf2) files from SD cards and USB drives, streamed from disk, with key switches, the instrument's own CC controls, Scala tuning, mono/legato with glide and up to Sinc 72 interpolation, on a one-page screen modelled on sfizz's editor. Gen1 and Gen2 builds.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sfztools - VST - sfizz\" && if [ -f \"./plugins/sfizz/sfizz_mpc.so\" ]; then cp -rf ./plugins/sfizz/* \"$TARGET_SYNTH_DIR/sfztools - VST - sfizz/\"; else (wget -q -O /tmp/sfizz.zip \"https://github.com/gmorb/mpc-vst-sfizz/releases/download/v1.1.1/sfizz-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/sfizz.zip \"https://github.com/gmorb/mpc-vst-sfizz/releases/download/v1.1.1/sfizz-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/gmorb/mpc-vst-sfizz/releases/download/v1.1.1/sfizz-1.1.1-mpc-armv7.zip\" -o /tmp/sfizz.zip) && unzip -o /tmp/sfizz.zip -d \"$TARGET_SYNTH_DIR/sfztools - VST - sfizz/\" && rm -f /tmp/sfizz.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/gmorb/mpc-vst-sfizz/6d9e627281779f087898521cd27caabf9b7a75f2/docs/screen.png", "https://github.com/gmorb/mpc-vst-sfizz/releases/download/v1.1.1/sfizz-1.1.1-mpc-armv7.zip", "plugins/sfizz/thumb.png",
+            "The sfizz 1.2.3 sampler: plays SFZ libraries and SoundFont 2 (.sf2) files from SD cards and USB drives, streamed from disk, with key switches, the instrument's own CC controls, Scala tuning, mono/legato with glide and up to Sinc 72 interpolation, on a one-page screen modelled on sfizz's editor. Gen1 and Gen2 builds.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sfztools - VST - sfizz\" && if [ -f \"./plugins/sfizz/sfizz_mpc.so\" ]; then cp -rf ./plugins/sfizz/* \"$TARGET_SYNTH_DIR/sfztools - VST - sfizz/\"; else (wget --no-check-certificate -q -O /tmp/sfizz.zip \"https://github.com/gmorb/mpc-vst-sfizz/releases/download/v1.1.1/sfizz-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/sfizz.zip \"https://github.com/gmorb/mpc-vst-sfizz/releases/download/v1.1.1/sfizz-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/sfizz.zip -d \"$TARGET_SYNTH_DIR/sfztools - VST - sfizz/\" && rm -f /tmp/sfizz.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2788,9 +2856,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "sonix", "Sonix", "3dthc", "v0.3.12", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "1075", "124.9 MB", "14%",
+            "1085", "124.9 MB", "14%",
             "3dthc - VST - Sonix", "sonix.so",
-            "https://raw.githubusercontent.com/3dthc/Sonix/main/docs/images/main_layers.jpg", "https://github.com/3dthc/Sonix/releases/download/v0.3.12/Sonix-0.3.12-mpc-armv7.zip", "plugins/sonix/thumb.ppm",
+            "https://raw.githubusercontent.com/3dthc/Sonix/main/docs/images/main_layers.jpg", "https://github.com/3dthc/Sonix/releases/download/v0.3.12/Sonix-0.3.12-mpc-armv7.zip", "plugins/sonix/thumb.png",
             "A melodic ROMpler instrument for standalone Akai MPC devices, built as a native ARM VST2 plugin. Includes pianos, keys, pads, strings, brass, choirs, leads, plucks, bass, bells, synth chords and effects, using redistributable sound libraries.", "./plugins/sonix/install.sh", 0,
             false,
             false,
@@ -2800,10 +2868,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-string", "String", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "88", "3.7 MB", "14%",
+            "90", "3.7 MB", "14%",
             "bombest - VST - String", "string.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/string.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/String-0.4.1-mpc-armv7.zip", "plugins/op1fx-string/thumb.ppm",
-            "Plucked string with eight voices and an amp envelope. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - String\" && if [ -f \"./plugins/op1fx-string/string.so\" ]; then cp -rf ./plugins/op1fx-string/* \"$TARGET_SYNTH_DIR/bombest - VST - String/\"; else (wget -q -O /tmp/op1fx-string.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/String-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-string.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/String-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/String-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-string.zip) && unzip -o /tmp/op1fx-string.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - String/\" && rm -f /tmp/op1fx-string.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/string.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/String-0.4.1-mpc-armv7.zip", "plugins/op1fx-string/thumb.png",
+            "Plucked string with eight voices and an amp envelope. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - String\" && if [ -f \"./plugins/op1fx-string/string.so\" ]; then cp -rf ./plugins/op1fx-string/* \"$TARGET_SYNTH_DIR/bombest - VST - String/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-string.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/String-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-string.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/String-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-string.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - String/\" && rm -f /tmp/op1fx-string.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2812,9 +2880,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "sturm-tp", "Sturm-TP", "sd88me", "v0.1.2", "Drum Machine",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "1267", "4.5 MB", "14%",
+            "1273", "4.5 MB", "14%",
             "sd88me - VST - Sturm-TP", "sturm.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-sturm/sturm-tp-v0.1.1/docs/img/sturm.png", "https://github.com/sd88me/mpc-vst-sturm/releases/download/sturm-tp-v0.1.2/Sturm-TP-0.1.2-mpc-armv7.zip", "plugins/sturm-tp/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-sturm/sturm-tp-v0.1.1/docs/img/sturm.png", "https://github.com/sd88me/mpc-vst-sturm/releases/download/sturm-tp-v0.1.2/Sturm-TP-0.1.2-mpc-armv7.zip", "plugins/sturm-tp/thumb.png",
             "Six-voice analog-style drum and synth voice modelled on the Tempest drum machine: two analog and two sample oscillators, lowpass and highpass filters, five envelopes, two LFOs, eight mod paths, kit mode, distortion, compressor and delay. Bank browser with Q-Links; loads its SysEx dumps.", "./plugins/sturm-tp/install.sh", 0,
             false,
             false,
@@ -2824,10 +2892,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "subwerk", "SubWerk", "Devko", "v0.0.10", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "179", "1.0 MB", "14%",
+            "180", "1.0 MB", "14%",
             "Devko - VST - SubWerk", "subwerk.so",
-            "https://raw.githubusercontent.com/Devko/SubWerk/main/docs/img/filter.png", "https://github.com/Devko/SubWerk/releases/download/v0.0.10/SubWerk-0.0.10-mpc-armv7.zip", "plugins/subwerk/thumb.ppm",
-            "Analog-style monosynth in the spirit of a 37-key American paraphonic classic: two morphing oscillators with hard sync, sub and noise, a feedback mixer, a 4-pole ladder filter with Multidrive, two looping envelopes, glide and Duo. 57 presets and a six-tab touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Devko - VST - SubWerk\" && if [ -f \"./plugins/subwerk/subwerk.so\" ]; then cp -rf ./plugins/subwerk/* \"$TARGET_SYNTH_DIR/Devko - VST - SubWerk/\"; else (wget -q -O /tmp/subwerk.zip \"https://github.com/Devko/SubWerk/releases/download/v0.0.10/SubWerk-0.0.10-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/subwerk.zip \"https://github.com/Devko/SubWerk/releases/download/v0.0.10/SubWerk-0.0.10-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Devko/SubWerk/releases/download/v0.0.10/SubWerk-0.0.10-mpc-armv7.zip\" -o /tmp/subwerk.zip) && unzip -o /tmp/subwerk.zip -d \"$TARGET_SYNTH_DIR/Devko - VST - SubWerk/\" && rm -f /tmp/subwerk.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Devko/SubWerk/main/docs/img/filter.png", "https://github.com/Devko/SubWerk/releases/download/v0.0.10/SubWerk-0.0.10-mpc-armv7.zip", "plugins/subwerk/thumb.png",
+            "Analog-style monosynth in the spirit of a 37-key American paraphonic classic: two morphing oscillators with hard sync, sub and noise, a feedback mixer, a 4-pole ladder filter with Multidrive, two looping envelopes, glide and Duo. 57 presets and a six-tab touchscreen skin with Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Devko - VST - SubWerk\" && if [ -f \"./plugins/subwerk/subwerk.so\" ]; then cp -rf ./plugins/subwerk/* \"$TARGET_SYNTH_DIR/Devko - VST - SubWerk/\"; else (wget --no-check-certificate -q -O /tmp/subwerk.zip \"https://github.com/Devko/SubWerk/releases/download/v0.0.10/SubWerk-0.0.10-mpc-armv7.zip\" || wget -q -O /tmp/subwerk.zip \"https://github.com/Devko/SubWerk/releases/download/v0.0.10/SubWerk-0.0.10-mpc-armv7.zip\") && unzip -o /tmp/subwerk.zip -d \"$TARGET_SYNTH_DIR/Devko - VST - SubWerk/\" && rm -f /tmp/subwerk.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2836,10 +2904,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "surgexxl", "SurgeXXL", "L'Cronx", "v0.2.0", "Synth",
             "INST", "Stable", "Akai Force (3.9.1)", "MPC OS 3.x", "2026-10-24",
-            "826", "294.4 MB", "14%",
+            "832", "294.4 MB", "14%",
             "L'Cronx - VST - SurgeXXL", "surgexxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/SurgeXXL/08c3c3eed8a3ad6792211fb1dc2351ded2383995/docs/img/osc.png", "https://github.com/sunskiefer/SurgeXXL/releases/download/v0.2.0/SurgeXXL-0.2.0-mpc-armv7.zip", "plugins/surgexxl/thumb.ppm",
-            "The open-source Surge XT synth engine, headless, for Gen1: 2 scenes of 3 oscillators, dual filters, 6 LFOs per scene, mod matrix, 16 FX slots and 8 macros on eight pages. Loads every factory and third-party patch (3008) and wavetable (761), plus your own. Install it on its own (about 450 MB). MPC OS 3.x.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - SurgeXXL\" && if [ -f \"./plugins/surgexxl/surgexxl.so\" ]; then cp -rf ./plugins/surgexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - SurgeXXL/\"; else (wget -q -O /tmp/surgexxl.zip \"https://github.com/sunskiefer/SurgeXXL/releases/download/v0.2.0/SurgeXXL-0.2.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/surgexxl.zip \"https://github.com/sunskiefer/SurgeXXL/releases/download/v0.2.0/SurgeXXL-0.2.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/SurgeXXL/releases/download/v0.2.0/SurgeXXL-0.2.0-mpc-armv7.zip\" -o /tmp/surgexxl.zip) && unzip -o /tmp/surgexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - SurgeXXL/\" && rm -f /tmp/surgexxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/SurgeXXL/08c3c3eed8a3ad6792211fb1dc2351ded2383995/docs/img/osc.png", "https://github.com/sunskiefer/SurgeXXL/releases/download/v0.2.0/SurgeXXL-0.2.0-mpc-armv7.zip", "plugins/surgexxl/thumb.png",
+            "The open-source Surge XT synth engine, headless, for Gen1: 2 scenes of 3 oscillators, dual filters, 6 LFOs per scene, mod matrix, 16 FX slots and 8 macros on eight pages. Loads every factory and third-party patch (3008) and wavetable (761), plus your own. Install it on its own (about 450 MB). MPC OS 3.x.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - SurgeXXL\" && if [ -f \"./plugins/surgexxl/surgexxl.so\" ]; then cp -rf ./plugins/surgexxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - SurgeXXL/\"; else (wget --no-check-certificate -q -O /tmp/surgexxl.zip \"https://github.com/sunskiefer/SurgeXXL/releases/download/v0.2.0/SurgeXXL-0.2.0-mpc-armv7.zip\" || wget -q -O /tmp/surgexxl.zip \"https://github.com/sunskiefer/SurgeXXL/releases/download/v0.2.0/SurgeXXL-0.2.0-mpc-armv7.zip\") && unzip -o /tmp/surgexxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - SurgeXXL/\" && rm -f /tmp/surgexxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2848,9 +2916,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tablor", "Tablor", "saustin2010", "v1.1.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "982", "20.3 MB", "14%",
+            "990", "20.3 MB", "14%",
             "athousanddetails - VST - [SYN] Tablor", "tablor.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-tablor/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-tablor/releases/download/v1.1.1/SYN-Tablor-1.1.1-mpc-armv7.zip", "plugins/tablor/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-tablor/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-tablor/releases/download/v1.1.1/SYN-Tablor-1.1.1-mpc-armv7.zip", "plugins/tablor/thumb.png",
             "Two-oscillator wavetable synth with unison, filter and mod envelopes; ships its wavetable library and 9 presets.", "./plugins/tablor/install.sh", 0,
             false,
             false,
@@ -2860,10 +2928,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tinyfreaky", "TinyFreaky", "MagicStino", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "745", "5.0 MB", "14%",
+            "751", "5.0 MB", "14%",
             "MagicStino - VST - Tinyfreaky", "tinyfreaky.so",
-            "https://raw.githubusercontent.com/MagicStino/TinyFreaky/v0.4.0/assets/force-readable-preview.png", "https://github.com/MagicStino/TinyFreaky/releases/download/v0.4.1/Tinyfreaky-0.4.1-mpc-armv7.zip", "plugins/tinyfreaky/thumb.ppm",
-            "Eight-voice MicroFreak-inspired interpretation with 16 synthesis engines, a 5x7 modulation matrix, arpeggiator/swing, 64-step sequencer and sound-informed preset names. 342 playable factory slots; six engine families remain unavailable.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MagicStino - VST - Tinyfreaky\" && if [ -f \"./plugins/tinyfreaky/tinyfreaky.so\" ]; then cp -rf ./plugins/tinyfreaky/* \"$TARGET_SYNTH_DIR/MagicStino - VST - Tinyfreaky/\"; else (wget -q -O /tmp/tinyfreaky.zip \"https://github.com/MagicStino/TinyFreaky/releases/download/v0.4.1/Tinyfreaky-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/tinyfreaky.zip \"https://github.com/MagicStino/TinyFreaky/releases/download/v0.4.1/Tinyfreaky-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/MagicStino/TinyFreaky/releases/download/v0.4.1/Tinyfreaky-0.4.1-mpc-armv7.zip\" -o /tmp/tinyfreaky.zip) && unzip -o /tmp/tinyfreaky.zip -d \"$TARGET_SYNTH_DIR/MagicStino - VST - Tinyfreaky/\" && rm -f /tmp/tinyfreaky.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/MagicStino/TinyFreaky/v0.4.0/assets/force-readable-preview.png", "https://github.com/MagicStino/TinyFreaky/releases/download/v0.4.1/Tinyfreaky-0.4.1-mpc-armv7.zip", "plugins/tinyfreaky/thumb.png",
+            "Eight-voice MicroFreak-inspired interpretation with 16 synthesis engines, a 5x7 modulation matrix, arpeggiator/swing, 64-step sequencer and sound-informed preset names. 342 playable factory slots; six engine families remain unavailable.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MagicStino - VST - Tinyfreaky\" && if [ -f \"./plugins/tinyfreaky/tinyfreaky.so\" ]; then cp -rf ./plugins/tinyfreaky/* \"$TARGET_SYNTH_DIR/MagicStino - VST - Tinyfreaky/\"; else (wget --no-check-certificate -q -O /tmp/tinyfreaky.zip \"https://github.com/MagicStino/TinyFreaky/releases/download/v0.4.1/Tinyfreaky-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/tinyfreaky.zip \"https://github.com/MagicStino/TinyFreaky/releases/download/v0.4.1/Tinyfreaky-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/tinyfreaky.zip -d \"$TARGET_SYNTH_DIR/MagicStino - VST - Tinyfreaky/\" && rm -f /tmp/tinyfreaky.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2872,9 +2940,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tr-mpc", "TR-MPC", "sd88me", "v1.1.0", "Drum Machine",
             "INST", "Stable", "Akai Force (MPC OS 3.9.1), MPC Live III (MPC OS 3.10)", "MPC OS 3.x", "2026-11-02",
-            "1463", "29.1 MB", "25%",
+            "1475", "29.1 MB", "25%",
             "sd88me - VST - TR-MPC", "trmpc.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/7e704c6f3be14b661c887631e203494d8cc3f74f/docs/img/tr-mpc-slots.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-vst-v1.1.0/TR-MPC-1.1.0-mpc-armv7.zip", "plugins/tr-mpc/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/7e704c6f3be14b661c887631e203494d8cc3f74f/docs/img/tr-mpc-slots.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-vst-v1.1.0/TR-MPC-1.1.0-mpc-armv7.zip", "plugins/tr-mpc/thumb.png",
             "A modular 16-slot drum kit: each slot plays any of the 49 voices of athousanddetails' 6W6, 8W8, CW-78 and 9W9 (a 606 kick beside an 808 snare and 909 hats), with per-slot level, tune, decay, drive, pan and sends, one shared reverb, delay and master chain, a randomise module, and a touchscreen skin that reskins each slot to its voice's kit.", "./plugins/tr-mpc/install.sh", 0,
             false,
             false,
@@ -2884,9 +2952,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tributary", "Tributary", "johnny", "v1.1.0", "Utility",
             "INST", "Stable", "MPC One (3.9.1.2)", "MPC OS 3.x", "2026-10-10",
-            "838", "556 KB", "3%",
+            "842", "556 KB", "3%",
             "johnny - VST - Tributary", "tributary.so",
-            "https://raw.githubusercontent.com/stampman3000-jpg/mpc-tributary/v1.1.0/screenshots/tributary.png", "https://github.com/stampman3000-jpg/mpc-tributary/releases/download/v1.1.0/Tributary-1.1.0-mpc-armv7.zip", "plugins/tributary/thumb.ppm",
+            "https://raw.githubusercontent.com/stampman3000-jpg/mpc-tributary/v1.1.0/screenshots/tributary.png", "https://github.com/stampman3000-jpg/mpc-tributary/releases/download/v1.1.0/Tributary-1.1.0-mpc-armv7.zip", "plugins/tributary/thumb.png",
             "Sums chosen Elektron Overbridge outputs onto one MPC track over USB. Based on Overwitch.", "./plugins/tributary/install.sh", 0,
             false,
             false,
@@ -2896,10 +2964,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tropix", "Tropix", "3dthc", "v0.1.1", "Sampler",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "280", "215.3 MB", "14%",
+            "283", "215.3 MB", "14%",
             "3dthc - VST - Tropix", "tropix.so",
-            "https://raw.githubusercontent.com/3dthc/Tropix/1005f9c4dc719f58bd17b02fac750457e6c8cb1e/docs/images/browse.jpg", "https://github.com/3dthc/Tropix/releases/download/v0.1.1/Tropix-0.1.1-mpc-armv7.zip", "plugins/tropix/thumb.ppm",
-            "Island and afro ROMpler: 128 presets and 65 instruments for afrobeat, amapiano, kompa, soca, reggae and Hawaiian music - steel pans, log drums, saxes and trumpets, kompa and slack-key guitars, steels, keys, mallets, basses and percussion, from redistributable recordings and original synthesis. Two layers, glide, horn scoop, vibrato, nine colorways.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3dthc - VST - Tropix\" && if [ -f \"./plugins/tropix/tropix.so\" ]; then cp -rf ./plugins/tropix/* \"$TARGET_SYNTH_DIR/3dthc - VST - Tropix/\"; else (wget -q -O /tmp/tropix.zip \"https://github.com/3dthc/Tropix/releases/download/v0.1.1/Tropix-0.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/tropix.zip \"https://github.com/3dthc/Tropix/releases/download/v0.1.1/Tropix-0.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/3dthc/Tropix/releases/download/v0.1.1/Tropix-0.1.1-mpc-armv7.zip\" -o /tmp/tropix.zip) && unzip -o /tmp/tropix.zip -d \"$TARGET_SYNTH_DIR/3dthc - VST - Tropix/\" && rm -f /tmp/tropix.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/3dthc/Tropix/1005f9c4dc719f58bd17b02fac750457e6c8cb1e/docs/images/browse.jpg", "https://github.com/3dthc/Tropix/releases/download/v0.1.1/Tropix-0.1.1-mpc-armv7.zip", "plugins/tropix/thumb.png",
+            "Island and afro ROMpler: 128 presets and 65 instruments for afrobeat, amapiano, kompa, soca, reggae and Hawaiian music - steel pans, log drums, saxes and trumpets, kompa and slack-key guitars, steels, keys, mallets, basses and percussion, from redistributable recordings and original synthesis. Two layers, glide, horn scoop, vibrato, nine colorways.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3dthc - VST - Tropix\" && if [ -f \"./plugins/tropix/tropix.so\" ]; then cp -rf ./plugins/tropix/* \"$TARGET_SYNTH_DIR/3dthc - VST - Tropix/\"; else (wget --no-check-certificate -q -O /tmp/tropix.zip \"https://github.com/3dthc/Tropix/releases/download/v0.1.1/Tropix-0.1.1-mpc-armv7.zip\" || wget -q -O /tmp/tropix.zip \"https://github.com/3dthc/Tropix/releases/download/v0.1.1/Tropix-0.1.1-mpc-armv7.zip\") && unzip -o /tmp/tropix.zip -d \"$TARGET_SYNTH_DIR/3dthc - VST - Tropix/\" && rm -f /tmp/tropix.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2908,9 +2976,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "vader", "VADER", "L'Cronx", "v0.9.0", "Synth",
             "INST", "Beta", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-30",
-            "1528", "42.2 MB", "14%",
+            "1546", "42.2 MB", "14%",
             "L'Cronx - VST - VADER", "vader.so",
-            "https://raw.githubusercontent.com/sunskiefer/VADER/v0.8.0/docs/img/main_star.png", "https://github.com/sunskiefer/VADER/releases/download/v0.9.0/VADER-0.9.0-mpc-armv7.zip", "plugins/vader/thumb.ppm",
+            "https://raw.githubusercontent.com/sunskiefer/VADER/v0.8.0/docs/img/main_star.png", "https://github.com/sunskiefer/VADER/releases/download/v0.9.0/VADER-0.9.0-mpc-armv7.zip", "plugins/vader/thumb.png",
             "An orbit-based vector synth: an orbiter travels a shape (15 built in, 35 maths shapes, or your own SVG, OBJ, PNG or JPG) or one of 27 modes across four corners. Each corner plays overtone generators, one of 14 voices, or a WAV sample. Two timbres, arpeggiator, effects. Its screen runs on your phone: scan the QR code, load shapes from the phone too.", "./plugins/vader/install.sh", 0,
             false,
             false,
@@ -2920,10 +2988,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-voltage", "Voltage", "Bombest", "v0.4.1", "Synth",
             "INST", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "78", "4.6 MB", "14%",
+            "80", "4.6 MB", "14%",
             "bombest - VST - Voltage", "voltage.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/voltage.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Voltage-0.4.1-mpc-armv7.zip", "plugins/op1fx-voltage/thumb.ppm",
-            "Four-control synth with eight voices and an amp envelope. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Voltage\" && if [ -f \"./plugins/op1fx-voltage/voltage.so\" ]; then cp -rf ./plugins/op1fx-voltage/* \"$TARGET_SYNTH_DIR/bombest - VST - Voltage/\"; else (wget -q -O /tmp/op1fx-voltage.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Voltage-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-voltage.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Voltage-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Voltage-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-voltage.zip) && unzip -o /tmp/op1fx-voltage.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Voltage/\" && rm -f /tmp/op1fx-voltage.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/voltage.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Voltage-0.4.1-mpc-armv7.zip", "plugins/op1fx-voltage/thumb.png",
+            "Four-control synth with eight voices and an amp envelope. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Voltage\" && if [ -f \"./plugins/op1fx-voltage/voltage.so\" ]; then cp -rf ./plugins/op1fx-voltage/* \"$TARGET_SYNTH_DIR/bombest - VST - Voltage/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-voltage.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Voltage-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-voltage.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Voltage-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-voltage.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Voltage/\" && rm -f /tmp/op1fx-voltage.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2932,9 +3000,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "wurl", "Wurl", "saustin2010", "v1.1.1", "Electric Piano",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1198", "827 KB", "14%",
+            "1205", "827 KB", "14%",
             "Filliformes - VST - [SYN] Wurl", "wurl.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-wurl/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-wurl/releases/download/v1.1.1/SYN-Wurl-1.1.1-mpc-armv7.zip", "plugins/wurl/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-wurl/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-wurl/releases/download/v1.1.1/SYN-Wurl-1.1.1-mpc-armv7.zip", "plugins/wurl/thumb.png",
             "A physically modelled Wurlitzer 200A electric piano (OpenWurli) that barks with velocity, with tremolo and 10 presets.", "./plugins/wurl/install.sh", 0,
             false,
             false,
@@ -2944,10 +3012,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "xenia", "Xenia", "sd88me", "v0.1.2", "Synth",
             "INST", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-03",
-            "244", "8.4 MB", "14%",
+            "248", "8.4 MB", "14%",
             "sd88me - VST - Xenia", "xenia.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-xenia/aeb6a25cfe8e5e14fc1df592526b2c2a32eb99be/docs/screenshots/xenia-play.png", "https://github.com/sd88me/mpc-vst-xenia/releases/download/v0.1.2/Xenia-0.1.2-mpc-aarch64.zip", "plugins/xenia/thumb.ppm",
-            "An emulation of the Microwave XT wavetable synthesizer's original firmware (gearmulator's 68k and DSP56300 emulators) as a native instrument for Gen2 MPC devices: ten touchscreen pages, ROM banks and patch browser, assignable play knobs and Q-Link control on every page. Gen2 (aarch64) only; you need your own Microwave XT ROM.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Xenia\" && if [ -f \"./plugins/xenia/xenia.so\" ]; then cp -rf ./plugins/xenia/* \"$TARGET_SYNTH_DIR/sd88me - VST - Xenia/\"; else (wget -q -O /tmp/xenia.zip \"https://github.com/sd88me/mpc-vst-xenia/releases/download/v0.1.2/Xenia-0.1.2-mpc-aarch64.zip\" || wget --no-check-certificate -q -O /tmp/xenia.zip \"https://github.com/sd88me/mpc-vst-xenia/releases/download/v0.1.2/Xenia-0.1.2-mpc-aarch64.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-xenia/releases/download/v0.1.2/Xenia-0.1.2-mpc-aarch64.zip\" -o /tmp/xenia.zip) && unzip -o /tmp/xenia.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Xenia/\" && rm -f /tmp/xenia.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-xenia/aeb6a25cfe8e5e14fc1df592526b2c2a32eb99be/docs/screenshots/xenia-play.png", "https://github.com/sd88me/mpc-vst-xenia/releases/download/v0.1.2/Xenia-0.1.2-mpc-aarch64.zip", "plugins/xenia/thumb.png",
+            "An emulation of the Microwave XT wavetable synthesizer's original firmware (gearmulator's 68k and DSP56300 emulators) as a native instrument for Gen2 MPC devices: ten touchscreen pages, ROM banks and patch browser, assignable play knobs and Q-Link control on every page. Gen2 (aarch64) only; you need your own Microwave XT ROM.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Xenia\" && if [ -f \"./plugins/xenia/xenia.so\" ]; then cp -rf ./plugins/xenia/* \"$TARGET_SYNTH_DIR/sd88me - VST - Xenia/\"; else (wget --no-check-certificate -q -O /tmp/xenia.zip \"https://github.com/sd88me/mpc-vst-xenia/releases/download/v0.1.2/Xenia-0.1.2-mpc-aarch64.zip\" || wget -q -O /tmp/xenia.zip \"https://github.com/sd88me/mpc-vst-xenia/releases/download/v0.1.2/Xenia-0.1.2-mpc-aarch64.zip\") && unzip -o /tmp/xenia.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Xenia/\" && rm -f /tmp/xenia.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2963,11 +3031,11 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "acid", "Acid", "sd88me", "v2.1.0", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-10-22",
-            "5573", "3.2 MB", "14%",
+            "5584", "3.2 MB", "14%",
             "sd88me - VST - Acid", "acid.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-acid/master/docs/img/acid.png", "https://github.com/sd88me/mpc-vst-acid/releases/download/acid-vst-v2.1.0/Acid-2.1.0-mpc-armv7.zip", "plugins/acid/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-acid/master/docs/img/acid.png", "https://github.com/sd88me/mpc-vst-acid/releases/download/acid-vst-v2.1.0/Acid-2.1.0-mpc-armv7.zip", "plugins/acid/thumb.png",
             "TB-303-style acid bassline sequencer: two blendable lines with generate/mutate, driving a synth track over MIDI, with a touchscreen skin and Q-Links.", "./plugins/acid/install.sh", 0,
-            true,
+            false,
             false,
             false,
             { "303", "acid", "midi", "bassline" }
@@ -2975,10 +3043,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "cadenza", "Cadenza", "Shrekage", "v0.25.0", "Sequencer",
             "MIDI", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-29",
-            "159", "1.1 MB", "40%",
+            "161", "1.1 MB", "40%",
             "Cadenza - VST - Cadenza", "cadenza.so",
-            "https://raw.githubusercontent.com/Shrekage2024/cadenza-force/main/docs/screenshot.png", "https://github.com/Shrekage2024/cadenza-force/releases/download/v0.25.0/Cadenza-0.25.0-mpc-armv7.zip", "plugins/cadenza/thumb.ppm",
-            "Chord-driven generative MIDI sequencer: pick a key and scale, shape chords, bass and melody with a few knobs per page, and it generates and follows along as you play.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Cadenza - VST - Cadenza\" && if [ -f \"./plugins/cadenza/cadenza.so\" ]; then cp -rf ./plugins/cadenza/* \"$TARGET_SYNTH_DIR/Cadenza - VST - Cadenza/\"; else (wget -q -O /tmp/cadenza.zip \"https://github.com/Shrekage2024/cadenza-force/releases/download/v0.25.0/Cadenza-0.25.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/cadenza.zip \"https://github.com/Shrekage2024/cadenza-force/releases/download/v0.25.0/Cadenza-0.25.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Shrekage2024/cadenza-force/releases/download/v0.25.0/Cadenza-0.25.0-mpc-armv7.zip\" -o /tmp/cadenza.zip) && unzip -o /tmp/cadenza.zip -d \"$TARGET_SYNTH_DIR/Cadenza - VST - Cadenza/\" && rm -f /tmp/cadenza.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Shrekage2024/cadenza-force/main/docs/screenshot.png", "https://github.com/Shrekage2024/cadenza-force/releases/download/v0.25.0/Cadenza-0.25.0-mpc-armv7.zip", "plugins/cadenza/thumb.png",
+            "Chord-driven generative MIDI sequencer: pick a key and scale, shape chords, bass and melody with a few knobs per page, and it generates and follows along as you play.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Cadenza - VST - Cadenza\" && if [ -f \"./plugins/cadenza/cadenza.so\" ]; then cp -rf ./plugins/cadenza/* \"$TARGET_SYNTH_DIR/Cadenza - VST - Cadenza/\"; else (wget --no-check-certificate -q -O /tmp/cadenza.zip \"https://github.com/Shrekage2024/cadenza-force/releases/download/v0.25.0/Cadenza-0.25.0-mpc-armv7.zip\" || wget -q -O /tmp/cadenza.zip \"https://github.com/Shrekage2024/cadenza-force/releases/download/v0.25.0/Cadenza-0.25.0-mpc-armv7.zip\") && unzip -o /tmp/cadenza.zip -d \"$TARGET_SYNTH_DIR/Cadenza - VST - Cadenza/\" && rm -f /tmp/cadenza.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2987,10 +3055,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "chordsmith", "Chordsmith", "jacob-sabella", "v1.0.4", "Utility",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
-            "2828", "4.2 MB", "8%",
+            "2835", "4.2 MB", "8%",
             "jacob-sabella - VST - Chordsmith", "chordsmith.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-chordsmith/188d34ca0d9482d2d1ba840edb12ccd8c3773f76/docs/screenshots/chordsmith.png", "https://github.com/jacob-sabella/mpc-vst-chordsmith/releases/download/chordsmith-vst-v1.0.4/Chordsmith-1.0.4-mpc-armv7.zip", "plugins/chordsmith/thumb.ppm",
-            "Chord tool: pads, keys or chord buttons play scale, set or custom chords with voicing, strum, arp and harp modes, MIDI out to other tracks and a built-in preview synth.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Chordsmith\" && if [ -f \"./plugins/chordsmith/chordsmith.so\" ]; then cp -rf ./plugins/chordsmith/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Chordsmith/\"; else (wget -q -O /tmp/chordsmith.zip \"https://github.com/jacob-sabella/mpc-vst-chordsmith/releases/download/chordsmith-vst-v1.0.4/Chordsmith-1.0.4-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/chordsmith.zip \"https://github.com/jacob-sabella/mpc-vst-chordsmith/releases/download/chordsmith-vst-v1.0.4/Chordsmith-1.0.4-mpc-armv7.zip\" || curl -k -sL \"https://github.com/jacob-sabella/mpc-vst-chordsmith/releases/download/chordsmith-vst-v1.0.4/Chordsmith-1.0.4-mpc-armv7.zip\" -o /tmp/chordsmith.zip) && unzip -o /tmp/chordsmith.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Chordsmith/\" && rm -f /tmp/chordsmith.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-chordsmith/188d34ca0d9482d2d1ba840edb12ccd8c3773f76/docs/screenshots/chordsmith.png", "https://github.com/jacob-sabella/mpc-vst-chordsmith/releases/download/chordsmith-vst-v1.0.4/Chordsmith-1.0.4-mpc-armv7.zip", "plugins/chordsmith/thumb.png",
+            "Chord tool: pads, keys or chord buttons play scale, set or custom chords with voicing, strum, arp and harp modes, MIDI out to other tracks and a built-in preview synth.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Chordsmith\" && if [ -f \"./plugins/chordsmith/chordsmith.so\" ]; then cp -rf ./plugins/chordsmith/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Chordsmith/\"; else (wget --no-check-certificate -q -O /tmp/chordsmith.zip \"https://github.com/jacob-sabella/mpc-vst-chordsmith/releases/download/chordsmith-vst-v1.0.4/Chordsmith-1.0.4-mpc-armv7.zip\" || wget -q -O /tmp/chordsmith.zip \"https://github.com/jacob-sabella/mpc-vst-chordsmith/releases/download/chordsmith-vst-v1.0.4/Chordsmith-1.0.4-mpc-armv7.zip\") && unzip -o /tmp/chordsmith.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Chordsmith/\" && rm -f /tmp/chordsmith.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -2999,9 +3067,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "daemon", "Daemon", "sd88me", "v1.0.1", "Sequencer",
             "MIDI", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "493", "727 KB", "14%",
+            "496", "727 KB", "14%",
             "sd88me - VST - Daemon", "daemon.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-daemon/v1.0.0/docs/screenshots/daemon.png", "https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-1.0.1-mpc-armv7.zip", "plugins/daemon/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-daemon/v1.0.0/docs/screenshots/daemon.png", "https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-1.0.1-mpc-armv7.zip", "plugins/daemon/thumb.png",
             "AI generative assistant: type or say what you hear and Daemon writes chords, basslines, melodies and beats in your key and plays them in time on its MIDI port. Agent mode builds the session too (tracks, instruments, presets, effects, clips) as a plan you RUN. Gemini or Claude; needs network and an API key.", "./plugins/daemon/install.sh", 0,
             false,
             false,
@@ -3011,9 +3079,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "grids", "Drum Map", "saustin2010", "v1.2.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1459", "337 KB", "14%",
+            "1463", "337 KB", "14%",
             "Émilie Gillet - VST - [SEQ] Drum Map", "grids.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-drum-map/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-drum-map/releases/download/v1.2.1/SEQ-Drum-Map-1.2.1-mpc-armv7.zip", "plugins/grids/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-drum-map/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-drum-map/releases/download/v1.2.1/SEQ-Drum-Map-1.2.1-mpc-armv7.zip", "plugins/grids/thumb.png",
             "Drum Map: a topographic drum sequencer that plays kick, snare and hats from MPC's clock through its own MIDI port, from Émilie Gillet's open-source Grids.", "./plugins/grids/install.sh", 0,
             false,
             false,
@@ -3023,10 +3091,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "rampage", "Dual Slope", "saustin2010", "v1.2.1", "Modulation",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1221", "3.1 MB", "14%",
+            "1229", "3.1 MB", "14%",
             "Andrew Belt - VST - [SEQ] Dual Slope", "rampage.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-dual-slope/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-dual-slope/releases/download/v1.2.1/SEQ-Dual-Slope-1.2.1-mpc-armv7.zip", "plugins/rampage/thumb.ppm",
-            "Dual Slope, based on Befaco's Rampage VCV Rack module: two rise-and-fall generators (envelopes, LFOs, slew) whose outputs go out of its own MIDI port as CCs.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Andrew Belt - VST - [SEQ] Dual Slope\" && if [ -f \"./plugins/rampage/rampage.so\" ]; then cp -rf ./plugins/rampage/* \"$TARGET_SYNTH_DIR/Andrew Belt - VST - [SEQ] Dual Slope/\"; else (wget -q -O /tmp/rampage.zip \"https://github.com/saustin2010/mpc-vst-dual-slope/releases/download/v1.2.1/SEQ-Dual-Slope-1.2.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/rampage.zip \"https://github.com/saustin2010/mpc-vst-dual-slope/releases/download/v1.2.1/SEQ-Dual-Slope-1.2.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-dual-slope/releases/download/v1.2.1/SEQ-Dual-Slope-1.2.1-mpc-armv7.zip\" -o /tmp/rampage.zip) && unzip -o /tmp/rampage.zip -d \"$TARGET_SYNTH_DIR/Andrew Belt - VST - [SEQ] Dual Slope/\" && rm -f /tmp/rampage.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-dual-slope/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-dual-slope/releases/download/v1.2.1/SEQ-Dual-Slope-1.2.1-mpc-armv7.zip", "plugins/rampage/thumb.png",
+            "Dual Slope, based on Befaco's Rampage VCV Rack module: two rise-and-fall generators (envelopes, LFOs, slew) whose outputs go out of its own MIDI port as CCs.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Andrew Belt - VST - [SEQ] Dual Slope\" && if [ -f \"./plugins/rampage/rampage.so\" ]; then cp -rf ./plugins/rampage/* \"$TARGET_SYNTH_DIR/Andrew Belt - VST - [SEQ] Dual Slope/\"; else (wget --no-check-certificate -q -O /tmp/rampage.zip \"https://github.com/saustin2010/mpc-vst-dual-slope/releases/download/v1.2.1/SEQ-Dual-Slope-1.2.1-mpc-armv7.zip\" || wget -q -O /tmp/rampage.zip \"https://github.com/saustin2010/mpc-vst-dual-slope/releases/download/v1.2.1/SEQ-Dual-Slope-1.2.1-mpc-armv7.zip\") && unzip -o /tmp/rampage.zip -d \"$TARGET_SYNTH_DIR/Andrew Belt - VST - [SEQ] Dual Slope/\" && rm -f /tmp/rampage.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3035,10 +3103,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "eucalypso", "Eucalypso", "saustin2010", "v1.0.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "820", "546 KB", "14%",
+            "822", "546 KB", "14%",
             "handcraftedcc - VST - [SEQ] Eucalypso", "eucalypso.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-eucalypso/v1.0.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-eucalypso/releases/download/v1.0.1/SEQ-Eucalypso-1.0.1-mpc-armv7.zip", "plugins/eucalypso/thumb.ppm",
-            "Four-lane Euclidean sequencer that turns the notes you hold into interlocking rhythms for other tracks.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/handcraftedcc - VST - [SEQ] Eucalypso\" && if [ -f \"./plugins/eucalypso/eucalypso.so\" ]; then cp -rf ./plugins/eucalypso/* \"$TARGET_SYNTH_DIR/handcraftedcc - VST - [SEQ] Eucalypso/\"; else (wget -q -O /tmp/eucalypso.zip \"https://github.com/saustin2010/mpc-vst-eucalypso/releases/download/v1.0.1/SEQ-Eucalypso-1.0.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/eucalypso.zip \"https://github.com/saustin2010/mpc-vst-eucalypso/releases/download/v1.0.1/SEQ-Eucalypso-1.0.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-eucalypso/releases/download/v1.0.1/SEQ-Eucalypso-1.0.1-mpc-armv7.zip\" -o /tmp/eucalypso.zip) && unzip -o /tmp/eucalypso.zip -d \"$TARGET_SYNTH_DIR/handcraftedcc - VST - [SEQ] Eucalypso/\" && rm -f /tmp/eucalypso.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-eucalypso/v1.0.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-eucalypso/releases/download/v1.0.1/SEQ-Eucalypso-1.0.1-mpc-armv7.zip", "plugins/eucalypso/thumb.png",
+            "Four-lane Euclidean sequencer that turns the notes you hold into interlocking rhythms for other tracks.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/handcraftedcc - VST - [SEQ] Eucalypso\" && if [ -f \"./plugins/eucalypso/eucalypso.so\" ]; then cp -rf ./plugins/eucalypso/* \"$TARGET_SYNTH_DIR/handcraftedcc - VST - [SEQ] Eucalypso/\"; else (wget --no-check-certificate -q -O /tmp/eucalypso.zip \"https://github.com/saustin2010/mpc-vst-eucalypso/releases/download/v1.0.1/SEQ-Eucalypso-1.0.1-mpc-armv7.zip\" || wget -q -O /tmp/eucalypso.zip \"https://github.com/saustin2010/mpc-vst-eucalypso/releases/download/v1.0.1/SEQ-Eucalypso-1.0.1-mpc-armv7.zip\") && unzip -o /tmp/eucalypso.zip -d \"$TARGET_SYNTH_DIR/handcraftedcc - VST - [SEQ] Eucalypso/\" && rm -f /tmp/eucalypso.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3047,21 +3115,21 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "euclidier", "Euclidier", "sd88me", "v1.0.8", "Sequencer",
             "MIDI", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 2.x & 3.x", "2026-10-14",
-            "4084", "1.6 MB", "14%",
+            "4093", "1.6 MB", "14%",
             "sd88me - VST - Euclidier", "euclidier.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-euclidier/master/docs/img/euclidier.png", "https://github.com/sd88me/mpc-vst-euclidier/releases/download/euclidier-vst-v1.0.8/Euclidier-1.0.8-mpc-armv7.zip", "plugins/euclidier/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-euclidier/master/docs/img/euclidier.png", "https://github.com/sd88me/mpc-vst-euclidier/releases/download/euclidier-vst-v1.0.8/Euclidier-1.0.8-mpc-armv7.zip", "plugins/euclidier/thumb.png",
             "8-lane Euclidean MIDI sequencer: live pattern circle and lane rows with a play-head, per-lane and global randomise, a drum-mode switch, and a touchscreen skin with Q-Links.", "./plugins/euclidier/install.sh", 0,
-            true,
-            true,
+            false,
+            false,
             false,
             { "euclidean", "midi", "drum", "polyrhythm" }
         },
         {
             "glass-spheres", "Glass Spheres", "Padbangers", "v1.0.0", "Sequencer",
             "MIDI", "Stable", "Akai MPC X (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-04",
-            "927", "6.6 MB", "4%",
+            "931", "6.6 MB", "4%",
             "Padbangers - VST - Glass Spheres", "glass_spheres.so",
-            "https://raw.githubusercontent.com/FullPace/glass-spheres/glass-spheres-v1.0.0/docs/glass-spheres-main.png", "https://github.com/padbangers/glass-spheres/releases/download/glass-spheres-v1.0.0/Glass-Spheres-1.0.0-mpc-armv7.zip", "plugins/glass-spheres/thumb.ppm",
+            "https://raw.githubusercontent.com/FullPace/glass-spheres/glass-spheres-v1.0.0/docs/glass-spheres-main.png", "https://github.com/padbangers/glass-spheres/releases/download/glass-spheres-v1.0.0/Glass-Spheres-1.0.0-mpc-armv7.zip", "plugins/glass-spheres/thumb.png",
             "A random sampler after Mutable Instruments Marbles: random gates, melodies and deja vu loops that play other tracks over MIDI or analog gear over the MPC X's CV jacks, with envelopes, LFOs and a modulation matrix.", "./plugins/glass-spheres/install.sh", 0,
             false,
             false,
@@ -3071,9 +3139,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "groove-bank", "Groove Bank", "saustin2010", "v1.1.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1477", "852 KB", "14%",
+            "1483", "852 KB", "14%",
             "Mission Minnow - VST - [SEQ] Groove Bank", "groovebank.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-groovebank/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-groovebank/releases/download/v1.1.1/SEQ-Groove-Bank-1.1.1-mpc-armv7.zip", "plugins/groove-bank/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-groovebank/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-groovebank/releases/download/v1.1.1/SEQ-Groove-Bank-1.1.1-mpc-armv7.zip", "plugins/groove-bank/thumb.png",
             "Replays the chord you hold in genre grooves from its library, with swing, strum and latch, through its own MIDI port.", "./plugins/groove-bank/install.sh", 0,
             false,
             false,
@@ -3083,11 +3151,11 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "maze-sequencer", "Maze Sequencer", "sd88me", "v1.0.7", "Sequencer",
             "MIDI", "Stable", "Akai Force (MPC OS 3.9.1), MPC Live III (Gen2) (MPC OS 3.9.1)", "MPC OS 2.x & 3.x", "2026-10-13",
-            "3903", "3.0 MB", "1%",
+            "3911", "3.0 MB", "1%",
             "sd88me - VST - Maze Sequencer", "maze_seq.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-maze/main/docs/img/maze-sequencer.png", "https://github.com/sd88me/mpc-vst-maze/releases/download/maze-sequencer-vst-v1.0.7/Maze-Sequencer-1.0.7-mpc-armv7.zip", "plugins/maze-sequencer/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-maze/main/docs/img/maze-sequencer.png", "https://github.com/sd88me/mpc-vst-maze/releases/download/maze-sequencer-vst-v1.0.7/Maze-Sequencer-1.0.7-mpc-armv7.zip", "plugins/maze-sequencer/thumb.png",
             "Dual 8-step generative sequencer (Moog Labyrinth style) with corrupt, scale quantising, two LFOs and per-line MIDI channels, driving other tracks over MIDI.", "./plugins/maze-sequencer/install.sh", 0,
-            true,
+            false,
             false,
             false,
             { "generative", "midi", "moog", "labyrinth" }
@@ -3095,9 +3163,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "midi-player", "MIDI Player", "saustin2010", "v1.1.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "909", "144 KB", "14%",
+            "912", "144 KB", "14%",
             "Charles Vestal - VST - [SEQ] MIDI Player", "midiplayer.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-midiplayer/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-midiplayer/releases/download/v1.1.1/SEQ-MIDI-Player-1.1.1-mpc-armv7.zip", "plugins/midi-player/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-midiplayer/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-midiplayer/releases/download/v1.1.1/SEQ-MIDI-Player-1.1.1-mpc-armv7.zip", "plugins/midi-player/thumb.png",
             "Plays Standard MIDI Files in time with MPC's tempo and transport, one track or all, through its own MIDI port.", "./plugins/midi-player/install.sh", 0,
             false,
             false,
@@ -3107,9 +3175,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "pixel-walkers", "Pixel Walkers", "saustin2010", "v1.1.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "919", "375 KB", "14%",
+            "927", "375 KB", "14%",
             "mestela - VST - [SEQ] Pixel Walkers", "pixelwalkers.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-pixelwalkers/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-pixelwalkers/releases/download/v1.1.1/SEQ-Pixel-Walkers-1.1.1-mpc-armv7.zip", "plugins/pixel-walkers/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-pixelwalkers/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-pixelwalkers/releases/download/v1.1.1/SEQ-Pixel-Walkers-1.1.1-mpc-armv7.zip", "plugins/pixel-walkers/thumb.png",
             "Generative gravity sequencer: each note you play becomes a walker that bounces and retriggers its note as it lands.", "./plugins/pixel-walkers/install.sh", 0,
             false,
             false,
@@ -3119,9 +3187,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "steprunner-8", "StepRunner-8", "djokenzi", "v1.2.0", "Sequencer",
             "MIDI", "Stable", "MPC Live (3.9.1.2)", "MPC OS 3.x", "2026-10-19",
-            "1349", "3.4 MB", "14%",
+            "1359", "3.4 MB", "14%",
             "djokenzi - VST - StepRunner-8", "steprunner8.so",
-            "https://raw.githubusercontent.com/djokenzi/steprunner-8/76285a3aa34dcdc85bf8e72e3aa18baa7f6428cd/docs/screenshots/steprunner-8.png", "https://github.com/djokenzi/steprunner-8/releases/download/v1.2.0/StepRunner-8-1.2.0-mpc-armv7.zip", "plugins/steprunner-8/thumb.ppm",
+            "https://raw.githubusercontent.com/djokenzi/steprunner-8/76285a3aa34dcdc85bf8e72e3aa18baa7f6428cd/docs/screenshots/steprunner-8.png", "https://github.com/djokenzi/steprunner-8/releases/download/v1.2.0/StepRunner-8-1.2.0-mpc-armv7.zip", "plugins/steprunner-8/thumb.png",
             "8-track, 64-step sequencer with step conditions, step and CC locks, patterns, states and performance effects, driving a drum program over MIDI.", "./plugins/steprunner-8/install.sh", 0,
             false,
             false,
@@ -3131,10 +3199,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "stevequencer", "Stevequencer", "saustin2010", "v1.1.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-24",
-            "996", "1.2 MB", "14%",
+            "1004", "1.2 MB", "14%",
             "Steve A - VST - [SEQ] Stevequencer", "stevequencer.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-stevequencer/v1.0.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-stevequencer/releases/download/v1.1.1/SEQ-Stevequencer-1.1.1-mpc-armv7.zip", "plugins/stevequencer/thumb.ppm",
-            "Melodic step sequencer edited from the Q-Links: 16 steps on a 4x4 grid, up to 64, with chance, ratchets and MOD lanes.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Steve A - VST - [SEQ] Stevequencer\" && if [ -f \"./plugins/stevequencer/stevequencer.so\" ]; then cp -rf ./plugins/stevequencer/* \"$TARGET_SYNTH_DIR/Steve A - VST - [SEQ] Stevequencer/\"; else (wget -q -O /tmp/stevequencer.zip \"https://github.com/saustin2010/mpc-vst-stevequencer/releases/download/v1.1.1/SEQ-Stevequencer-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/stevequencer.zip \"https://github.com/saustin2010/mpc-vst-stevequencer/releases/download/v1.1.1/SEQ-Stevequencer-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-stevequencer/releases/download/v1.1.1/SEQ-Stevequencer-1.1.1-mpc-armv7.zip\" -o /tmp/stevequencer.zip) && unzip -o /tmp/stevequencer.zip -d \"$TARGET_SYNTH_DIR/Steve A - VST - [SEQ] Stevequencer/\" && rm -f /tmp/stevequencer.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-stevequencer/v1.0.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-stevequencer/releases/download/v1.1.1/SEQ-Stevequencer-1.1.1-mpc-armv7.zip", "plugins/stevequencer/thumb.png",
+            "Melodic step sequencer edited from the Q-Links: 16 steps on a 4x4 grid, up to 64, with chance, ratchets and MOD lanes.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Steve A - VST - [SEQ] Stevequencer\" && if [ -f \"./plugins/stevequencer/stevequencer.so\" ]; then cp -rf ./plugins/stevequencer/* \"$TARGET_SYNTH_DIR/Steve A - VST - [SEQ] Stevequencer/\"; else (wget --no-check-certificate -q -O /tmp/stevequencer.zip \"https://github.com/saustin2010/mpc-vst-stevequencer/releases/download/v1.1.1/SEQ-Stevequencer-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/stevequencer.zip \"https://github.com/saustin2010/mpc-vst-stevequencer/releases/download/v1.1.1/SEQ-Stevequencer-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/stevequencer.zip -d \"$TARGET_SYNTH_DIR/Steve A - VST - [SEQ] Stevequencer/\" && rm -f /tmp/stevequencer.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3143,9 +3211,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "stevequencer-16", "Stevequencer 16", "saustin2010", "v1.1.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-24",
-            "968", "628 KB", "14%",
+            "976", "628 KB", "14%",
             "Steve A - VST - [SEQ] Stevequencer 16", "stevequencer16.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-stevequencer16/v1.0.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-stevequencer16/releases/download/v1.1.1/SEQ-Stevequencer-16-1.1.1-mpc-armv7.zip", "plugins/stevequencer-16/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-stevequencer16/v1.0.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-stevequencer16/releases/download/v1.1.1/SEQ-Stevequencer-16-1.1.1-mpc-armv7.zip", "plugins/stevequencer-16/thumb.png",
             "16-step sequencer with eight modulation lanes that move any parameter of the instrument (CC or NRPN), on any page.", "./plugins/stevequencer-16/install.sh", 0,
             false,
             false,
@@ -3155,9 +3223,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "super-arp", "Super Arp", "saustin2010", "v1.1.1", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1025", "2.3 MB", "14%",
+            "1031", "2.3 MB", "14%",
             "handcraftedcc - VST - [SEQ] Super Arp", "superarp.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-superarp/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-superarp/releases/download/v1.1.1/SEQ-Super-Arp-1.1.1-mpc-armv7.zip", "plugins/super-arp/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-superarp/v1.1.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-superarp/releases/download/v1.1.1/SEQ-Super-Arp-1.1.1-mpc-armv7.zip", "plugins/super-arp/thumb.png",
             "Arpeggiator that splits note order from rhythm: 40 patterns, 40 rhythms and seeded random modifiers.", "./plugins/super-arp/install.sh", 0,
             false,
             false,
@@ -3167,9 +3235,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "piclidean-mpc", "πClideaN MPC", "Timo", "v1.3.0", "Sequencer",
             "MIDI", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-30",
-            "85", "5.1 MB", "14%",
+            "87", "5.1 MB", "14%",
             "Timo - VST - πClideaN MPC", "piclidean_mpc.so",
-            "https://raw.githubusercontent.com/timomacquis/piClideaN16-MPC/48c2560cb46bcec86b8f473844d38b3b37a21709/Cover.png", "https://github.com/timomacquis/piClideaN16-MPC/releases/download/v1.3.0/ClideaN-MPC-1.3.0-mpc-armv7.zip", "plugins/piclidean-mpc/thumb.ppm",
+            "https://raw.githubusercontent.com/timomacquis/piClideaN16-MPC/48c2560cb46bcec86b8f473844d38b3b37a21709/Cover.png", "https://github.com/timomacquis/piClideaN16-MPC/releases/download/v1.3.0/ClideaN-MPC-1.3.0-mpc-armv7.zip", "plugins/piclidean-mpc/thumb.png",
             "Sixteen-lane hybrid MIDI sequencer with Euclidean patterns, per-step expression, scales, selective randomization and dual-LFO modulation.", "./plugins/piclidean-mpc/install.sh", 0,
             false,
             false,
@@ -3186,9 +3254,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-air3", "Airwindows Air3", "mmiroshnikov", "v1.0.0", "Eq",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1181", "745 KB", "14%",
+            "1182", "745 KB", "14%",
             "Airwindows - VST - Air3", "air3.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Air3.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Air3-1.0.0-mpc-armv7.zip", "plugins/airwindows-air3/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Air3.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Air3-1.0.0-mpc-armv7.zip", "plugins/airwindows-air3/thumb.png",
             "Air-band EQ that lifts or tames the very top and the low ground of a mix.", "./plugins/airwindows-air3/install.sh", 0,
             false,
             false,
@@ -3198,10 +3266,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-buttercomp2", "Airwindows ButterComp2", "mmiroshnikov", "v1.0.0", "Compressor",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1155", "757 KB", "14%",
+            "1156", "757 KB", "14%",
             "Airwindows - VST - ButterComp2", "buttercomp2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ButterComp2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ButterComp2-1.0.0-mpc-armv7.zip", "plugins/airwindows-buttercomp2/thumb.ppm",
-            "Smooth, buttery bipolar compressor that stays transparent even when pushed.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ButterComp2\" && if [ -f \"./plugins/airwindows-buttercomp2/buttercomp2.so\" ]; then cp -rf ./plugins/airwindows-buttercomp2/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ButterComp2/\"; else (wget -q -O /tmp/airwindows-buttercomp2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ButterComp2-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-buttercomp2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ButterComp2-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ButterComp2-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-buttercomp2.zip) && unzip -o /tmp/airwindows-buttercomp2.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ButterComp2/\" && rm -f /tmp/airwindows-buttercomp2.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ButterComp2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ButterComp2-1.0.0-mpc-armv7.zip", "plugins/airwindows-buttercomp2/thumb.png",
+            "Smooth, buttery bipolar compressor that stays transparent even when pushed.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ButterComp2\" && if [ -f \"./plugins/airwindows-buttercomp2/buttercomp2.so\" ]; then cp -rf ./plugins/airwindows-buttercomp2/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ButterComp2/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-buttercomp2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ButterComp2-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-buttercomp2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ButterComp2-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-buttercomp2.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ButterComp2/\" && rm -f /tmp/airwindows-buttercomp2.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3210,9 +3278,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-chamber2", "Airwindows Chamber2", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1103", "702 KB", "14%",
+            "1104", "702 KB", "14%",
             "Airwindows - VST - Chamber2", "chamber2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Chamber2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Chamber2-1.0.0-mpc-armv7.zip", "plugins/airwindows-chamber2/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Chamber2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Chamber2-1.0.0-mpc-armv7.zip", "plugins/airwindows-chamber2/thumb.png",
             "Chamber reverb with delay, regeneration and thickness controls.", "./plugins/airwindows-chamber2/install.sh", 0,
             false,
             false,
@@ -3222,10 +3290,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-chorusensemble", "Airwindows ChorusEnsemble", "mmiroshnikov", "v1.0.0", "Chorus",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1106", "647 KB", "14%",
+            "1107", "647 KB", "14%",
             "Airwindows - VST - ChorusEnsemble", "chorusensemble.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ChorusEnsemble.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ChorusEnsemble-1.0.0-mpc-armv7.zip", "plugins/airwindows-chorusensemble/thumb.ppm",
-            "Lush multi-tap ensemble chorus.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ChorusEnsemble\" && if [ -f \"./plugins/airwindows-chorusensemble/chorusensemble.so\" ]; then cp -rf ./plugins/airwindows-chorusensemble/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ChorusEnsemble/\"; else (wget -q -O /tmp/airwindows-chorusensemble.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ChorusEnsemble-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-chorusensemble.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ChorusEnsemble-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ChorusEnsemble-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-chorusensemble.zip) && unzip -o /tmp/airwindows-chorusensemble.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ChorusEnsemble/\" && rm -f /tmp/airwindows-chorusensemble.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ChorusEnsemble.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ChorusEnsemble-1.0.0-mpc-armv7.zip", "plugins/airwindows-chorusensemble/thumb.png",
+            "Lush multi-tap ensemble chorus.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ChorusEnsemble\" && if [ -f \"./plugins/airwindows-chorusensemble/chorusensemble.so\" ]; then cp -rf ./plugins/airwindows-chorusensemble/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ChorusEnsemble/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-chorusensemble.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ChorusEnsemble-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-chorusensemble.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ChorusEnsemble-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-chorusensemble.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ChorusEnsemble/\" && rm -f /tmp/airwindows-chorusensemble.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3234,9 +3302,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-ambience", "Airwindows Collection: Ambience", "sd88me", "v0.1.0", "Delay",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "138", "10.6 MB", "14%",
+            "139", "10.6 MB", "14%",
             "Airwindows - VST - AW Ambience", "aw_ambience.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/ambience.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Ambience-0.1.0-mpc-armv7.zip", "plugins/aw-ambience/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/ambience.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Ambience-0.1.0-mpc-armv7.zip", "plugins/aw-ambience/thumb.png",
             "The Airwindows Ambience collection: all 26 ambience, delay, chorus and echo effects in one plugin, each with its own panel, Q-Link badges and built-in manual.", "./plugins/aw-ambience/install.sh", 0,
             false,
             false,
@@ -3246,10 +3314,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-console-strips", "Airwindows Collection: Console Strips", "sd88me", "v0.1.0", "Mixing",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "146", "15.2 MB", "14%",
+            "147", "15.2 MB", "14%",
             "Airwindows - VST - AW Console Strips", "aw_consolestrips.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/consolestrips.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Console-Strips-0.1.0-mpc-armv7.zip", "plugins/aw-console-strips/thumb.ppm",
-            "The Airwindows Console Strips collection: all 8 big console channel strips (ConsoleX and ConsoleH), spread over four pages in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Console Strips\" && if [ -f \"./plugins/aw-console-strips/aw_consolestrips.so\" ]; then cp -rf ./plugins/aw-console-strips/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Console Strips/\"; else (wget -q -O /tmp/aw-console-strips.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Console-Strips-0.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/aw-console-strips.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Console-Strips-0.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Console-Strips-0.1.0-mpc-armv7.zip\" -o /tmp/aw-console-strips.zip) && unzip -o /tmp/aw-console-strips.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Console Strips/\" && rm -f /tmp/aw-console-strips.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/consolestrips.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Console-Strips-0.1.0-mpc-armv7.zip", "plugins/aw-console-strips/thumb.png",
+            "The Airwindows Console Strips collection: all 8 big console channel strips (ConsoleX and ConsoleH), spread over four pages in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Console Strips\" && if [ -f \"./plugins/aw-console-strips/aw_consolestrips.so\" ]; then cp -rf ./plugins/aw-console-strips/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Console Strips/\"; else (wget --no-check-certificate -q -O /tmp/aw-console-strips.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Console-Strips-0.1.0-mpc-armv7.zip\" || wget -q -O /tmp/aw-console-strips.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Console-Strips-0.1.0-mpc-armv7.zip\") && unzip -o /tmp/aw-console-strips.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Console Strips/\" && rm -f /tmp/aw-console-strips.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3258,9 +3326,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-consoles", "Airwindows Collection: Consoles", "sd88me", "v0.1.0", "Mixing",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "137", "10.5 MB", "14%",
+            "138", "10.5 MB", "14%",
             "Airwindows - VST - AW Consoles", "aw_consoles.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/consoles.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Consoles-0.1.0-mpc-armv7.zip", "plugins/aw-consoles/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/consoles.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Consoles-0.1.0-mpc-armv7.zip", "plugins/aw-consoles/thumb.png",
             "The Airwindows Consoles collection: all 50 console and mix-buss systems (Console 0 to 9, ConsoleLA, MC, MD and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "./plugins/aw-consoles/install.sh", 0,
             false,
             false,
@@ -3270,10 +3338,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-distortion", "Airwindows Collection: Distortion", "sd88me", "v0.1.0", "Distortion",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "136", "10.0 MB", "14%",
+            "137", "10.0 MB", "14%",
             "Airwindows - VST - AW Distortion", "aw_distortion.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/distortion.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Distortion-0.1.0-mpc-armv7.zip", "plugins/aw-distortion/thumb.ppm",
-            "The Airwindows Distortion collection: all 15 distortions (Density, Drive, Edge, Mackity, HardVacuum and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Distortion\" && if [ -f \"./plugins/aw-distortion/aw_distortion.so\" ]; then cp -rf ./plugins/aw-distortion/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Distortion/\"; else (wget -q -O /tmp/aw-distortion.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Distortion-0.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/aw-distortion.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Distortion-0.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Distortion-0.1.0-mpc-armv7.zip\" -o /tmp/aw-distortion.zip) && unzip -o /tmp/aw-distortion.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Distortion/\" && rm -f /tmp/aw-distortion.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/distortion.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Distortion-0.1.0-mpc-armv7.zip", "plugins/aw-distortion/thumb.png",
+            "The Airwindows Distortion collection: all 15 distortions (Density, Drive, Edge, Mackity, HardVacuum and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Distortion\" && if [ -f \"./plugins/aw-distortion/aw_distortion.so\" ]; then cp -rf ./plugins/aw-distortion/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Distortion/\"; else (wget --no-check-certificate -q -O /tmp/aw-distortion.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Distortion-0.1.0-mpc-armv7.zip\" || wget -q -O /tmp/aw-distortion.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Distortion-0.1.0-mpc-armv7.zip\") && unzip -o /tmp/aw-distortion.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Distortion/\" && rm -f /tmp/aw-distortion.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3282,9 +3350,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-dynamics", "Airwindows Collection: Dynamics", "sd88me", "v0.1.0", "Dynamics",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "135", "13.8 MB", "14%",
+            "136", "13.8 MB", "14%",
             "Airwindows - VST - AW Dynamics", "aw_dynamics.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/dynamics.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Dynamics-0.1.0-mpc-armv7.zip", "plugins/aw-dynamics/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/dynamics.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Dynamics-0.1.0-mpc-armv7.zip", "plugins/aw-dynamics/thumb.png",
             "The Airwindows Dynamics collection: all 35 compressors, gates and dynamics tools in one plugin, each with its own panel, Q-Link badges and built-in manual.", "./plugins/aw-dynamics/install.sh", 0,
             false,
             false,
@@ -3294,10 +3362,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-effects", "Airwindows Collection: Effects", "sd88me", "v0.1.0", "Utility",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "144", "12.2 MB", "14%",
+            "145", "12.2 MB", "14%",
             "Airwindows - VST - AW Effects", "aw_effects.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/effects.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Effects-0.1.0-mpc-armv7.zip", "plugins/aw-effects/thumb.ppm",
-            "The Airwindows Effects collection: all 29 effects (Pafnuty, tremolo, pitch shifters, wavefolders, exciters and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Effects\" && if [ -f \"./plugins/aw-effects/aw_effects.so\" ]; then cp -rf ./plugins/aw-effects/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Effects/\"; else (wget -q -O /tmp/aw-effects.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Effects-0.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/aw-effects.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Effects-0.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Effects-0.1.0-mpc-armv7.zip\" -o /tmp/aw-effects.zip) && unzip -o /tmp/aw-effects.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Effects/\" && rm -f /tmp/aw-effects.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/effects.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Effects-0.1.0-mpc-armv7.zip", "plugins/aw-effects/thumb.png",
+            "The Airwindows Effects collection: all 29 effects (Pafnuty, tremolo, pitch shifters, wavefolders, exciters and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Effects\" && if [ -f \"./plugins/aw-effects/aw_effects.so\" ]; then cp -rf ./plugins/aw-effects/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Effects/\"; else (wget --no-check-certificate -q -O /tmp/aw-effects.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Effects-0.1.0-mpc-armv7.zip\" || wget -q -O /tmp/aw-effects.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Effects-0.1.0-mpc-armv7.zip\") && unzip -o /tmp/aw-effects.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Effects/\" && rm -f /tmp/aw-effects.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3306,9 +3374,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-filter", "Airwindows Collection: Filter", "sd88me", "v0.1.0", "Filter",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "134", "13.7 MB", "14%",
+            "135", "13.7 MB", "14%",
             "Airwindows - VST - AW Filter", "aw_filter.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/filter.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Filter-0.1.0-mpc-armv7.zip", "plugins/aw-filter/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/filter.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Filter-0.1.0-mpc-armv7.zip", "plugins/aw-filter/thumb.png",
             "The Airwindows Filter collection: all 54 filters and EQs (Baxandall, Isolator, Holt, SmoothEQ and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "./plugins/aw-filter/install.sh", 0,
             false,
             false,
@@ -3318,10 +3386,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-reverb", "Airwindows Collection: Reverb", "sd88me", "v0.1.0", "Reverb",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "141", "10.7 MB", "14%",
+            "142", "10.7 MB", "14%",
             "Airwindows - VST - AW Reverb", "aw_reverb.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/reverb.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Reverb-0.1.0-mpc-armv7.zip", "plugins/aw-reverb/thumb.ppm",
-            "The Airwindows Reverb collection: all 42 reverbs (the k-series, plates, Galactic, Verbity and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Reverb\" && if [ -f \"./plugins/aw-reverb/aw_reverb.so\" ]; then cp -rf ./plugins/aw-reverb/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Reverb/\"; else (wget -q -O /tmp/aw-reverb.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Reverb-0.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/aw-reverb.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Reverb-0.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Reverb-0.1.0-mpc-armv7.zip\" -o /tmp/aw-reverb.zip) && unzip -o /tmp/aw-reverb.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Reverb/\" && rm -f /tmp/aw-reverb.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/reverb.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Reverb-0.1.0-mpc-armv7.zip", "plugins/aw-reverb/thumb.png",
+            "The Airwindows Reverb collection: all 42 reverbs (the k-series, plates, Galactic, Verbity and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Reverb\" && if [ -f \"./plugins/aw-reverb/aw_reverb.so\" ]; then cp -rf ./plugins/aw-reverb/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Reverb/\"; else (wget --no-check-certificate -q -O /tmp/aw-reverb.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Reverb-0.1.0-mpc-armv7.zip\" || wget -q -O /tmp/aw-reverb.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Reverb-0.1.0-mpc-armv7.zip\") && unzip -o /tmp/aw-reverb.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Reverb/\" && rm -f /tmp/aw-reverb.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3330,9 +3398,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-saturation", "Airwindows Collection: Saturation", "sd88me", "v0.1.0", "Saturation",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "142", "10.9 MB", "14%",
+            "143", "10.9 MB", "14%",
             "Airwindows - VST - AW Saturation", "aw_saturation.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/saturation.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Saturation-0.1.0-mpc-armv7.zip", "plugins/aw-saturation/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/saturation.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Saturation-0.1.0-mpc-armv7.zip", "plugins/aw-saturation/thumb.png",
             "The Airwindows Saturation collection: all 20 saturation models (Tube, Mojo, Focus, Spiral2 and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "./plugins/aw-saturation/install.sh", 0,
             false,
             false,
@@ -3342,10 +3410,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-tape", "Airwindows Collection: Tape", "sd88me", "v0.1.0", "Tape",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "143", "10.6 MB", "14%",
+            "144", "10.6 MB", "14%",
             "Airwindows - VST - AW Tape", "aw_tape.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/tape.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Tape-0.1.0-mpc-armv7.zip", "plugins/aw-tape/thumb.ppm",
-            "The Airwindows Tape collection: all 12 tape emulations (ToTape, TapeHack, IronOxide and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Tape\" && if [ -f \"./plugins/aw-tape/aw_tape.so\" ]; then cp -rf ./plugins/aw-tape/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Tape/\"; else (wget -q -O /tmp/aw-tape.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Tape-0.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/aw-tape.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Tape-0.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Tape-0.1.0-mpc-armv7.zip\" -o /tmp/aw-tape.zip) && unzip -o /tmp/aw-tape.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Tape/\" && rm -f /tmp/aw-tape.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/tape.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Tape-0.1.0-mpc-armv7.zip", "plugins/aw-tape/thumb.png",
+            "The Airwindows Tape collection: all 12 tape emulations (ToTape, TapeHack, IronOxide and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Tape\" && if [ -f \"./plugins/aw-tape/aw_tape.so\" ]; then cp -rf ./plugins/aw-tape/* \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Tape/\"; else (wget --no-check-certificate -q -O /tmp/aw-tape.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Tape-0.1.0-mpc-armv7.zip\" || wget -q -O /tmp/aw-tape.zip \"https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Tape-0.1.0-mpc-armv7.zip\") && unzip -o /tmp/aw-tape.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - AW Tape/\" && rm -f /tmp/aw-tape.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3354,9 +3422,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "aw-utility", "Airwindows Collection: Utility", "sd88me", "v0.1.0", "Utility",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "126", "13.5 MB", "14%",
+            "127", "13.5 MB", "14%",
             "Airwindows - VST - AW Utility", "aw_utility.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/utility.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Utility-0.1.0-mpc-armv7.zip", "plugins/aw-utility/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-airwindows/6196324ee776860ce4d3cc46dbd90e331f3ba53d/docs/img/utility.png", "https://github.com/sd88me/mpc-vst-airwindows/releases/download/v0.1.0/AW-Utility-0.1.0-mpc-armv7.zip", "plugins/aw-utility/thumb.png",
             "The Airwindows Utility collection: all 38 utilities (gain, pan, trims, mid/side, monitoring, mix checks and more) in one plugin, each with its own panel, Q-Link badges and built-in manual.", "./plugins/aw-utility/install.sh", 0,
             false,
             false,
@@ -3366,10 +3434,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-console7channel", "Airwindows Console7Channel", "mmiroshnikov", "v1.0.0", "Saturation",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1103", "737 KB", "14%",
+            "1104", "737 KB", "14%",
             "Airwindows - VST - Console7Channel", "console7channel.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Console7Channel.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Console7Channel-1.0.0-mpc-armv7.zip", "plugins/airwindows-console7channel/thumb.ppm",
-            "Console7 channel stage: analog-style console saturation behind a fader.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Console7Channel\" && if [ -f \"./plugins/airwindows-console7channel/console7channel.so\" ]; then cp -rf ./plugins/airwindows-console7channel/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Console7Channel/\"; else (wget -q -O /tmp/airwindows-console7channel.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Console7Channel-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-console7channel.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Console7Channel-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Console7Channel-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-console7channel.zip) && unzip -o /tmp/airwindows-console7channel.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Console7Channel/\" && rm -f /tmp/airwindows-console7channel.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Console7Channel.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Console7Channel-1.0.0-mpc-armv7.zip", "plugins/airwindows-console7channel/thumb.png",
+            "Console7 channel stage: analog-style console saturation behind a fader.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Console7Channel\" && if [ -f \"./plugins/airwindows-console7channel/console7channel.so\" ]; then cp -rf ./plugins/airwindows-console7channel/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Console7Channel/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-console7channel.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Console7Channel-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-console7channel.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Console7Channel-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-console7channel.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Console7Channel/\" && rm -f /tmp/airwindows-console7channel.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3378,9 +3446,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-density2", "Airwindows Density2", "mmiroshnikov", "v1.0.0", "Saturation",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1116", "648 KB", "14%",
+            "1117", "648 KB", "14%",
             "Airwindows - VST - Density2", "density2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Density2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Density2-1.0.0-mpc-armv7.zip", "plugins/airwindows-density2/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Density2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Density2-1.0.0-mpc-armv7.zip", "plugins/airwindows-density2/thumb.png",
             "Density saturation with a highpass, for thickening and fattening sounds.", "./plugins/airwindows-density2/install.sh", 0,
             false,
             false,
@@ -3390,10 +3458,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-galactic", "Airwindows Galactic", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1174", "835 KB", "14%",
+            "1175", "835 KB", "14%",
             "Airwindows - VST - Galactic", "galactic.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Galactic.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic-1.0.0-mpc-armv7.zip", "plugins/airwindows-galactic/thumb.ppm",
-            "Huge, dark, shimmering ambient space reverb.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic\" && if [ -f \"./plugins/airwindows-galactic/galactic.so\" ]; then cp -rf ./plugins/airwindows-galactic/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic/\"; else (wget -q -O /tmp/airwindows-galactic.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-galactic.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-galactic.zip) && unzip -o /tmp/airwindows-galactic.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic/\" && rm -f /tmp/airwindows-galactic.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Galactic.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic-1.0.0-mpc-armv7.zip", "plugins/airwindows-galactic/thumb.png",
+            "Huge, dark, shimmering ambient space reverb.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic\" && if [ -f \"./plugins/airwindows-galactic/galactic.so\" ]; then cp -rf ./plugins/airwindows-galactic/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-galactic.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-galactic.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-galactic.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic/\" && rm -f /tmp/airwindows-galactic.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3402,9 +3470,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-galactic2", "Airwindows Galactic2", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1100", "816 KB", "14%",
+            "1101", "816 KB", "14%",
             "Airwindows - VST - Galactic2", "galactic2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Galactic2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic2-1.0.0-mpc-armv7.zip", "plugins/airwindows-galactic2/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Galactic2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic2-1.0.0-mpc-armv7.zip", "plugins/airwindows-galactic2/thumb.png",
             "Galactic reverb with drive, sustain and darkening for vast ambient tails.", "./plugins/airwindows-galactic2/install.sh", 0,
             false,
             false,
@@ -3414,10 +3482,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-galactic3", "Airwindows Galactic3", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1117", "692 KB", "14%",
+            "1118", "692 KB", "14%",
             "Airwindows - VST - Galactic3", "galactic3.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Galactic3.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic3-1.0.0-mpc-armv7.zip", "plugins/airwindows-galactic3/thumb.ppm",
-            "Galactic reverb with brightness, detune, derez and size controls.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic3\" && if [ -f \"./plugins/airwindows-galactic3/galactic3.so\" ]; then cp -rf ./plugins/airwindows-galactic3/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic3/\"; else (wget -q -O /tmp/airwindows-galactic3.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic3-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-galactic3.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic3-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic3-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-galactic3.zip) && unzip -o /tmp/airwindows-galactic3.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic3/\" && rm -f /tmp/airwindows-galactic3.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Galactic3.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic3-1.0.0-mpc-armv7.zip", "plugins/airwindows-galactic3/thumb.png",
+            "Galactic reverb with brightness, detune, derez and size controls.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic3\" && if [ -f \"./plugins/airwindows-galactic3/galactic3.so\" ]; then cp -rf ./plugins/airwindows-galactic3/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic3/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-galactic3.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic3-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-galactic3.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Galactic3-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-galactic3.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Galactic3/\" && rm -f /tmp/airwindows-galactic3.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3426,9 +3494,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-galacticvibe", "Airwindows GalacticVibe", "mmiroshnikov", "v1.0.0", "Chorus",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1073", "702 KB", "14%",
+            "1074", "702 KB", "14%",
             "Airwindows - VST - GalacticVibe", "galacticvibe.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/GalacticVibe.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/GalacticVibe-1.0.0-mpc-armv7.zip", "plugins/airwindows-galacticvibe/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/GalacticVibe.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/GalacticVibe-1.0.0-mpc-armv7.zip", "plugins/airwindows-galacticvibe/thumb.png",
             "The pitch-wobble vibrato stage of the Galactic reverbs on its own.", "./plugins/airwindows-galacticvibe/install.sh", 0,
             false,
             false,
@@ -3438,10 +3506,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-infinity2", "Airwindows Infinity2", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1111", "622 KB", "14%",
+            "1112", "622 KB", "14%",
             "Airwindows - VST - Infinity2", "infinity2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Infinity2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Infinity2-1.0.0-mpc-armv7.zip", "plugins/airwindows-infinity2/thumb.ppm",
-            "Infinite-sustain reverb with filtering, damping and allpass diffusion.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Infinity2\" && if [ -f \"./plugins/airwindows-infinity2/infinity2.so\" ]; then cp -rf ./plugins/airwindows-infinity2/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Infinity2/\"; else (wget -q -O /tmp/airwindows-infinity2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Infinity2-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-infinity2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Infinity2-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Infinity2-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-infinity2.zip) && unzip -o /tmp/airwindows-infinity2.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Infinity2/\" && rm -f /tmp/airwindows-infinity2.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Infinity2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Infinity2-1.0.0-mpc-armv7.zip", "plugins/airwindows-infinity2/thumb.png",
+            "Infinite-sustain reverb with filtering, damping and allpass diffusion.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Infinity2\" && if [ -f \"./plugins/airwindows-infinity2/infinity2.so\" ]; then cp -rf ./plugins/airwindows-infinity2/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Infinity2/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-infinity2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Infinity2-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-infinity2.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Infinity2-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-infinity2.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Infinity2/\" && rm -f /tmp/airwindows-infinity2.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3450,9 +3518,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-kalienspaceship", "Airwindows kAlienSpaceship", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1092", "721 KB", "14%",
+            "1093", "721 KB", "14%",
             "Airwindows - VST - kAlienSpaceship", "kalienspaceship.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/kAlienSpaceship.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kAlienSpaceship-1.0.0-mpc-armv7.zip", "plugins/airwindows-kalienspaceship/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/kAlienSpaceship.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kAlienSpaceship-1.0.0-mpc-armv7.zip", "plugins/airwindows-kalienspaceship/thumb.png",
             "Enormous sci-fi space reverb from the kCathedral family.", "./plugins/airwindows-kalienspaceship/install.sh", 0,
             false,
             false,
@@ -3462,10 +3530,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-kcathedral5", "Airwindows kCathedral5", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1057", "599 KB", "14%",
+            "1058", "599 KB", "14%",
             "Airwindows - VST - kCathedral5", "kcathedral5.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/kCathedral5.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCathedral5-1.0.0-mpc-armv7.zip", "plugins/airwindows-kcathedral5/thumb.ppm",
-            "Cathedral-sized reverb with early reflections and position control.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - kCathedral5\" && if [ -f \"./plugins/airwindows-kcathedral5/kcathedral5.so\" ]; then cp -rf ./plugins/airwindows-kcathedral5/* \"$TARGET_SYNTH_DIR/Airwindows - VST - kCathedral5/\"; else (wget -q -O /tmp/airwindows-kcathedral5.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCathedral5-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-kcathedral5.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCathedral5-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCathedral5-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-kcathedral5.zip) && unzip -o /tmp/airwindows-kcathedral5.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - kCathedral5/\" && rm -f /tmp/airwindows-kcathedral5.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/kCathedral5.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCathedral5-1.0.0-mpc-armv7.zip", "plugins/airwindows-kcathedral5/thumb.png",
+            "Cathedral-sized reverb with early reflections and position control.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - kCathedral5\" && if [ -f \"./plugins/airwindows-kcathedral5/kcathedral5.so\" ]; then cp -rf ./plugins/airwindows-kcathedral5/* \"$TARGET_SYNTH_DIR/Airwindows - VST - kCathedral5/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-kcathedral5.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCathedral5-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-kcathedral5.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCathedral5-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-kcathedral5.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - kCathedral5/\" && rm -f /tmp/airwindows-kcathedral5.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3474,9 +3542,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-kcosmos", "Airwindows kCosmos", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1092", "715 KB", "14%",
+            "1093", "715 KB", "14%",
             "Airwindows - VST - kCosmos", "kcosmos.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/kCosmos.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCosmos-1.0.0-mpc-armv7.zip", "plugins/airwindows-kcosmos/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/kCosmos.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/kCosmos-1.0.0-mpc-armv7.zip", "plugins/airwindows-kcosmos/thumb.png",
             "Vast cosmic reverb with predelay and early reflections.", "./plugins/airwindows-kcosmos/install.sh", 0,
             false,
             false,
@@ -3486,10 +3554,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-mackity", "Airwindows Mackity", "mmiroshnikov", "v1.0.0", "Saturation",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-05",
-            "951", "587 KB", "14%",
+            "952", "587 KB", "14%",
             "Airwindows - VST - Mackity", "mackity.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Mackity.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.1.0/Mackity-1.0.0-mpc-armv7.zip", "plugins/airwindows-mackity/thumb.ppm",
-            "Mackie-style console distortion: drive it with the input trim, tame it with the output pad.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Mackity\" && if [ -f \"./plugins/airwindows-mackity/mackity.so\" ]; then cp -rf ./plugins/airwindows-mackity/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Mackity/\"; else (wget -q -O /tmp/airwindows-mackity.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.1.0/Mackity-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-mackity.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.1.0/Mackity-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.1.0/Mackity-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-mackity.zip) && unzip -o /tmp/airwindows-mackity.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Mackity/\" && rm -f /tmp/airwindows-mackity.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Mackity.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.1.0/Mackity-1.0.0-mpc-armv7.zip", "plugins/airwindows-mackity/thumb.png",
+            "Mackie-style console distortion: drive it with the input trim, tame it with the output pad.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - Mackity\" && if [ -f \"./plugins/airwindows-mackity/mackity.so\" ]; then cp -rf ./plugins/airwindows-mackity/* \"$TARGET_SYNTH_DIR/Airwindows - VST - Mackity/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-mackity.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.1.0/Mackity-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-mackity.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.1.0/Mackity-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-mackity.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - Mackity/\" && rm -f /tmp/airwindows-mackity.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3498,9 +3566,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-matrixverb", "Airwindows MatrixVerb", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1069", "730 KB", "14%",
+            "1070", "730 KB", "14%",
             "Airwindows - VST - MatrixVerb", "matrixverb.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/MatrixVerb.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/MatrixVerb-1.0.0-mpc-armv7.zip", "plugins/airwindows-matrixverb/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/MatrixVerb.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/MatrixVerb-1.0.0-mpc-armv7.zip", "plugins/airwindows-matrixverb/thumb.png",
             "Classic algorithmic reverb with filter, damping, modulation and room size.", "./plugins/airwindows-matrixverb/install.sh", 0,
             false,
             false,
@@ -3510,10 +3578,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-pitchdelay", "Airwindows PitchDelay", "mmiroshnikov", "v1.0.0", "Delay",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1096", "618 KB", "14%",
+            "1097", "618 KB", "14%",
             "Airwindows - VST - PitchDelay", "pitchdelay.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/PitchDelay.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/PitchDelay-1.0.0-mpc-armv7.zip", "plugins/airwindows-pitchdelay/thumb.ppm",
-            "Delay with pitch shifting in the feedback path and a resonant filter.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - PitchDelay\" && if [ -f \"./plugins/airwindows-pitchdelay/pitchdelay.so\" ]; then cp -rf ./plugins/airwindows-pitchdelay/* \"$TARGET_SYNTH_DIR/Airwindows - VST - PitchDelay/\"; else (wget -q -O /tmp/airwindows-pitchdelay.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/PitchDelay-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-pitchdelay.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/PitchDelay-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/PitchDelay-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-pitchdelay.zip) && unzip -o /tmp/airwindows-pitchdelay.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - PitchDelay/\" && rm -f /tmp/airwindows-pitchdelay.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/PitchDelay.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/PitchDelay-1.0.0-mpc-armv7.zip", "plugins/airwindows-pitchdelay/thumb.png",
+            "Delay with pitch shifting in the feedback path and a resonant filter.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - PitchDelay\" && if [ -f \"./plugins/airwindows-pitchdelay/pitchdelay.so\" ]; then cp -rf ./plugins/airwindows-pitchdelay/* \"$TARGET_SYNTH_DIR/Airwindows - VST - PitchDelay/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-pitchdelay.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/PitchDelay-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-pitchdelay.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/PitchDelay-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-pitchdelay.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - PitchDelay/\" && rm -f /tmp/airwindows-pitchdelay.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3522,9 +3590,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-tapedelay2", "Airwindows TapeDelay2", "mmiroshnikov", "v1.0.0", "Delay",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1144", "548 KB", "14%",
+            "1145", "548 KB", "14%",
             "Airwindows - VST - TapeDelay2", "tapedelay2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/TapeDelay2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/TapeDelay2-1.0.0-mpc-armv7.zip", "plugins/airwindows-tapedelay2/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/TapeDelay2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/TapeDelay2-1.0.0-mpc-armv7.zip", "plugins/airwindows-tapedelay2/thumb.png",
             "Tape-style delay with flutter and a resonant filter in the repeats.", "./plugins/airwindows-tapedelay2/install.sh", 0,
             false,
             false,
@@ -3534,10 +3602,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-tovinyl4", "Airwindows ToVinyl4", "mmiroshnikov", "v1.0.0", "Utility",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1054", "738 KB", "14%",
+            "1055", "738 KB", "14%",
             "Airwindows - VST - ToVinyl4", "tovinyl4.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ToVinyl4.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ToVinyl4-1.0.0-mpc-armv7.zip", "plugins/airwindows-tovinyl4/thumb.ppm",
-            "Vinyl mastering stage: mid and side highpass, high limiter and groove wear.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ToVinyl4\" && if [ -f \"./plugins/airwindows-tovinyl4/tovinyl4.so\" ]; then cp -rf ./plugins/airwindows-tovinyl4/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ToVinyl4/\"; else (wget -q -O /tmp/airwindows-tovinyl4.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ToVinyl4-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-tovinyl4.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ToVinyl4-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ToVinyl4-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-tovinyl4.zip) && unzip -o /tmp/airwindows-tovinyl4.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ToVinyl4/\" && rm -f /tmp/airwindows-tovinyl4.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ToVinyl4.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ToVinyl4-1.0.0-mpc-armv7.zip", "plugins/airwindows-tovinyl4/thumb.png",
+            "Vinyl mastering stage: mid and side highpass, high limiter and groove wear.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ToVinyl4\" && if [ -f \"./plugins/airwindows-tovinyl4/tovinyl4.so\" ]; then cp -rf ./plugins/airwindows-tovinyl4/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ToVinyl4/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-tovinyl4.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ToVinyl4-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-tovinyl4.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ToVinyl4-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-tovinyl4.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ToVinyl4/\" && rm -f /tmp/airwindows-tovinyl4.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3546,9 +3614,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-verbity2", "Airwindows Verbity2", "mmiroshnikov", "v1.0.0", "Reverb",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1050", "779 KB", "14%",
+            "1051", "779 KB", "14%",
             "Airwindows - VST - Verbity2", "verbity2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Verbity2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Verbity2-1.0.0-mpc-armv7.zip", "plugins/airwindows-verbity2/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/Verbity2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/Verbity2-1.0.0-mpc-armv7.zip", "plugins/airwindows-verbity2/thumb.png",
             "Dense, smooth reverb with size, sustain and mulch controls.", "./plugins/airwindows-verbity2/install.sh", 0,
             false,
             false,
@@ -3558,10 +3626,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-zacidlowpass", "Airwindows ZAcidLowpass", "mmiroshnikov", "v1.0.0", "Filter",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1025", "685 KB", "14%",
+            "1026", "685 KB", "14%",
             "Airwindows - VST - ZAcidLowpass", "zacidlowpass.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ZAcidLowpass.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZAcidLowpass-1.0.0-mpc-armv7.zip", "plugins/airwindows-zacidlowpass/thumb.ppm",
-            "Acid-style overdriven resonant lowpass filter.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ZAcidLowpass\" && if [ -f \"./plugins/airwindows-zacidlowpass/zacidlowpass.so\" ]; then cp -rf ./plugins/airwindows-zacidlowpass/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ZAcidLowpass/\"; else (wget -q -O /tmp/airwindows-zacidlowpass.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZAcidLowpass-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/airwindows-zacidlowpass.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZAcidLowpass-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZAcidLowpass-1.0.0-mpc-armv7.zip\" -o /tmp/airwindows-zacidlowpass.zip) && unzip -o /tmp/airwindows-zacidlowpass.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ZAcidLowpass/\" && rm -f /tmp/airwindows-zacidlowpass.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ZAcidLowpass.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZAcidLowpass-1.0.0-mpc-armv7.zip", "plugins/airwindows-zacidlowpass/thumb.png",
+            "Acid-style overdriven resonant lowpass filter.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Airwindows - VST - ZAcidLowpass\" && if [ -f \"./plugins/airwindows-zacidlowpass/zacidlowpass.so\" ]; then cp -rf ./plugins/airwindows-zacidlowpass/* \"$TARGET_SYNTH_DIR/Airwindows - VST - ZAcidLowpass/\"; else (wget --no-check-certificate -q -O /tmp/airwindows-zacidlowpass.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZAcidLowpass-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/airwindows-zacidlowpass.zip \"https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZAcidLowpass-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/airwindows-zacidlowpass.zip -d \"$TARGET_SYNTH_DIR/Airwindows - VST - ZAcidLowpass/\" && rm -f /tmp/airwindows-zacidlowpass.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3570,9 +3638,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "airwindows-zlowpass2", "Airwindows ZLowpass2", "mmiroshnikov", "v1.0.0", "Filter",
             "FX", "Stable", "Akai MPC Live (3.9.0), Akai Force (3.9.0)", "MPC OS 3.x", "2026-10-03",
-            "1020", "694 KB", "14%",
+            "1021", "694 KB", "14%",
             "Airwindows - VST - ZLowpass2", "zlowpass2.so",
-            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ZLowpass2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZLowpass2-1.0.0-mpc-armv7.zip", "plugins/airwindows-zlowpass2/thumb.ppm",
+            "https://raw.githubusercontent.com/mmiroshnikov/mpc-airwindows/main/docs/screenshots/ZLowpass2.jpg", "https://github.com/mmiroshnikov/mpc-airwindows/releases/download/v1.0.0/ZLowpass2-1.0.0-mpc-armv7.zip", "plugins/airwindows-zlowpass2/thumb.png",
             "Smooth lowpass filter with a choice of slopes.", "./plugins/airwindows-zlowpass2/install.sh", 0,
             false,
             false,
@@ -3582,9 +3650,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "boris-granular", "Boris Granular", "sd88me", "v1.0.1", "Granular",
             "FX", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "1264", "10.3 MB", "14%",
+            "1267", "10.3 MB", "14%",
             "sd88me - VST - Boris Granular", "boris_granular.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-boris/2d7b1360c68ccc91b22b0c5030152e08dd3682b8/docs/screenshot-force.png", "https://github.com/sd88me/mpc-vst-boris/releases/download/v1.0.1/Boris-Granular-1.0.1-mpc-armv7.zip", "plugins/boris-granular/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-boris/2d7b1360c68ccc91b22b0c5030152e08dd3682b8/docs/screenshot-force.png", "https://github.com/sd88me/mpc-vst-boris/releases/download/v1.0.1/Boris-Granular-1.0.1-mpc-armv7.zip", "plugins/boris-granular/thumb.png",
             "Real-time granular insert effect: incoming audio fills a 10 s buffer and up to 24 overlapping grains replay it with random size, delay, pitch, direction and pan. MPC tempo sync, freeze, feedback, 22 presets and a one-page touchscreen skin with Q-Links. A port of Boris Granular Station by Alessandro Gaiba.", "./plugins/boris-granular/install.sh", 0,
             false,
             false,
@@ -3594,10 +3662,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "clif-tape", "Clif Tape", "MagicStino", "v0.2.0", "Effect",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "185", "1.6 MB", "14%",
+            "187", "1.6 MB", "14%",
             "MagicStino - VST - Clif Tape", "clif_tape.so",
-            "https://raw.githubusercontent.com/MagicStino/Clif-Tape/v0.2.0/catalog-thumbnail.png", "https://github.com/MagicStino/Clif-Tape/releases/download/v0.2.0/Clif-Tape-0.2.0-mpc-armv7.zip", "plugins/clif-tape/thumb.ppm",
-            "Stereo tape colour and digital degradation, expressive Wow/Flutter, twelve tone profiles, crackle, stereo spread, independent noise textures and Silence Gate. Fifteen presets and touchscreen Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MagicStino - VST - Clif Tape\" && if [ -f \"./plugins/clif-tape/clif_tape.so\" ]; then cp -rf ./plugins/clif-tape/* \"$TARGET_SYNTH_DIR/MagicStino - VST - Clif Tape/\"; else (wget -q -O /tmp/clif-tape.zip \"https://github.com/MagicStino/Clif-Tape/releases/download/v0.2.0/Clif-Tape-0.2.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/clif-tape.zip \"https://github.com/MagicStino/Clif-Tape/releases/download/v0.2.0/Clif-Tape-0.2.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/MagicStino/Clif-Tape/releases/download/v0.2.0/Clif-Tape-0.2.0-mpc-armv7.zip\" -o /tmp/clif-tape.zip) && unzip -o /tmp/clif-tape.zip -d \"$TARGET_SYNTH_DIR/MagicStino - VST - Clif Tape/\" && rm -f /tmp/clif-tape.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/MagicStino/Clif-Tape/v0.2.0/catalog-thumbnail.png", "https://github.com/MagicStino/Clif-Tape/releases/download/v0.2.0/Clif-Tape-0.2.0-mpc-armv7.zip", "plugins/clif-tape/thumb.png",
+            "Stereo tape colour and digital degradation, expressive Wow/Flutter, twelve tone profiles, crackle, stereo spread, independent noise textures and Silence Gate. Fifteen presets and touchscreen Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MagicStino - VST - Clif Tape\" && if [ -f \"./plugins/clif-tape/clif_tape.so\" ]; then cp -rf ./plugins/clif-tape/* \"$TARGET_SYNTH_DIR/MagicStino - VST - Clif Tape/\"; else (wget --no-check-certificate -q -O /tmp/clif-tape.zip \"https://github.com/MagicStino/Clif-Tape/releases/download/v0.2.0/Clif-Tape-0.2.0-mpc-armv7.zip\" || wget -q -O /tmp/clif-tape.zip \"https://github.com/MagicStino/Clif-Tape/releases/download/v0.2.0/Clif-Tape-0.2.0-mpc-armv7.zip\") && unzip -o /tmp/clif-tape.zip -d \"$TARGET_SYNTH_DIR/MagicStino - VST - Clif Tape/\" && rm -f /tmp/clif-tape.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3606,10 +3674,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-cwo", "Cwo", "Bombest", "v0.4.1", "Delay",
             "FX", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "74", "4.2 MB", "14%",
+            "77", "4.2 MB", "14%",
             "bombest - VST - Cwo", "cwo.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/cwo.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cwo-0.4.1-mpc-armv7.zip", "plugins/op1fx-cwo/thumb.ppm",
-            "Stereo delay with a frequency shifter in the feedback loop, plus a MIX knob. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Cwo\" && if [ -f \"./plugins/op1fx-cwo/cwo.so\" ]; then cp -rf ./plugins/op1fx-cwo/* \"$TARGET_SYNTH_DIR/bombest - VST - Cwo/\"; else (wget -q -O /tmp/op1fx-cwo.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cwo-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-cwo.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cwo-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cwo-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-cwo.zip) && unzip -o /tmp/op1fx-cwo.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Cwo/\" && rm -f /tmp/op1fx-cwo.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/cwo.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cwo-0.4.1-mpc-armv7.zip", "plugins/op1fx-cwo/thumb.png",
+            "Stereo delay with a frequency shifter in the feedback loop, plus a MIX knob. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Cwo\" && if [ -f \"./plugins/op1fx-cwo/cwo.so\" ]; then cp -rf ./plugins/op1fx-cwo/* \"$TARGET_SYNTH_DIR/bombest - VST - Cwo/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-cwo.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cwo-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-cwo.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Cwo-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-cwo.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Cwo/\" && rm -f /tmp/op1fx-cwo.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3618,10 +3686,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "daemon-listen", "Daemon Listen", "sd88me", "v1.0.1", "Utility",
             "FX", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "448", "64 KB", "14%",
+            "451", "64 KB", "14%",
             "sd88me - VST - Daemon Listen", "daemonlisten.so",
-            "", "https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-Listen-1.0.1-mpc-armv7.zip", "plugins/daemon-listen/thumb.ppm",
-            "Companion to Daemon: insert it on the audio track that carries your mic, and Daemon's TALK button hears you. Passes audio through unchanged. Needs Daemon in the same project.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Daemon Listen\" && if [ -f \"./plugins/daemon-listen/daemonlisten.so\" ]; then cp -rf ./plugins/daemon-listen/* \"$TARGET_SYNTH_DIR/sd88me - VST - Daemon Listen/\"; else (wget -q -O /tmp/daemon-listen.zip \"https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-Listen-1.0.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/daemon-listen.zip \"https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-Listen-1.0.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-Listen-1.0.1-mpc-armv7.zip\" -o /tmp/daemon-listen.zip) && unzip -o /tmp/daemon-listen.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Daemon Listen/\" && rm -f /tmp/daemon-listen.zip; fi && sync", 1,
+            "", "https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-Listen-1.0.1-mpc-armv7.zip", "plugins/daemon-listen/thumb.png",
+            "Companion to Daemon: insert it on the audio track that carries your mic, and Daemon's TALK button hears you. Passes audio through unchanged. Needs Daemon in the same project.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - Daemon Listen\" && if [ -f \"./plugins/daemon-listen/daemonlisten.so\" ]; then cp -rf ./plugins/daemon-listen/* \"$TARGET_SYNTH_DIR/sd88me - VST - Daemon Listen/\"; else (wget --no-check-certificate -q -O /tmp/daemon-listen.zip \"https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-Listen-1.0.1-mpc-armv7.zip\" || wget -q -O /tmp/daemon-listen.zip \"https://github.com/sd88me/mpc-vst-daemon/releases/download/v1.0.1/Daemon-Listen-1.0.1-mpc-armv7.zip\") && unzip -o /tmp/daemon-listen.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - Daemon Listen/\" && rm -f /tmp/daemon-listen.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3630,10 +3698,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-delay", "Delay", "Bombest", "v0.4.1", "Delay",
             "FX", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "73", "4.2 MB", "14%",
+            "76", "4.2 MB", "14%",
             "bombest - VST - Delay", "delay.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/delay.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Delay-0.4.1-mpc-armv7.zip", "plugins/op1fx-delay/thumb.ppm",
-            "Four-knob delay with a 12-preset bank. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Delay\" && if [ -f \"./plugins/op1fx-delay/delay.so\" ]; then cp -rf ./plugins/op1fx-delay/* \"$TARGET_SYNTH_DIR/bombest - VST - Delay/\"; else (wget -q -O /tmp/op1fx-delay.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Delay-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-delay.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Delay-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Delay-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-delay.zip) && unzip -o /tmp/op1fx-delay.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Delay/\" && rm -f /tmp/op1fx-delay.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/delay.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Delay-0.4.1-mpc-armv7.zip", "plugins/op1fx-delay/thumb.png",
+            "Four-knob delay with a 12-preset bank. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Delay\" && if [ -f \"./plugins/op1fx-delay/delay.so\" ]; then cp -rf ./plugins/op1fx-delay/* \"$TARGET_SYNTH_DIR/bombest - VST - Delay/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-delay.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Delay-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-delay.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Delay-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-delay.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Delay/\" && rm -f /tmp/op1fx-delay.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3642,10 +3710,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dragonfly-early-reflections", "Dragonfly Early Reflections", "gmorb", "v1.3.1", "Reverb",
             "FX", "Stable", "Akai Force (3.9.1), MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-10-29",
-            "166", "766 KB", "14%",
+            "167", "766 KB", "14%",
             "Dragonfly - VST - Early Reflections", "dragonfly_early.so",
-            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-early-reflections/2044beed9f510a3963df7b61da6a4c19c6c7e7b3/docs/banners/early.png", "https://github.com/gmorb/mpc-vst-dragonfly-early-reflections/releases/download/v1.3.1/Early-Reflections-1.3.1-mpc-armv7.zip", "plugins/dragonfly-early-reflections/thumb.ppm",
-            "Dragonfly Early Reflections as a native insert effect, with a touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Dragonfly - VST - Early Reflections\" && if [ -f \"./plugins/dragonfly-early-reflections/dragonfly_early.so\" ]; then cp -rf ./plugins/dragonfly-early-reflections/* \"$TARGET_SYNTH_DIR/Dragonfly - VST - Early Reflections/\"; else (wget -q -O /tmp/dragonfly-early-reflections.zip \"https://github.com/gmorb/mpc-vst-dragonfly-early-reflections/releases/download/v1.3.1/Early-Reflections-1.3.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/dragonfly-early-reflections.zip \"https://github.com/gmorb/mpc-vst-dragonfly-early-reflections/releases/download/v1.3.1/Early-Reflections-1.3.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/gmorb/mpc-vst-dragonfly-early-reflections/releases/download/v1.3.1/Early-Reflections-1.3.1-mpc-armv7.zip\" -o /tmp/dragonfly-early-reflections.zip) && unzip -o /tmp/dragonfly-early-reflections.zip -d \"$TARGET_SYNTH_DIR/Dragonfly - VST - Early Reflections/\" && rm -f /tmp/dragonfly-early-reflections.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-early-reflections/2044beed9f510a3963df7b61da6a4c19c6c7e7b3/docs/banners/early.png", "https://github.com/gmorb/mpc-vst-dragonfly-early-reflections/releases/download/v1.3.1/Early-Reflections-1.3.1-mpc-armv7.zip", "plugins/dragonfly-early-reflections/thumb.png",
+            "Dragonfly Early Reflections as a native insert effect, with a touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Dragonfly - VST - Early Reflections\" && if [ -f \"./plugins/dragonfly-early-reflections/dragonfly_early.so\" ]; then cp -rf ./plugins/dragonfly-early-reflections/* \"$TARGET_SYNTH_DIR/Dragonfly - VST - Early Reflections/\"; else (wget --no-check-certificate -q -O /tmp/dragonfly-early-reflections.zip \"https://github.com/gmorb/mpc-vst-dragonfly-early-reflections/releases/download/v1.3.1/Early-Reflections-1.3.1-mpc-armv7.zip\" || wget -q -O /tmp/dragonfly-early-reflections.zip \"https://github.com/gmorb/mpc-vst-dragonfly-early-reflections/releases/download/v1.3.1/Early-Reflections-1.3.1-mpc-armv7.zip\") && unzip -o /tmp/dragonfly-early-reflections.zip -d \"$TARGET_SYNTH_DIR/Dragonfly - VST - Early Reflections/\" && rm -f /tmp/dragonfly-early-reflections.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3654,9 +3722,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dragonfly-hall", "Dragonfly Hall", "gmorb", "v1.3.0", "Reverb",
             "FX", "Stable", "Akai Force (3.9.1), MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-10-29",
-            "1002", "2.4 MB", "14%",
+            "1004", "2.4 MB", "14%",
             "Dragonfly - VST - Hall", "dragonfly_hall.so",
-            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-hall/eb9f41f22ea93414776db40760c2387b36cf3144/docs/banners/hall.png", "https://github.com/gmorb/mpc-vst-dragonfly-hall/releases/download/v1.3.0/Hall-1.3.0-mpc-armv7.zip", "plugins/dragonfly-hall/thumb.ppm",
+            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-hall/eb9f41f22ea93414776db40760c2387b36cf3144/docs/banners/hall.png", "https://github.com/gmorb/mpc-vst-dragonfly-hall/releases/download/v1.3.0/Hall-1.3.0-mpc-armv7.zip", "plugins/dragonfly-hall/thumb.png",
             "Dragonfly Hall reverb as a native insert effect, with a touchscreen skin and Q-Links.", "./plugins/dragonfly-hall/install.sh", 0,
             false,
             false,
@@ -3666,10 +3734,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dragonfly-plate", "Dragonfly Plate", "gmorb", "v1.3.0", "Reverb",
             "FX", "Stable", "Akai Force (3.9.1), MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-10-29",
-            "973", "1.2 MB", "14%",
+            "975", "1.2 MB", "14%",
             "Dragonfly - VST - Plate", "dragonfly_plate.so",
-            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-plate/a9087385948d18ae38739c44ddf42ab826d1a567/docs/banners/plate.png", "https://github.com/gmorb/mpc-vst-dragonfly-plate/releases/download/v1.3.0/Plate-1.3.0-mpc-armv7.zip", "plugins/dragonfly-plate/thumb.ppm",
-            "Dragonfly Plate reverb as a native insert effect, with a touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Dragonfly - VST - Plate\" && if [ -f \"./plugins/dragonfly-plate/dragonfly_plate.so\" ]; then cp -rf ./plugins/dragonfly-plate/* \"$TARGET_SYNTH_DIR/Dragonfly - VST - Plate/\"; else (wget -q -O /tmp/dragonfly-plate.zip \"https://github.com/gmorb/mpc-vst-dragonfly-plate/releases/download/v1.3.0/Plate-1.3.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/dragonfly-plate.zip \"https://github.com/gmorb/mpc-vst-dragonfly-plate/releases/download/v1.3.0/Plate-1.3.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/gmorb/mpc-vst-dragonfly-plate/releases/download/v1.3.0/Plate-1.3.0-mpc-armv7.zip\" -o /tmp/dragonfly-plate.zip) && unzip -o /tmp/dragonfly-plate.zip -d \"$TARGET_SYNTH_DIR/Dragonfly - VST - Plate/\" && rm -f /tmp/dragonfly-plate.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-plate/a9087385948d18ae38739c44ddf42ab826d1a567/docs/banners/plate.png", "https://github.com/gmorb/mpc-vst-dragonfly-plate/releases/download/v1.3.0/Plate-1.3.0-mpc-armv7.zip", "plugins/dragonfly-plate/thumb.png",
+            "Dragonfly Plate reverb as a native insert effect, with a touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Dragonfly - VST - Plate\" && if [ -f \"./plugins/dragonfly-plate/dragonfly_plate.so\" ]; then cp -rf ./plugins/dragonfly-plate/* \"$TARGET_SYNTH_DIR/Dragonfly - VST - Plate/\"; else (wget --no-check-certificate -q -O /tmp/dragonfly-plate.zip \"https://github.com/gmorb/mpc-vst-dragonfly-plate/releases/download/v1.3.0/Plate-1.3.0-mpc-armv7.zip\" || wget -q -O /tmp/dragonfly-plate.zip \"https://github.com/gmorb/mpc-vst-dragonfly-plate/releases/download/v1.3.0/Plate-1.3.0-mpc-armv7.zip\") && unzip -o /tmp/dragonfly-plate.zip -d \"$TARGET_SYNTH_DIR/Dragonfly - VST - Plate/\" && rm -f /tmp/dragonfly-plate.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3678,9 +3746,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dragonfly-room", "Dragonfly Room", "gmorb", "v1.3.0", "Reverb",
             "FX", "Stable", "Akai Force (3.9.1), MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-10-29",
-            "964", "2.0 MB", "14%",
+            "966", "2.0 MB", "14%",
             "Dragonfly - VST - Room", "dragonfly_room.so",
-            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-room/6c62e1a5c9ef57f0c31897afa0faf07d7a446585/docs/banners/room.png", "https://github.com/gmorb/mpc-vst-dragonfly-room/releases/download/v1.3.0/Room-1.3.0-mpc-armv7.zip", "plugins/dragonfly-room/thumb.ppm",
+            "https://raw.githubusercontent.com/gmorb/mpc-vst-dragonfly-room/6c62e1a5c9ef57f0c31897afa0faf07d7a446585/docs/banners/room.png", "https://github.com/gmorb/mpc-vst-dragonfly-room/releases/download/v1.3.0/Room-1.3.0-mpc-armv7.zip", "plugins/dragonfly-room/thumb.png",
             "Dragonfly Room reverb as a native insert effect, with a touchscreen skin and Q-Links.", "./plugins/dragonfly-room/install.sh", 0,
             false,
             false,
@@ -3690,10 +3758,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "drips", "Drips", "Padbangers", "v1.0.0", "Granular",
             "FX", "Stable", "Akai MPC X (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-13",
-            "619", "3.2 MB", "10%",
+            "621", "3.2 MB", "10%",
             "Padbangers - VST - Drips", "drips.so",
-            "https://raw.githubusercontent.com/padbangers/drips/85683cebf7b4fcf1716ed6f32faa89041768b24e/docs/drips-main.png", "https://github.com/padbangers/drips/releases/download/drips-v1.0.0/Drips-1.0.0-mpc-armv7.zip", "plugins/drips/thumb.ppm",
-            "Drips: a granular texture synthesizer with four recording qualities, a delay and beat slicer, tempo-synced seeding, wavetables and a modulation page, from Émilie Gillet's open-source Beads.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Padbangers - VST - Drips\" && if [ -f \"./plugins/drips/drips.so\" ]; then cp -rf ./plugins/drips/* \"$TARGET_SYNTH_DIR/Padbangers - VST - Drips/\"; else (wget -q -O /tmp/drips.zip \"https://github.com/padbangers/drips/releases/download/drips-v1.0.0/Drips-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/drips.zip \"https://github.com/padbangers/drips/releases/download/drips-v1.0.0/Drips-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/padbangers/drips/releases/download/drips-v1.0.0/Drips-1.0.0-mpc-armv7.zip\" -o /tmp/drips.zip) && unzip -o /tmp/drips.zip -d \"$TARGET_SYNTH_DIR/Padbangers - VST - Drips/\" && rm -f /tmp/drips.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/padbangers/drips/85683cebf7b4fcf1716ed6f32faa89041768b24e/docs/drips-main.png", "https://github.com/padbangers/drips/releases/download/drips-v1.0.0/Drips-1.0.0-mpc-armv7.zip", "plugins/drips/thumb.png",
+            "Drips: a granular texture synthesizer with four recording qualities, a delay and beat slicer, tempo-synced seeding, wavetables and a modulation page, from Émilie Gillet's open-source Beads.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Padbangers - VST - Drips\" && if [ -f \"./plugins/drips/drips.so\" ]; then cp -rf ./plugins/drips/* \"$TARGET_SYNTH_DIR/Padbangers - VST - Drips/\"; else (wget --no-check-certificate -q -O /tmp/drips.zip \"https://github.com/padbangers/drips/releases/download/drips-v1.0.0/Drips-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/drips.zip \"https://github.com/padbangers/drips/releases/download/drips-v1.0.0/Drips-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/drips.zip -d \"$TARGET_SYNTH_DIR/Padbangers - VST - Drips/\" && rm -f /tmp/drips.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3702,10 +3770,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "dub-station", "Dub Station", "nachtaktiv303", "v1.0.2", "Delay",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1275", "2.1 MB", "14%",
+            "1279", "2.1 MB", "14%",
             "Lukas - VST - Dub Station", "dub_station.so",
-            "https://raw.githubusercontent.com/nachtaktiv303/mpc-vst-dub-station/main/preview_0.png", "https://github.com/nachtaktiv303/mpc-vst-dub-station/releases/download/dub-station-vst-v1.0.2/Dub-Station-1.0.2-mpc-armv7.zip", "plugins/dub-station/thumb.ppm",
-            "Dub-techno multi-effect: two independent tape delays, a huge modulated reverb, tape grit, a noise/crackle ambience bed, phaser, ducking and a panic kill.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Lukas - VST - Dub Station\" && if [ -f \"./plugins/dub-station/dub_station.so\" ]; then cp -rf ./plugins/dub-station/* \"$TARGET_SYNTH_DIR/Lukas - VST - Dub Station/\"; else (wget -q -O /tmp/dub-station.zip \"https://github.com/nachtaktiv303/mpc-vst-dub-station/releases/download/dub-station-vst-v1.0.2/Dub-Station-1.0.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/dub-station.zip \"https://github.com/nachtaktiv303/mpc-vst-dub-station/releases/download/dub-station-vst-v1.0.2/Dub-Station-1.0.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/nachtaktiv303/mpc-vst-dub-station/releases/download/dub-station-vst-v1.0.2/Dub-Station-1.0.2-mpc-armv7.zip\" -o /tmp/dub-station.zip) && unzip -o /tmp/dub-station.zip -d \"$TARGET_SYNTH_DIR/Lukas - VST - Dub Station/\" && rm -f /tmp/dub-station.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/nachtaktiv303/mpc-vst-dub-station/main/preview_0.png", "https://github.com/nachtaktiv303/mpc-vst-dub-station/releases/download/dub-station-vst-v1.0.2/Dub-Station-1.0.2-mpc-armv7.zip", "plugins/dub-station/thumb.png",
+            "Dub-techno multi-effect: two independent tape delays, a huge modulated reverb, tape grit, a noise/crackle ambience bed, phaser, ducking and a panic kill.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Lukas - VST - Dub Station\" && if [ -f \"./plugins/dub-station/dub_station.so\" ]; then cp -rf ./plugins/dub-station/* \"$TARGET_SYNTH_DIR/Lukas - VST - Dub Station/\"; else (wget --no-check-certificate -q -O /tmp/dub-station.zip \"https://github.com/nachtaktiv303/mpc-vst-dub-station/releases/download/dub-station-vst-v1.0.2/Dub-Station-1.0.2-mpc-armv7.zip\" || wget -q -O /tmp/dub-station.zip \"https://github.com/nachtaktiv303/mpc-vst-dub-station/releases/download/dub-station-vst-v1.0.2/Dub-Station-1.0.2-mpc-armv7.zip\") && unzip -o /tmp/dub-station.zip -d \"$TARGET_SYNTH_DIR/Lukas - VST - Dub Station/\" && rm -f /tmp/dub-station.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3714,9 +3782,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "effectwerk", "EffectWerk", "Devko", "v0.0.5", "Multi Fx",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "149", "3.0 MB", "14%",
+            "150", "3.0 MB", "14%",
             "Devko - VST - EffectWerk", "effectwerk.so",
-            "https://raw.githubusercontent.com/Devko/EffectWerk/v0.0.1/docs/img/looper.png", "https://github.com/Devko/EffectWerk/releases/download/v0.0.5/EffectWerk-0.0.5-mpc-armv7.zip", "plugins/effectwerk/thumb.ppm",
+            "https://raw.githubusercontent.com/Devko/EffectWerk/v0.0.1/docs/img/looper.png", "https://github.com/Devko/EffectWerk/releases/download/v0.0.5/EffectWerk-0.0.5-mpc-armv7.zip", "plugins/effectwerk/thumb.png",
             "A live looper and performance mixer in one insert slot: record bars on MPC's grid, then roll, slow, reverse and layer them, and crossfade two scenes from 64 one-tap effects. Plus a ten-module effect rack with macros, LFOs and a mod matrix, 62 presets and a 14-page touchscreen skin with Q-Links.", "./plugins/effectwerk/install.sh", 0,
             false,
             false,
@@ -3726,10 +3794,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "ghost", "GHOST", "MPC-EURO", "v2.4.2", "Glitch",
             "FX", "Beta", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-29",
-            "45", "812 KB", "14%",
+            "46", "812 KB", "14%",
             "MPC-EURO - VST - GHOST", "ghost.so",
-            "", "https://github.com/carballocba/MPC-EURO-/releases/download/v2.4.2-installer2-rc3/GHOST-2.4.2-installer2-rc3-mpc-armv7.zip", "plugins/ghost/thumb.ppm",
-            "Live buffer manipulation, rhythmic stutter and generative glitch with independent and combined Random Repeat modes.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MPC-EURO - VST - GHOST\" && if [ -f \"./plugins/ghost/ghost.so\" ]; then cp -rf ./plugins/ghost/* \"$TARGET_SYNTH_DIR/MPC-EURO - VST - GHOST/\"; else (wget -q -O /tmp/ghost.zip \"https://github.com/carballocba/MPC-EURO-/releases/download/v2.4.2-installer2-rc3/GHOST-2.4.2-installer2-rc3-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/ghost.zip \"https://github.com/carballocba/MPC-EURO-/releases/download/v2.4.2-installer2-rc3/GHOST-2.4.2-installer2-rc3-mpc-armv7.zip\" || curl -k -sL \"https://github.com/carballocba/MPC-EURO-/releases/download/v2.4.2-installer2-rc3/GHOST-2.4.2-installer2-rc3-mpc-armv7.zip\" -o /tmp/ghost.zip) && unzip -o /tmp/ghost.zip -d \"$TARGET_SYNTH_DIR/MPC-EURO - VST - GHOST/\" && rm -f /tmp/ghost.zip; fi && sync", 1,
+            "", "https://github.com/carballocba/MPC-EURO-/releases/download/v2.4.2-installer2-rc3/GHOST-2.4.2-installer2-rc3-mpc-armv7.zip", "plugins/ghost/thumb.png",
+            "Live buffer manipulation, rhythmic stutter and generative glitch with independent and combined Random Repeat modes.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/MPC-EURO - VST - GHOST\" && if [ -f \"./plugins/ghost/ghost.so\" ]; then cp -rf ./plugins/ghost/* \"$TARGET_SYNTH_DIR/MPC-EURO - VST - GHOST/\"; else (wget --no-check-certificate -q -O /tmp/ghost.zip \"https://github.com/carballocba/MPC-EURO-/releases/download/v2.4.2-installer2-rc3/GHOST-2.4.2-installer2-rc3-mpc-armv7.zip\" || wget -q -O /tmp/ghost.zip \"https://github.com/carballocba/MPC-EURO-/releases/download/v2.4.2-installer2-rc3/GHOST-2.4.2-installer2-rc3-mpc-armv7.zip\") && unzip -o /tmp/ghost.zip -d \"$TARGET_SYNTH_DIR/MPC-EURO - VST - GHOST/\" && rm -f /tmp/ghost.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3738,10 +3806,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-grid", "Grid", "Bombest", "v0.4.1", "Reverb",
             "FX", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "73", "9.5 MB", "14%",
+            "75", "9.5 MB", "14%",
             "bombest - VST - Grid", "grid.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/grid.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Grid-0.4.1-mpc-armv7.zip", "plugins/op1fx-grid/thumb.ppm",
-            "A 2D waveguide mesh you feed audio and read back. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Grid\" && if [ -f \"./plugins/op1fx-grid/grid.so\" ]; then cp -rf ./plugins/op1fx-grid/* \"$TARGET_SYNTH_DIR/bombest - VST - Grid/\"; else (wget -q -O /tmp/op1fx-grid.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Grid-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-grid.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Grid-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Grid-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-grid.zip) && unzip -o /tmp/op1fx-grid.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Grid/\" && rm -f /tmp/op1fx-grid.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/grid.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Grid-0.4.1-mpc-armv7.zip", "plugins/op1fx-grid/thumb.png",
+            "A 2D waveguide mesh you feed audio and read back. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Grid\" && if [ -f \"./plugins/op1fx-grid/grid.so\" ]; then cp -rf ./plugins/op1fx-grid/* \"$TARGET_SYNTH_DIR/bombest - VST - Grid/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-grid.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Grid-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-grid.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Grid-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-grid.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Grid/\" && rm -f /tmp/op1fx-grid.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3750,9 +3818,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "incipience-out", "Incipience OUT", "saustin2010", "v1.1.1", "Utility",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "600", "104 KB", "14%",
+            "605", "104 KB", "14%",
             "Steve A - VST - [FX] Incipience OUT", "incipienceout.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-incipience/v1.1.1/incipienceout/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-incipience/releases/download/incipience-out-v1.1.1/FX-Incipience-OUT-1.1.1-mpc-armv7.zip", "plugins/incipience-out/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-incipience/v1.1.1/incipienceout/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-incipience/releases/download/incipience-out-v1.1.1/FX-Incipience-OUT-1.1.1-mpc-armv7.zip", "plugins/incipience-out/thumb.png",
             "Companion to Incipience: plays one of its OUT 1-11 on its own MPC track (an audio track will do), so an instrument gets that track's fader, inserts and outputs, in time with the kit. Needs Incipience 1.0.0 or later in the same project.", "./plugins/incipience-out/install.sh", 0,
             false,
             false,
@@ -3762,10 +3830,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "keyscope", "Keyscope", "jacob-sabella", "v1.0.4", "Utility",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
-            "1970", "3.2 MB", "4%",
+            "1976", "3.2 MB", "4%",
             "jacob-sabella - VST - Keyscope", "keyscope.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-keyscope/88cb99ac5e0d682e1e6d9c81836bf4096a9cde3c/docs/screenshots/keyscope.png", "https://github.com/jacob-sabella/mpc-vst-keyscope/releases/download/keyscope-vst-v1.0.4/Keyscope-1.0.4-mpc-armv7.zip", "plugins/keyscope/thumb.ppm",
-            "Listens to any track and names its key, chord, bass note and tuning, from the spectrum of the whole mix; the audio passes through untouched.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Keyscope\" && if [ -f \"./plugins/keyscope/keyscope.so\" ]; then cp -rf ./plugins/keyscope/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Keyscope/\"; else (wget -q -O /tmp/keyscope.zip \"https://github.com/jacob-sabella/mpc-vst-keyscope/releases/download/keyscope-vst-v1.0.4/Keyscope-1.0.4-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/keyscope.zip \"https://github.com/jacob-sabella/mpc-vst-keyscope/releases/download/keyscope-vst-v1.0.4/Keyscope-1.0.4-mpc-armv7.zip\" || curl -k -sL \"https://github.com/jacob-sabella/mpc-vst-keyscope/releases/download/keyscope-vst-v1.0.4/Keyscope-1.0.4-mpc-armv7.zip\" -o /tmp/keyscope.zip) && unzip -o /tmp/keyscope.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Keyscope/\" && rm -f /tmp/keyscope.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-keyscope/88cb99ac5e0d682e1e6d9c81836bf4096a9cde3c/docs/screenshots/keyscope.png", "https://github.com/jacob-sabella/mpc-vst-keyscope/releases/download/keyscope-vst-v1.0.4/Keyscope-1.0.4-mpc-armv7.zip", "plugins/keyscope/thumb.png",
+            "Listens to any track and names its key, chord, bass note and tuning, from the spectrum of the whole mix; the audio passes through untouched.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Keyscope\" && if [ -f \"./plugins/keyscope/keyscope.so\" ]; then cp -rf ./plugins/keyscope/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Keyscope/\"; else (wget --no-check-certificate -q -O /tmp/keyscope.zip \"https://github.com/jacob-sabella/mpc-vst-keyscope/releases/download/keyscope-vst-v1.0.4/Keyscope-1.0.4-mpc-armv7.zip\" || wget -q -O /tmp/keyscope.zip \"https://github.com/jacob-sabella/mpc-vst-keyscope/releases/download/keyscope-vst-v1.0.4/Keyscope-1.0.4-mpc-armv7.zip\") && unzip -o /tmp/keyscope.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Keyscope/\" && rm -f /tmp/keyscope.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3774,10 +3842,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "liminal-amp", "Liminal Amp", "gmorb", "v1.0.2", "Amp Sim",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1059", "5.5 MB", "14%",
+            "1063", "5.5 MB", "14%",
             "Gm0rb - VST - Liminal Amp", "liminal_amp.so",
-            "https://raw.githubusercontent.com/gmorb/mpc-vst-liminal-amp/v1.0.0/docs/images/page.png", "https://github.com/gmorb/mpc-vst-liminal-amp/releases/download/v1.0.2/Liminal-Amp-1.0.2-mpc-armv7.zip", "plugins/liminal-amp/thumb.ppm",
-            "Lightweight, official-sound Neural Amp Modeler: A2 captures with cab IR, gate and tone stack, resampled like the official plugin; browses models/ and irs/ folders on any drive.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Gm0rb - VST - Liminal Amp\" && if [ -f \"./plugins/liminal-amp/liminal_amp.so\" ]; then cp -rf ./plugins/liminal-amp/* \"$TARGET_SYNTH_DIR/Gm0rb - VST - Liminal Amp/\"; else (wget -q -O /tmp/liminal-amp.zip \"https://github.com/gmorb/mpc-vst-liminal-amp/releases/download/v1.0.2/Liminal-Amp-1.0.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/liminal-amp.zip \"https://github.com/gmorb/mpc-vst-liminal-amp/releases/download/v1.0.2/Liminal-Amp-1.0.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/gmorb/mpc-vst-liminal-amp/releases/download/v1.0.2/Liminal-Amp-1.0.2-mpc-armv7.zip\" -o /tmp/liminal-amp.zip) && unzip -o /tmp/liminal-amp.zip -d \"$TARGET_SYNTH_DIR/Gm0rb - VST - Liminal Amp/\" && rm -f /tmp/liminal-amp.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/gmorb/mpc-vst-liminal-amp/v1.0.0/docs/images/page.png", "https://github.com/gmorb/mpc-vst-liminal-amp/releases/download/v1.0.2/Liminal-Amp-1.0.2-mpc-armv7.zip", "plugins/liminal-amp/thumb.png",
+            "Lightweight, official-sound Neural Amp Modeler: A2 captures with cab IR, gate and tone stack, resampled like the official plugin; browses models/ and irs/ folders on any drive.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Gm0rb - VST - Liminal Amp\" && if [ -f \"./plugins/liminal-amp/liminal_amp.so\" ]; then cp -rf ./plugins/liminal-amp/* \"$TARGET_SYNTH_DIR/Gm0rb - VST - Liminal Amp/\"; else (wget --no-check-certificate -q -O /tmp/liminal-amp.zip \"https://github.com/gmorb/mpc-vst-liminal-amp/releases/download/v1.0.2/Liminal-Amp-1.0.2-mpc-armv7.zip\" || wget -q -O /tmp/liminal-amp.zip \"https://github.com/gmorb/mpc-vst-liminal-amp/releases/download/v1.0.2/Liminal-Amp-1.0.2-mpc-armv7.zip\") && unzip -o /tmp/liminal-amp.zip -d \"$TARGET_SYNTH_DIR/Gm0rb - VST - Liminal Amp/\" && rm -f /tmp/liminal-amp.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3786,9 +3854,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "liminal-hz", "Liminal Hz", "gmorb", "v1.3.0", "Reverb",
             "FX", "Stable", "Akai Force (3.9.1), MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-10-24",
-            "1831", "22.4 MB", "14%",
+            "1836", "22.4 MB", "14%",
             "Gm0rb - VST - Liminal Hz", "liminal_hz.so",
-            "https://raw.githubusercontent.com/gmorb/mpc-vst-liminal-hz/main/docs/images/banner.png", "https://github.com/gmorb/mpc-vst-liminal-hz/releases/download/v1.3.0/Liminal-Hz-1.3.0-mpc-armv7.zip", "plugins/liminal-hz/thumb.ppm",
+            "https://raw.githubusercontent.com/gmorb/mpc-vst-liminal-hz/main/docs/images/banner.png", "https://github.com/gmorb/mpc-vst-liminal-hz/releases/download/v1.3.0/Liminal-Hz-1.3.0-mpc-armv7.zip", "plugins/liminal-hz/thumb.png",
             "Real rooms, halls and echoes from impulse responses (up to 5 s, mono or stereo), the space for your NAM amp; ~3.5% of an audio block on a Force; browses reverbs/ folders and TONE3000.", "./plugins/liminal-hz/install.sh", 0,
             false,
             false,
@@ -3798,10 +3866,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "loop-saboteurxxl", "Loop-SaboteurXXL", "L'Cronx", "v0.1.3", "Glitch",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-22",
-            "1074", "8.2 MB", "14%",
+            "1080", "8.2 MB", "14%",
             "L'Cronx - VST - Loop-SaboteurXXL", "loop_saboteurxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/Loop-SaboteurXXL/v0.1.0/docs/img/3-acts-seq.png", "https://github.com/sunskiefer/Loop-SaboteurXXL/releases/download/v0.1.3/Loop-SaboteurXXL-0.1.3-mpc-armv7.zip", "plugins/loop-saboteurxxl/thumb.ppm",
-            "A port of Loop Saboteur by Stephen McLeod Blythe (clickysteve): a glitch / chop / beat-slicer that records the last bars and replays them on the MPC tempo as retriggered, pitched, reversed, stretched and crushed slices. Eight Acts, a 64-step sequencer with trig conditions, ratchets and p-locks, and 19 factory presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - Loop-SaboteurXXL\" && if [ -f \"./plugins/loop-saboteurxxl/loop_saboteurxxl.so\" ]; then cp -rf ./plugins/loop-saboteurxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - Loop-SaboteurXXL/\"; else (wget -q -O /tmp/loop-saboteurxxl.zip \"https://github.com/sunskiefer/Loop-SaboteurXXL/releases/download/v0.1.3/Loop-SaboteurXXL-0.1.3-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/loop-saboteurxxl.zip \"https://github.com/sunskiefer/Loop-SaboteurXXL/releases/download/v0.1.3/Loop-SaboteurXXL-0.1.3-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/Loop-SaboteurXXL/releases/download/v0.1.3/Loop-SaboteurXXL-0.1.3-mpc-armv7.zip\" -o /tmp/loop-saboteurxxl.zip) && unzip -o /tmp/loop-saboteurxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - Loop-SaboteurXXL/\" && rm -f /tmp/loop-saboteurxxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/Loop-SaboteurXXL/v0.1.0/docs/img/3-acts-seq.png", "https://github.com/sunskiefer/Loop-SaboteurXXL/releases/download/v0.1.3/Loop-SaboteurXXL-0.1.3-mpc-armv7.zip", "plugins/loop-saboteurxxl/thumb.png",
+            "A port of Loop Saboteur by Stephen McLeod Blythe (clickysteve): a glitch / chop / beat-slicer that records the last bars and replays them on the MPC tempo as retriggered, pitched, reversed, stretched and crushed slices. Eight Acts, a 64-step sequencer with trig conditions, ratchets and p-locks, and 19 factory presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - Loop-SaboteurXXL\" && if [ -f \"./plugins/loop-saboteurxxl/loop_saboteurxxl.so\" ]; then cp -rf ./plugins/loop-saboteurxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - Loop-SaboteurXXL/\"; else (wget --no-check-certificate -q -O /tmp/loop-saboteurxxl.zip \"https://github.com/sunskiefer/Loop-SaboteurXXL/releases/download/v0.1.3/Loop-SaboteurXXL-0.1.3-mpc-armv7.zip\" || wget -q -O /tmp/loop-saboteurxxl.zip \"https://github.com/sunskiefer/Loop-SaboteurXXL/releases/download/v0.1.3/Loop-SaboteurXXL-0.1.3-mpc-armv7.zip\") && unzip -o /tmp/loop-saboteurxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - Loop-SaboteurXXL/\" && rm -f /tmp/loop-saboteurxxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3809,10 +3877,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         },
         {
             "machinemodule-tap-gen2", "Machinemodule Tap (Gen2)", "sd88me", "v1.0.3", "Utility",
-            "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-04",
-            "296", "95 KB", "14%",
+            "FX", "Stable", "MPC Live III (Gen2) (MPC OS 3.10.1)", "MPC OS 3.x", "2026-11-04",
+            "301", "95 KB", "14%",
             "sd88me - VST - Machinemodule Tap", "machinedrum_tapfx.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-machinedrum/main/docs/img/machinemodule-tap-gen2.png", "https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-Tap-1.0.3-mpc-aarch64.zip", "plugins/machinemodule-tap-gen2/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-machinedrum/main/docs/img/machinemodule-tap-gen2.png", "https://github.com/sd88me/mpc-vst-machinedrum/releases/download/v1.0.3/Machinemodule-Tap-1.0.3-mpc-aarch64.zip", "plugins/machinemodule-tap-gen2/thumb.png",
             "Puts any Machinemodule tracks, and its reverb and delay sends, on their own MPC return or FX track, so MPC's mixer and effects can process them. Needs Machinemodule in the same project. Gen2 (aarch64) only.", "./plugins/machinemodule-tap-gen2/install.sh", 0,
             false,
             false,
@@ -3822,9 +3890,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "magic-tape-echo", "Magic Tape Echo", "MagicStino", "v0.1.2", "Delay",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "444", "2.6 MB", "14%",
+            "446", "2.6 MB", "14%",
             "MagicStino - VST - Magic Tape Echo", "magic_tape_echo.so",
-            "https://raw.githubusercontent.com/MagicStino/Magic-Tape-Echo/a616cc2fad6bd7eb920111627bb1fc81631ff09a/magic-tape-echo-three-heads.png", "https://github.com/MagicStino/Magic-Tape-Echo/releases/download/v0.1.2/Magic-Tape-Echo-0.1.2-mpc-armv7.zip", "plugins/magic-tape-echo/thumb.ppm",
+            "https://raw.githubusercontent.com/MagicStino/Magic-Tape-Echo/a616cc2fad6bd7eb920111627bb1fc81631ff09a/magic-tape-echo-three-heads.png", "https://github.com/MagicStino/Magic-Tape-Echo/releases/download/v0.1.2/Magic-Tape-Echo-0.1.2-mpc-armv7.zip", "plugins/magic-tape-echo/thumb.png",
             "Three-head stereo tape echo with tape saturation, wow/flutter, tempo sync, optional spring reverb and a slow VU meter.", "./plugins/magic-tape-echo/install.sh", 0,
             false,
             false,
@@ -3834,10 +3902,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "warps", "Meta Mod", "saustin2010", "v1.2.1", "Modulation",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1503", "1.0 MB", "14%",
+            "1513", "1.0 MB", "14%",
             "Émilie Gillet - VST - [FX] Meta Mod", "warps.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-meta-mod/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-meta-mod/releases/download/v1.2.1/FX-Meta-Mod-1.2.1-mpc-armv7.zip", "plugins/warps/thumb.ppm",
-            "Meta Mod: ring mod, folding, XOR, vocoder and frequency shifting as an insert effect; 12 presets, from Émilie Gillet's open-source Warps.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Meta Mod\" && if [ -f \"./plugins/warps/warps.so\" ]; then cp -rf ./plugins/warps/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Meta Mod/\"; else (wget -q -O /tmp/warps.zip \"https://github.com/saustin2010/mpc-vst-meta-mod/releases/download/v1.2.1/FX-Meta-Mod-1.2.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/warps.zip \"https://github.com/saustin2010/mpc-vst-meta-mod/releases/download/v1.2.1/FX-Meta-Mod-1.2.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-meta-mod/releases/download/v1.2.1/FX-Meta-Mod-1.2.1-mpc-armv7.zip\" -o /tmp/warps.zip) && unzip -o /tmp/warps.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Meta Mod/\" && rm -f /tmp/warps.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-meta-mod/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-meta-mod/releases/download/v1.2.1/FX-Meta-Mod-1.2.1-mpc-armv7.zip", "plugins/warps/thumb.png",
+            "Meta Mod: ring mod, folding, XOR, vocoder and frequency shifting as an insert effect; 12 presets, from Émilie Gillet's open-source Warps.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Meta Mod\" && if [ -f \"./plugins/warps/warps.so\" ]; then cp -rf ./plugins/warps/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Meta Mod/\"; else (wget --no-check-certificate -q -O /tmp/warps.zip \"https://github.com/saustin2010/mpc-vst-meta-mod/releases/download/v1.2.1/FX-Meta-Mod-1.2.1-mpc-armv7.zip\" || wget -q -O /tmp/warps.zip \"https://github.com/saustin2010/mpc-vst-meta-mod/releases/download/v1.2.1/FX-Meta-Mod-1.2.1-mpc-armv7.zip\") && unzip -o /tmp/warps.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Meta Mod/\" && rm -f /tmp/warps.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3846,10 +3914,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "meta4mpcxxl-fx", "Meta4MPCXXL FX", "L'Cronx", "v0.1.2", "Modular",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "340", "11.2 MB", "14%",
+            "342", "11.2 MB", "14%",
             "L'Cronx - VST - Meta4MPCXXL FX", "meta4mpcxxl_fx.so",
-            "https://raw.githubusercontent.com/sunskiefer/Meta4MPCXXL/v0.1.1/docs/img/meta4mpcxxl.png", "https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-FX-0.1.2-mpc-armv7.zip", "plugins/meta4mpcxxl-fx/thumb.ppm",
-            "Meta4MPCXXL as an effect: the track's audio goes into a 4ms MetaModule-format (VCV Rack) patch's In 1 / In 2, with every parameter on Q-Links, MIDI and clock into the patch, and Wi-Fi patch upload from VCV Rack.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - Meta4MPCXXL FX\" && if [ -f \"./plugins/meta4mpcxxl-fx/meta4mpcxxl_fx.so\" ]; then cp -rf ./plugins/meta4mpcxxl-fx/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - Meta4MPCXXL FX/\"; else (wget -q -O /tmp/meta4mpcxxl-fx.zip \"https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-FX-0.1.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/meta4mpcxxl-fx.zip \"https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-FX-0.1.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-FX-0.1.2-mpc-armv7.zip\" -o /tmp/meta4mpcxxl-fx.zip) && unzip -o /tmp/meta4mpcxxl-fx.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - Meta4MPCXXL FX/\" && rm -f /tmp/meta4mpcxxl-fx.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/Meta4MPCXXL/v0.1.1/docs/img/meta4mpcxxl.png", "https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-FX-0.1.2-mpc-armv7.zip", "plugins/meta4mpcxxl-fx/thumb.png",
+            "Meta4MPCXXL as an effect: the track's audio goes into a 4ms MetaModule-format (VCV Rack) patch's In 1 / In 2, with every parameter on Q-Links, MIDI and clock into the patch, and Wi-Fi patch upload from VCV Rack.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - Meta4MPCXXL FX\" && if [ -f \"./plugins/meta4mpcxxl-fx/meta4mpcxxl_fx.so\" ]; then cp -rf ./plugins/meta4mpcxxl-fx/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - Meta4MPCXXL FX/\"; else (wget --no-check-certificate -q -O /tmp/meta4mpcxxl-fx.zip \"https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-FX-0.1.2-mpc-armv7.zip\" || wget -q -O /tmp/meta4mpcxxl-fx.zip \"https://github.com/sunskiefer/Meta4MPCXXL/releases/download/v0.1.2/Meta4MPCXXL-FX-0.1.2-mpc-armv7.zip\") && unzip -o /tmp/meta4mpcxxl-fx.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - Meta4MPCXXL FX/\" && rm -f /tmp/meta4mpcxxl-fx.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3857,10 +3925,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         },
         {
             "monomodule-fx-gen2", "Monomodule FX (Gen2)", "sd88me", "v1.0.4", "Multi Effect",
-            "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-04",
-            "218", "4.2 MB", "14%",
+            "FX", "Stable", "MPC Live III (Gen2) (MPC OS 3.10.1)", "MPC OS 3.x", "2026-11-04",
+            "224", "4.2 MB", "14%",
             "sd88me - VST - Monomodule FX", "monomodule_fx.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-monomodule/main/docs/img/monomodule-fx-gen2.png", "https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-FX-1.0.4-mpc-aarch64.zip", "plugins/monomodule-fx-gen2/thumb.ppm",
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-monomodule/main/docs/img/monomodule-fx-gen2.png", "https://github.com/sd88me/mpc-vst-monomodule/releases/download/v1.0.4/Monomodule-FX-1.0.4-mpc-aarch64.zip", "plugins/monomodule-fx-gen2/thumb.png",
             "The Elektron Monomachine's seven effect machines (thru, reverb, chorus, dynamix, ring mod, phaser, flanger) as an audio effect for Gen2 MPC devices, with a touchscreen skin and Q-Links. A ready-made download with nothing of Elektron's in it: it reads your own Monomachine OS file from the plugin folder. Gen2 only.", "./plugins/monomodule-fx-gen2/install.sh", 0,
             false,
             false,
@@ -3870,9 +3938,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mpc-dj-fx-2", "MPC DJ FX 2", "mitchoster", "v3.1.6", "Multi Fx",
             "FX", "Stable", "MPC Live II (MPC OS 3.x (ACVS-MPC3 build))", "MPC OS 3.x", "2026-11-03",
-            "731", "5.1 MB", "30%",
+            "747", "5.1 MB", "30%",
             "LarryDaimond - VST - MPC DJ FX 2", "mpc_djfx2.so",
-            "https://raw.githubusercontent.com/mitchoster/mpc-vst-djfx2/0f20d92f/docs/ui-preview/page_1.png", "https://github.com/mitchoster/mpc-vst-djfx2/releases/download/v3.1.6/MPC-DJ-FX-2-3.1.6-mpc-armv7.zip", "plugins/mpc-dj-fx-2/thumb.ppm",
+            "https://raw.githubusercontent.com/mitchoster/mpc-vst-djfx2/0f20d92f/docs/ui-preview/page_1.png", "https://github.com/mitchoster/mpc-vst-djfx2/releases/download/v3.1.6/MPC-DJ-FX-2-3.1.6-mpc-armv7.zip", "plugins/mpc-dj-fx-2/thumb.png",
             "One-slot live DJ insert for MPC/Force: 3-band isolator, DJ filter, beat repeat, delay, reverb, through-zero flanger, grain delay, limiter, and eight performance macros measured from Lenny Kiser's DJ-FX rack.", "./plugins/mpc-dj-fx-2/install.sh", 0,
             false,
             false,
@@ -3882,9 +3950,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mpc-multihead-echo", "MPC Multihead Echo", "mitchoster", "v1.0.2", "Delay",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-02",
-            "123", "1.7 MB", "14%",
+            "125", "1.7 MB", "14%",
             "LarryDaimond - VST - MPC Multihead Echo", "mpc_multihead_echo.so",
-            "https://raw.githubusercontent.com/mitchoster/mpc-vst-multihead-echo/c31c3ef479ce87083ab87fbef14c2fe92a6bb83b/docs/companion-panel-echo.png", "https://github.com/mitchoster/mpc-vst-multihead-echo/releases/download/v1.0.2/MPC-Multihead-Echo-1.0.2-mpc-armv7.zip", "plugins/mpc-multihead-echo/thumb.ppm",
+            "https://raw.githubusercontent.com/mitchoster/mpc-vst-multihead-echo/c31c3ef479ce87083ab87fbef14c2fe92a6bb83b/docs/companion-panel-echo.png", "https://github.com/mitchoster/mpc-vst-multihead-echo/releases/download/v1.0.2/MPC-Multihead-Echo-1.0.2-mpc-armv7.zip", "plugins/mpc-multihead-echo/thumb.png",
             "Three-head tape echo with three preamp characters, chorus, tape wear, tempo sync with drift, a spring reverb and a companion screen in the browser.", "./plugins/mpc-multihead-echo/install.sh", 0,
             false,
             false,
@@ -3894,9 +3962,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "mpc-tape-echo", "MPC Tape Echo", "mitchoster", "v1.2.3", "Delay",
             "FX", "Stable", "MPC Live II (MPC OS 3.x (ACVS-MPC3 build))", "MPC OS 3.x", "2026-11-02",
-            "489", "11.6 MB", "14%",
+            "495", "11.6 MB", "14%",
             "LarryDaimond - VST - MPC Tape Echo", "mpc_tape_echo.so",
-            "https://raw.githubusercontent.com/mitchoster/mpc-vst-tape-echo/main/docs/img/panel.png", "https://github.com/mitchoster/mpc-vst-tape-echo/releases/download/v1.2.3/MPC-Tape-Echo-1.2.3-mpc-armv7.zip", "plugins/mpc-tape-echo/thumb.ppm",
+            "https://raw.githubusercontent.com/mitchoster/mpc-vst-tape-echo/main/docs/img/panel.png", "https://github.com/mitchoster/mpc-vst-tape-echo/releases/download/v1.2.3/MPC-Tape-Echo-1.2.3-mpc-armv7.zip", "plugins/mpc-tape-echo/thumb.png",
             "Three-head tape echo with a spring tank: 12 head and reverb modes, tape saturation, wow and flutter, tempo sync, live VU.", "./plugins/mpc-tape-echo/install.sh", 0,
             false,
             false,
@@ -3906,9 +3974,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "nam", "NAM", "jacob-sabella", "v1.0.10", "Amp Sim",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
-            "3533", "2.8 MB", "14%",
+            "3541", "2.8 MB", "14%",
             "jacob-sabella - VST - NAM", "nam_vst.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-nam/f2fa28c8f4086606e929732a4824e72579bdcf80/docs/screenshots/nam.png", "https://github.com/jacob-sabella/mpc-vst-nam/releases/download/v1.0.10/NAM-1.0.10-mpc-armv7.zip", "plugins/nam/thumb.ppm",
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-nam/f2fa28c8f4086606e929732a4824e72579bdcf80/docs/screenshots/nam.png", "https://github.com/jacob-sabella/mpc-vst-nam/releases/download/v1.0.10/NAM-1.0.10-mpc-armv7.zip", "plugins/nam/thumb.png",
             "Neural Amp Modeler captures as an insert effect, with cab IR, tone, gate, pitch, delay, reverb and an on-device TONE3000 downloader.", "./plugins/nam/install.sh", 0,
             false,
             false,
@@ -3918,10 +3986,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-nitro", "Nitro", "Bombest", "v0.4.1", "Filter",
             "FX", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "68", "4.9 MB", "14%",
+            "70", "4.9 MB", "14%",
             "bombest - VST - Nitro", "nitro.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/nitro.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Nitro-0.4.1-mpc-armv7.zip", "plugins/op1fx-nitro/thumb.ppm",
-            "Filter with a drive stage and a MIX knob, 12 presets. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Nitro\" && if [ -f \"./plugins/op1fx-nitro/nitro.so\" ]; then cp -rf ./plugins/op1fx-nitro/* \"$TARGET_SYNTH_DIR/bombest - VST - Nitro/\"; else (wget -q -O /tmp/op1fx-nitro.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Nitro-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-nitro.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Nitro-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Nitro-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-nitro.zip) && unzip -o /tmp/op1fx-nitro.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Nitro/\" && rm -f /tmp/op1fx-nitro.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/nitro.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Nitro-0.4.1-mpc-armv7.zip", "plugins/op1fx-nitro/thumb.png",
+            "Filter with a drive stage and a MIX knob, 12 presets. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Nitro\" && if [ -f \"./plugins/op1fx-nitro/nitro.so\" ]; then cp -rf ./plugins/op1fx-nitro/* \"$TARGET_SYNTH_DIR/bombest - VST - Nitro/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-nitro.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Nitro-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-nitro.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Nitro-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-nitro.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Nitro/\" && rm -f /tmp/op1fx-nitro.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3930,10 +3998,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "ottmpc", "OTTmpc", "sd88me", "v1.0.1", "Compressor",
             "FX", "Stable", "Akai Force (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-21",
-            "1145", "1.7 MB", "14%",
+            "1152", "1.7 MB", "14%",
             "sd88me - VST - OTTmpc", "ottmpc.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-OTT/claude/friendly-wozniak-m9ak1l/docs/screenshot.png", "https://github.com/sd88me/mpc-vst-OTT/releases/download/ottmpc-vst-v1.0.1/OTTmpc-1.0.1-mpc-armv7.zip", "plugins/ottmpc/thumb.ppm",
-            "Vital's OTT multiband up/down compressor as an insert effect: live band meters with dB numbers, 12 Q-Link controls and 10 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - OTTmpc\" && if [ -f \"./plugins/ottmpc/ottmpc.so\" ]; then cp -rf ./plugins/ottmpc/* \"$TARGET_SYNTH_DIR/sd88me - VST - OTTmpc/\"; else (wget -q -O /tmp/ottmpc.zip \"https://github.com/sd88me/mpc-vst-OTT/releases/download/ottmpc-vst-v1.0.1/OTTmpc-1.0.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/ottmpc.zip \"https://github.com/sd88me/mpc-vst-OTT/releases/download/ottmpc-vst-v1.0.1/OTTmpc-1.0.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-OTT/releases/download/ottmpc-vst-v1.0.1/OTTmpc-1.0.1-mpc-armv7.zip\" -o /tmp/ottmpc.zip) && unzip -o /tmp/ottmpc.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - OTTmpc/\" && rm -f /tmp/ottmpc.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-OTT/claude/friendly-wozniak-m9ak1l/docs/screenshot.png", "https://github.com/sd88me/mpc-vst-OTT/releases/download/ottmpc-vst-v1.0.1/OTTmpc-1.0.1-mpc-armv7.zip", "plugins/ottmpc/thumb.png",
+            "Vital's OTT multiband up/down compressor as an insert effect: live band meters with dB numbers, 12 Q-Link controls and 10 presets.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - OTTmpc\" && if [ -f \"./plugins/ottmpc/ottmpc.so\" ]; then cp -rf ./plugins/ottmpc/* \"$TARGET_SYNTH_DIR/sd88me - VST - OTTmpc/\"; else (wget --no-check-certificate -q -O /tmp/ottmpc.zip \"https://github.com/sd88me/mpc-vst-OTT/releases/download/ottmpc-vst-v1.0.1/OTTmpc-1.0.1-mpc-armv7.zip\" || wget -q -O /tmp/ottmpc.zip \"https://github.com/sd88me/mpc-vst-OTT/releases/download/ottmpc-vst-v1.0.1/OTTmpc-1.0.1-mpc-armv7.zip\") && unzip -o /tmp/ottmpc.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - OTTmpc/\" && rm -f /tmp/ottmpc.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3942,9 +4010,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "overcast", "Overcast", "Padbangers", "v1.0.6", "Granular",
             "FX", "Stable", "Akai MPC X (MPC OS 3.9.1)", "MPC OS 3.x", "2026-10-04",
-            "3764", "3.8 MB", "9%",
+            "3786", "3.8 MB", "9%",
             "Padbangers - VST - Overcast", "overcast.so",
-            "https://raw.githubusercontent.com/FullPace/overcast/overcast-v1.0.6/docs/overcast-main.png", "https://github.com/padbangers/overcast/releases/download/overcast-v1.0.6/Overcast-1.0.6-mpc-armv7.zip", "plugins/overcast/thumb.ppm",
+            "https://raw.githubusercontent.com/FullPace/overcast/overcast-v1.0.6/docs/overcast-main.png", "https://github.com/padbangers/overcast/releases/download/overcast-v1.0.6/Overcast-1.0.6-mpc-armv7.zip", "plugins/overcast/thumb.png",
             "Mutable Instruments Clouds (Parasites firmware, six modes) with a modulation page: two envelopes, two LFOs and an 8-slot matrix onto Clouds' CV inputs.", "./plugins/overcast/install.sh", 0,
             false,
             false,
@@ -3954,9 +4022,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "percolator-out", "Percolator OUT", "saustin2010", "v2.1.0", "Utility",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "870", "147 KB", "14%",
+            "876", "147 KB", "14%",
             "Steve A - VST - [FX] Percolator OUT", "percolatorout.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-percolator/v2.1.0/percolatorout/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-percolator/releases/download/percolator-out-v2.1.0/FX-Percolator-OUT-2.1.0-mpc-armv7.zip", "plugins/percolator-out/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-percolator/v2.1.0/percolatorout/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-percolator/releases/download/percolator-out-v2.1.0/FX-Percolator-OUT-2.1.0-mpc-armv7.zip", "plugins/percolator-out/thumb.png",
             "Companion to Percolator: plays one of its OUT 1-4 on its own MPC track (an audio track will do), so a voice gets that track's fader, inserts and outputs, in time with the kit. Needs Percolator 2.0.0 or later in the same project.", "./plugins/percolator-out/install.sh", 0,
             false,
             false,
@@ -3966,9 +4034,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-phone", "Phone", "Bombest", "v0.4.1", "Filter",
             "FX", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "69", "5.1 MB", "14%",
+            "72", "5.1 MB", "14%",
             "bombest - VST - Phone", "phone.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/phone.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phone-0.4.1-mpc-armv7.zip", "plugins/op1fx-phone/thumb.ppm",
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/phone.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Phone-0.4.1-mpc-armv7.zip", "plugins/op1fx-phone/thumb.png",
             "Telephone-band squash with a 12-preset bank. OP-1 inspired.", "./plugins/op1fx-phone/install.sh", 0,
             false,
             false,
@@ -3978,10 +4046,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "phyxxl", "PhyXXL", "L'Cronx", "v0.1.6", "Filter",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-25",
-            "653", "18.3 MB", "14%",
+            "661", "18.3 MB", "14%",
             "L'Cronx - VST - PhyXXL", "phyxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/PhyXXL/v0.1.2/docs/img/overview.png", "https://github.com/sunskiefer/PhyXXL/releases/download/v0.1.6/PhyXXL-0.1.6-mpc-armv7.zip", "plugins/phyxxl/thumb.ppm",
-            "Eight filters in the style of classic synths (MS-20, SEM, Minimoog, Matrix-12, 2600, Wasp, prologue, Polivoks) in one effect. Route audio from any filter into any other; modulate each from ten sources by touch patch bay or matrix. 28 patches. By L'Cronx, GPL-3. No third-party code; not endorsed by the makers of the originals.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - PhyXXL\" && if [ -f \"./plugins/phyxxl/phyxxl.so\" ]; then cp -rf ./plugins/phyxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - PhyXXL/\"; else (wget -q -O /tmp/phyxxl.zip \"https://github.com/sunskiefer/PhyXXL/releases/download/v0.1.6/PhyXXL-0.1.6-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/phyxxl.zip \"https://github.com/sunskiefer/PhyXXL/releases/download/v0.1.6/PhyXXL-0.1.6-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/PhyXXL/releases/download/v0.1.6/PhyXXL-0.1.6-mpc-armv7.zip\" -o /tmp/phyxxl.zip) && unzip -o /tmp/phyxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - PhyXXL/\" && rm -f /tmp/phyxxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/PhyXXL/v0.1.2/docs/img/overview.png", "https://github.com/sunskiefer/PhyXXL/releases/download/v0.1.6/PhyXXL-0.1.6-mpc-armv7.zip", "plugins/phyxxl/thumb.png",
+            "Eight filters in the style of classic synths (MS-20, SEM, Minimoog, Matrix-12, 2600, Wasp, prologue, Polivoks) in one effect. Route audio from any filter into any other; modulate each from ten sources by touch patch bay or matrix. 28 patches. By L'Cronx, GPL-3. No third-party code; not endorsed by the makers of the originals.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - PhyXXL\" && if [ -f \"./plugins/phyxxl/phyxxl.so\" ]; then cp -rf ./plugins/phyxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - PhyXXL/\"; else (wget --no-check-certificate -q -O /tmp/phyxxl.zip \"https://github.com/sunskiefer/PhyXXL/releases/download/v0.1.6/PhyXXL-0.1.6-mpc-armv7.zip\" || wget -q -O /tmp/phyxxl.zip \"https://github.com/sunskiefer/PhyXXL/releases/download/v0.1.6/PhyXXL-0.1.6-mpc-armv7.zip\") && unzip -o /tmp/phyxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - PhyXXL/\" && rm -f /tmp/phyxxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -3990,10 +4058,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "plateauxxl", "PlateauXXL", "L'Cronx", "v0.4.3", "Reverb",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-22",
-            "1459", "12.9 MB", "14%",
+            "1468", "12.9 MB", "14%",
             "L'Cronx - VST - PlateauXXL", "plateauxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/PlateauXXL/v0.4.1/docs/img/plateau.png", "https://github.com/sunskiefer/PlateauXXL/releases/download/v0.4.3/PlateauXXL-0.4.3-mpc-armv7.zip", "plugins/plateauxxl/thumb.ppm",
-            "Valley Audio's Plateau reverb from VCV Rack, patched: every CV input on a built-in source (four Bogaudio LFOs, Tidal Modulator 2, Random Sampler, step and gate sequencers) synced to the MPC tempo, a brickwall limiter, Panic and 16 presets, each page drawn like its module.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - PlateauXXL\" && if [ -f \"./plugins/plateauxxl/plateauxxl.so\" ]; then cp -rf ./plugins/plateauxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - PlateauXXL/\"; else (wget -q -O /tmp/plateauxxl.zip \"https://github.com/sunskiefer/PlateauXXL/releases/download/v0.4.3/PlateauXXL-0.4.3-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/plateauxxl.zip \"https://github.com/sunskiefer/PlateauXXL/releases/download/v0.4.3/PlateauXXL-0.4.3-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/PlateauXXL/releases/download/v0.4.3/PlateauXXL-0.4.3-mpc-armv7.zip\" -o /tmp/plateauxxl.zip) && unzip -o /tmp/plateauxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - PlateauXXL/\" && rm -f /tmp/plateauxxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/PlateauXXL/v0.4.1/docs/img/plateau.png", "https://github.com/sunskiefer/PlateauXXL/releases/download/v0.4.3/PlateauXXL-0.4.3-mpc-armv7.zip", "plugins/plateauxxl/thumb.png",
+            "Valley Audio's Plateau reverb from VCV Rack, patched: every CV input on a built-in source (four Bogaudio LFOs, Tidal Modulator 2, Random Sampler, step and gate sequencers) synced to the MPC tempo, a brickwall limiter, Panic and 16 presets, each page drawn like its module.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - PlateauXXL\" && if [ -f \"./plugins/plateauxxl/plateauxxl.so\" ]; then cp -rf ./plugins/plateauxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - PlateauXXL/\"; else (wget --no-check-certificate -q -O /tmp/plateauxxl.zip \"https://github.com/sunskiefer/PlateauXXL/releases/download/v0.4.3/PlateauXXL-0.4.3-mpc-armv7.zip\" || wget -q -O /tmp/plateauxxl.zip \"https://github.com/sunskiefer/PlateauXXL/releases/download/v0.4.3/PlateauXXL-0.4.3-mpc-armv7.zip\") && unzip -o /tmp/plateauxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - PlateauXXL/\" && rm -f /tmp/plateauxxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4002,9 +4070,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "potentialpatina", "PotentialPatina", "PotentialBreaks", "v1.0.2", "Saturation",
             "FX", "Stable", "MPC One (HAKAI 3.10)", "MPC OS 3.x", "2026-11-05",
-            "4", "428 KB", "14%",
+            "5", "428 KB", "14%",
             "PotentialBreaks - VST - PotentialPatina", "potentialpatina.so",
-            "https://raw.githubusercontent.com/PotentialBreakfast/mpc-vst-potentialpatina/a64e56fb32abe9f25e7c6b2316a50676f3cd1b53/docs/images/potentialpatina.png", "https://github.com/PotentialBreakfast/mpc-vst-potentialpatina/releases/download/v1.0.2/PotentialPatina-1.0.2-mpc-armv7.zip", "plugins/potentialpatina/thumb.ppm",
+            "https://raw.githubusercontent.com/PotentialBreakfast/mpc-vst-potentialpatina/a64e56fb32abe9f25e7c6b2316a50676f3cd1b53/docs/images/potentialpatina.png", "https://github.com/PotentialBreakfast/mpc-vst-potentialpatina/releases/download/v1.0.2/PotentialPatina-1.0.2-mpc-armv7.zip", "plugins/potentialpatina/thumb.png",
             "Retro-colour insert effect: vinyl and tape noise, wow and flutter, tape/tube/cassette drive, bit and sample-rate crush, a tone tilt and a small room, with presets from subtle dust to old radio.", "./plugins/potentialpatina/install.sh", 0,
             false,
             false,
@@ -4014,9 +4082,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "pulytek", "PulyTek", "MagicStino", "v1.0.2", "Eq",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-10-23",
-            "2090", "14.9 MB", "14%",
+            "2104", "14.9 MB", "14%",
             "MagicStino - VST - PulyTek", "pulytek.so",
-            "https://raw.githubusercontent.com/MagicStino/pulytek/v1.0.1/docs/preview_0.png", "https://github.com/MagicStino/pulytek/releases/download/v1.0.2/PulyTek-1.0.2-mpc-armv7.zip", "plugins/pulytek/thumb.ppm",
+            "https://raw.githubusercontent.com/MagicStino/pulytek/v1.0.1/docs/preview_0.png", "https://github.com/MagicStino/pulytek/releases/download/v1.0.2/PulyTek-1.0.2-mpc-armv7.zip", "plugins/pulytek/thumb.png",
             "Pultec-style WDF EQ with tube warmth, AIR, stereo VU meters and four-band side EQ.", "./plugins/pulytek/install.sh", 0,
             false,
             false,
@@ -4026,10 +4094,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-punch", "Punch", "Bombest", "v0.4.1", "Distortion",
             "FX", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "72", "6.0 MB", "14%",
+            "74", "6.0 MB", "14%",
             "bombest - VST - Punch", "punch.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/punch.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Punch-0.4.1-mpc-armv7.zip", "plugins/op1fx-punch/thumb.ppm",
-            "Bit-crush style punch for drums and buses, 12 presets, with a Detroit boxer skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Punch\" && if [ -f \"./plugins/op1fx-punch/punch.so\" ]; then cp -rf ./plugins/op1fx-punch/* \"$TARGET_SYNTH_DIR/bombest - VST - Punch/\"; else (wget -q -O /tmp/op1fx-punch.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Punch-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-punch.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Punch-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Punch-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-punch.zip) && unzip -o /tmp/op1fx-punch.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Punch/\" && rm -f /tmp/op1fx-punch.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/punch.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Punch-0.4.1-mpc-armv7.zip", "plugins/op1fx-punch/thumb.png",
+            "Bit-crush style punch for drums and buses, 12 presets, with a Detroit boxer skin.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Punch\" && if [ -f \"./plugins/op1fx-punch/punch.so\" ]; then cp -rf ./plugins/op1fx-punch/* \"$TARGET_SYNTH_DIR/bombest - VST - Punch/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-punch.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Punch-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-punch.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Punch-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-punch.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Punch/\" && rm -f /tmp/op1fx-punch.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4038,9 +4106,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "rings-fx", "Resonator FX", "saustin2010", "v1.2.1", "Resonator",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1747", "1.2 MB", "14%",
+            "1758", "1.2 MB", "14%",
             "Émilie Gillet - VST - [FX] Resonator FX", "ringsfx.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-resonator-fx/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-resonator-fx/releases/download/v1.2.1/FX-Resonator-FX-1.2.1-mpc-armv7.zip", "plugins/rings-fx/thumb.ppm",
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-resonator-fx/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-resonator-fx/releases/download/v1.2.1/FX-Resonator-FX-1.2.1-mpc-armv7.zip", "plugins/rings-fx/thumb.png",
             "Resonator FX: Resonator as an insert effect, the track's audio strums it, turning drums and loops into tuned strings; 12 presets.", "./plugins/rings-fx/install.sh", 0,
             false,
             false,
@@ -4050,10 +4118,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "rmxxxl", "RMXXXL", "L'Cronx", "v1.3.0", "Multi Fx",
             "FX", "Stable", "Akai Force (3.9.1)", "MPC OS 3.x", "2026-10-29",
-            "2247", "3.3 MB", "14%",
+            "2266", "3.3 MB", "14%",
             "L'Cronx - VST - RMXXXL", "rmxxxl.so",
-            "https://raw.githubusercontent.com/sunskiefer/RMXXXL/0ef9fe195525cada860205f1370a4b9f6896bc60/docs/img/remix.png", "https://github.com/sunskiefer/RMXXXL/releases/download/v1.3.0/RMXXXL-1.3.0-mpc-armv7.zip", "plugins/rmxxxl/thumb.ppm",
-            "RMX-1000-style remix effect: isolator, DJ filter, Build Up / Break Down scenes, synced echo, Release FX and a Release kill switch, EQ Kill buttons, a clean Panic, Clouds, Dragonfly reverbs, sample pads with ADSR, 16 user presets and a brickwall limiter, with a big-button touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - RMXXXL\" && if [ -f \"./plugins/rmxxxl/rmxxxl.so\" ]; then cp -rf ./plugins/rmxxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - RMXXXL/\"; else (wget -q -O /tmp/rmxxxl.zip \"https://github.com/sunskiefer/RMXXXL/releases/download/v1.3.0/RMXXXL-1.3.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/rmxxxl.zip \"https://github.com/sunskiefer/RMXXXL/releases/download/v1.3.0/RMXXXL-1.3.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sunskiefer/RMXXXL/releases/download/v1.3.0/RMXXXL-1.3.0-mpc-armv7.zip\" -o /tmp/rmxxxl.zip) && unzip -o /tmp/rmxxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - RMXXXL/\" && rm -f /tmp/rmxxxl.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sunskiefer/RMXXXL/0ef9fe195525cada860205f1370a4b9f6896bc60/docs/img/remix.png", "https://github.com/sunskiefer/RMXXXL/releases/download/v1.3.0/RMXXXL-1.3.0-mpc-armv7.zip", "plugins/rmxxxl/thumb.png",
+            "RMX-1000-style remix effect: isolator, DJ filter, Build Up / Break Down scenes, synced echo, Release FX and a Release kill switch, EQ Kill buttons, a clean Panic, Clouds, Dragonfly reverbs, sample pads with ADSR, 16 user presets and a brickwall limiter, with a big-button touchscreen skin and Q-Links.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/L'Cronx - VST - RMXXXL\" && if [ -f \"./plugins/rmxxxl/rmxxxl.so\" ]; then cp -rf ./plugins/rmxxxl/* \"$TARGET_SYNTH_DIR/L'Cronx - VST - RMXXXL/\"; else (wget --no-check-certificate -q -O /tmp/rmxxxl.zip \"https://github.com/sunskiefer/RMXXXL/releases/download/v1.3.0/RMXXXL-1.3.0-mpc-armv7.zip\" || wget -q -O /tmp/rmxxxl.zip \"https://github.com/sunskiefer/RMXXXL/releases/download/v1.3.0/RMXXXL-1.3.0-mpc-armv7.zip\") && unzip -o /tmp/rmxxxl.zip -d \"$TARGET_SYNTH_DIR/L'Cronx - VST - RMXXXL/\" && rm -f /tmp/rmxxxl.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4062,9 +4130,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "shapey-5-band-eq", "Shapey 5-Band EQ", "3dthc", "v1.0.1", "Eq",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "269", "3.4 MB", "14%",
+            "272", "3.4 MB", "14%",
             "3DTHC - VST - Shapey 5-Band EQ", "shapey_5band_eq.so",
-            "https://raw.githubusercontent.com/3dthc/Shapey-MPC/ddbf9bbc9f66f2af0802070b38bb3d113140131c/docs/shapey-5-band-eq.png", "https://github.com/3dthc/Shapey-MPC/releases/download/shapey-5-band-eq-vst-v1.0.1/Shapey-5-Band-EQ-1.0.1-mpc-armv7.zip", "plugins/shapey-5-band-eq/thumb.ppm",
+            "https://raw.githubusercontent.com/3dthc/Shapey-MPC/ddbf9bbc9f66f2af0802070b38bb3d113140131c/docs/shapey-5-band-eq.png", "https://github.com/3dthc/Shapey-MPC/releases/download/shapey-5-band-eq-vst-v1.0.1/Shapey-5-Band-EQ-1.0.1-mpc-armv7.zip", "plugins/shapey-5-band-eq/thumb.png",
             "The 5-band version of Shapey EQ, made for touch: every band has its own lane under a taller curve, so any dot drags directly. Any band can be a bell, shelf, cut, notch or band pass. Live analyzer, zero latency.", "./plugins/shapey-5-band-eq/install.sh", 0,
             false,
             false,
@@ -4074,10 +4142,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "shapey-eq", "Shapey EQ", "3dthc", "v1.6.2", "Eq",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "313", "4.3 MB", "14%",
+            "316", "4.3 MB", "14%",
             "3DTHC - VST - Shapey EQ", "shapey_eq.so",
-            "https://raw.githubusercontent.com/3dthc/Shapey-MPC/ddbf9bbc9f66f2af0802070b38bb3d113140131c/docs/shapey-eq.png", "https://github.com/3dthc/Shapey-MPC/releases/download/shapey-eq-vst-v1.6.2/Shapey-EQ-1.6.2-mpc-armv7.zip", "plugins/shapey-eq/thumb.ppm",
-            "An 8-band parametric EQ you shape by touch: tap or drag on the curve, drag numbered dots, and make any band a bell, shelf, cut, notch or band pass. Live analyzer, zero latency, presets and four themes.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3DTHC - VST - Shapey EQ\" && if [ -f \"./plugins/shapey-eq/shapey_eq.so\" ]; then cp -rf ./plugins/shapey-eq/* \"$TARGET_SYNTH_DIR/3DTHC - VST - Shapey EQ/\"; else (wget -q -O /tmp/shapey-eq.zip \"https://github.com/3dthc/Shapey-MPC/releases/download/shapey-eq-vst-v1.6.2/Shapey-EQ-1.6.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/shapey-eq.zip \"https://github.com/3dthc/Shapey-MPC/releases/download/shapey-eq-vst-v1.6.2/Shapey-EQ-1.6.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/3dthc/Shapey-MPC/releases/download/shapey-eq-vst-v1.6.2/Shapey-EQ-1.6.2-mpc-armv7.zip\" -o /tmp/shapey-eq.zip) && unzip -o /tmp/shapey-eq.zip -d \"$TARGET_SYNTH_DIR/3DTHC - VST - Shapey EQ/\" && rm -f /tmp/shapey-eq.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/3dthc/Shapey-MPC/ddbf9bbc9f66f2af0802070b38bb3d113140131c/docs/shapey-eq.png", "https://github.com/3dthc/Shapey-MPC/releases/download/shapey-eq-vst-v1.6.2/Shapey-EQ-1.6.2-mpc-armv7.zip", "plugins/shapey-eq/thumb.png",
+            "An 8-band parametric EQ you shape by touch: tap or drag on the curve, drag numbered dots, and make any band a bell, shelf, cut, notch or band pass. Live analyzer, zero latency, presets and four themes.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3DTHC - VST - Shapey EQ\" && if [ -f \"./plugins/shapey-eq/shapey_eq.so\" ]; then cp -rf ./plugins/shapey-eq/* \"$TARGET_SYNTH_DIR/3DTHC - VST - Shapey EQ/\"; else (wget --no-check-certificate -q -O /tmp/shapey-eq.zip \"https://github.com/3dthc/Shapey-MPC/releases/download/shapey-eq-vst-v1.6.2/Shapey-EQ-1.6.2-mpc-armv7.zip\" || wget -q -O /tmp/shapey-eq.zip \"https://github.com/3dthc/Shapey-MPC/releases/download/shapey-eq-vst-v1.6.2/Shapey-EQ-1.6.2-mpc-armv7.zip\") && unzip -o /tmp/shapey-eq.zip -d \"$TARGET_SYNTH_DIR/3DTHC - VST - Shapey EQ/\" && rm -f /tmp/shapey-eq.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4086,10 +4154,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "op1fx-spring", "Spring", "Bombest", "v0.4.1", "Reverb",
             "FX", "Stable", "MPC Live III (Gen2) (3.9.1)", "MPC OS 3.x", "2026-11-01",
-            "73", "3.4 MB", "14%",
+            "75", "3.4 MB", "14%",
             "bombest - VST - Spring", "spring.so",
-            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/spring.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Spring-0.4.1-mpc-armv7.zip", "plugins/op1fx-spring/thumb.ppm",
-            "Spring reverb with a 12-preset bank. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Spring\" && if [ -f \"./plugins/op1fx-spring/spring.so\" ]; then cp -rf ./plugins/op1fx-spring/* \"$TARGET_SYNTH_DIR/bombest - VST - Spring/\"; else (wget -q -O /tmp/op1fx-spring.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Spring-0.4.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/op1fx-spring.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Spring-0.4.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Spring-0.4.1-mpc-armv7.zip\" -o /tmp/op1fx-spring.zip) && unzip -o /tmp/op1fx-spring.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Spring/\" && rm -f /tmp/op1fx-spring.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/Bombest-Audio/op1-fx/34f1396d82a4ae72baa761a50f1d9bfe834c444f/screenshots/mpc/spring.png", "https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Spring-0.4.1-mpc-armv7.zip", "plugins/op1fx-spring/thumb.png",
+            "Spring reverb with a 12-preset bank. OP-1 inspired.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/bombest - VST - Spring\" && if [ -f \"./plugins/op1fx-spring/spring.so\" ]; then cp -rf ./plugins/op1fx-spring/* \"$TARGET_SYNTH_DIR/bombest - VST - Spring/\"; else (wget --no-check-certificate -q -O /tmp/op1fx-spring.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Spring-0.4.1-mpc-armv7.zip\" || wget -q -O /tmp/op1fx-spring.zip \"https://github.com/Bombest-Audio/op1-fx/releases/download/v0.4.1/Spring-0.4.1-mpc-armv7.zip\") && unzip -o /tmp/op1fx-spring.zip -d \"$TARGET_SYNTH_DIR/bombest - VST - Spring/\" && rm -f /tmp/op1fx-spring.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4098,10 +4166,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "stompbox", "Stompbox", "jacob-sabella", "v1.0.0", "Amp Sim",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-04",
-            "150", "6.7 MB", "21%",
+            "152", "6.7 MB", "21%",
             "jacob-sabella - VST - Stompbox", "stompbox.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-stompbox/bc70be3dd01103bc792db0c2b0e54a589fc37d36/docs/screenshots/stompbox.png", "https://github.com/jacob-sabella/mpc-vst-stompbox/releases/download/stompbox-vst-v1.0.0/Stompbox-1.0.0-mpc-armv7.zip", "plugins/stompbox/thumb.ppm",
-            "A whole guitar rig from guitarix's DSP: gate, comp, wah, any number of pedals, amp, tone stack, power amp, cabinet with an IR loader, post FX, mod, delay, reverb and EQ. 219 models and guitarix's 40 factory presets in the PRESET menu. Not affiliated with guitarix.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Stompbox\" && if [ -f \"./plugins/stompbox/stompbox.so\" ]; then cp -rf ./plugins/stompbox/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Stompbox/\"; else (wget -q -O /tmp/stompbox.zip \"https://github.com/jacob-sabella/mpc-vst-stompbox/releases/download/stompbox-vst-v1.0.0/Stompbox-1.0.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/stompbox.zip \"https://github.com/jacob-sabella/mpc-vst-stompbox/releases/download/stompbox-vst-v1.0.0/Stompbox-1.0.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/jacob-sabella/mpc-vst-stompbox/releases/download/stompbox-vst-v1.0.0/Stompbox-1.0.0-mpc-armv7.zip\" -o /tmp/stompbox.zip) && unzip -o /tmp/stompbox.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Stompbox/\" && rm -f /tmp/stompbox.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-stompbox/bc70be3dd01103bc792db0c2b0e54a589fc37d36/docs/screenshots/stompbox.png", "https://github.com/jacob-sabella/mpc-vst-stompbox/releases/download/stompbox-vst-v1.0.0/Stompbox-1.0.0-mpc-armv7.zip", "plugins/stompbox/thumb.png",
+            "A whole guitar rig from guitarix's DSP: gate, comp, wah, any number of pedals, amp, tone stack, power amp, cabinet with an IR loader, post FX, mod, delay, reverb and EQ. 219 models and guitarix's 40 factory presets in the PRESET menu. Not affiliated with guitarix.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Stompbox\" && if [ -f \"./plugins/stompbox/stompbox.so\" ]; then cp -rf ./plugins/stompbox/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Stompbox/\"; else (wget --no-check-certificate -q -O /tmp/stompbox.zip \"https://github.com/jacob-sabella/mpc-vst-stompbox/releases/download/stompbox-vst-v1.0.0/Stompbox-1.0.0-mpc-armv7.zip\" || wget -q -O /tmp/stompbox.zip \"https://github.com/jacob-sabella/mpc-vst-stompbox/releases/download/stompbox-vst-v1.0.0/Stompbox-1.0.0-mpc-armv7.zip\") && unzip -o /tmp/stompbox.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - Stompbox/\" && rm -f /tmp/stompbox.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4110,9 +4178,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "stream", "Stream", "johnny", "v1.0.0", "Utility",
             "FX", "Stable", "MPC One (3.9.1.2)", "MPC OS 3.x", "2026-10-03",
-            "501", "2.7 MB", "1%",
+            "504", "2.7 MB", "1%",
             "johnny - VST - Stream", "stream.so",
-            "https://raw.githubusercontent.com/stampman3000-jpg/mpc-stream/764605ba1a08594e2dc5268e4f12bd6e25edb184/screenshots/stream.png", "https://github.com/stampman3000-jpg/mpc-stream/releases/download/v1.0.0/Stream-1.0.0-mpc-armv7.zip", "plugins/stream/thumb.ppm",
+            "https://raw.githubusercontent.com/stampman3000-jpg/mpc-stream/764605ba1a08594e2dc5268e4f12bd6e25edb184/screenshots/stream.png", "https://github.com/stampman3000-jpg/mpc-stream/releases/download/v1.0.0/Stream-1.0.0-mpc-armv7.zip", "plugins/stream/thumb.png",
             "Multichannel USB audio effect send from an MPC to a Mac. Needs BlackHole 64ch and a Mac helper app.", "./plugins/stream/install.sh", 0,
             false,
             false,
@@ -4122,10 +4190,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tr-mpc-tap-fx", "TR-MPC Tap FX", "sd88me", "v1.1.0", "Utility",
             "FX", "Stable", "Akai Force (MPC OS 3.9.1), MPC Live III (MPC OS 3.10)", "MPC OS 3.x", "2026-11-02",
-            "969", "515 KB", "14%",
+            "978", "515 KB", "14%",
             "sd88me - VST - TR-MPC Tap FX", "trmpc_tapfx.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/7e704c6f3be14b661c887631e203494d8cc3f74f/docs/img/tr-mpc-tap-fx.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-tap-fx-vst-v1.1.0/TR-MPC-Tap-FX-1.1.0-mpc-armv7.zip", "plugins/tr-mpc-tap-fx/thumb.ppm",
-            "Companion to TR-MPC: sends any slot, or the kit's reverb or delay send, out on its own MPC track, sample-aligned with the kit, so MPC's mixer, submixes and insert effects can process it. Needs TR-MPC in the same project.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - TR-MPC Tap FX\" && if [ -f \"./plugins/tr-mpc-tap-fx/trmpc_tapfx.so\" ]; then cp -rf ./plugins/tr-mpc-tap-fx/* \"$TARGET_SYNTH_DIR/sd88me - VST - TR-MPC Tap FX/\"; else (wget -q -O /tmp/tr-mpc-tap-fx.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-tap-fx-vst-v1.1.0/TR-MPC-Tap-FX-1.1.0-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/tr-mpc-tap-fx.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-tap-fx-vst-v1.1.0/TR-MPC-Tap-FX-1.1.0-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-tap-fx-vst-v1.1.0/TR-MPC-Tap-FX-1.1.0-mpc-armv7.zip\" -o /tmp/tr-mpc-tap-fx.zip) && unzip -o /tmp/tr-mpc-tap-fx.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - TR-MPC Tap FX/\" && rm -f /tmp/tr-mpc-tap-fx.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-vst-TR-MPC/7e704c6f3be14b661c887631e203494d8cc3f74f/docs/img/tr-mpc-tap-fx.png", "https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-tap-fx-vst-v1.1.0/TR-MPC-Tap-FX-1.1.0-mpc-armv7.zip", "plugins/tr-mpc-tap-fx/thumb.png",
+            "Companion to TR-MPC: sends any slot, or the kit's reverb or delay send, out on its own MPC track, sample-aligned with the kit, so MPC's mixer, submixes and insert effects can process it. Needs TR-MPC in the same project.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - TR-MPC Tap FX\" && if [ -f \"./plugins/tr-mpc-tap-fx/trmpc_tapfx.so\" ]; then cp -rf ./plugins/tr-mpc-tap-fx/* \"$TARGET_SYNTH_DIR/sd88me - VST - TR-MPC Tap FX/\"; else (wget --no-check-certificate -q -O /tmp/tr-mpc-tap-fx.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-tap-fx-vst-v1.1.0/TR-MPC-Tap-FX-1.1.0-mpc-armv7.zip\" || wget -q -O /tmp/tr-mpc-tap-fx.zip \"https://github.com/sd88me/mpc-vst-TR-MPC/releases/download/trmpc-tap-fx-vst-v1.1.0/TR-MPC-Tap-FX-1.1.0-mpc-armv7.zip\") && unzip -o /tmp/tr-mpc-tap-fx.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - TR-MPC Tap FX/\" && rm -f /tmp/tr-mpc-tap-fx.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4134,9 +4202,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tuner", "Tuner", "jacob-sabella", "v1.0.0", "Utility",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-11-04",
-            "113", "664 KB", "1%",
+            "115", "664 KB", "1%",
             "jacob-sabella - VST - Tuner", "tuner.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-tuner/a3e4c099eacce3cdd440d54eb3ff059c96baafa5/docs/screenshots/needle.png", "https://github.com/jacob-sabella/mpc-vst-tuner/releases/download/tuner-vst-v1.0.0/Tuner-1.0.0-mpc-armv7.zip", "plugins/tuner/thumb.ppm",
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-vst-tuner/a3e4c099eacce3cdd440d54eb3ff059c96baafa5/docs/screenshots/needle.png", "https://github.com/jacob-sabella/mpc-vst-tuner/releases/download/tuner-vst-v1.0.0/Tuner-1.0.0-mpc-armv7.zip", "plugins/tuner/thumb.png",
             "A chromatic tuner insert with a live needle drawn straight onto the MPC's screen at 20-24 fps: note, cents and Hz, A4 from 430 to 450 Hz, and a mute for silent tuning. It writes into MPC's display memory, which MPC OS doesn't offer plugins, so a firmware update could break it. Not affiliated with Akai.", "./plugins/tuner/install.sh", 0,
             false,
             false,
@@ -4146,10 +4214,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "tuney", "Tuney", "3dthc", "v1.4.3", "Pitch",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "233", "9.3 MB", "14%",
+            "235", "9.3 MB", "14%",
             "3DTHC - VST - Tuney", "tuney.so",
-            "https://raw.githubusercontent.com/3dthc/Tuney-MPC/55862ef83ab6938b5f1e3e20f5fa1ead7449e9b2/docs/tuney.png", "https://github.com/3dthc/Tuney-MPC/releases/download/tuney-vst-v1.4.3/Tuney-1.4.3-mpc-armv7.zip", "plugins/tuney/thumb.ppm",
-            "Real-time vocal pitch correction: key and scale or your own notes on a touch keyboard, a pitch dial, Retune, Transition, Amount, Vibrato and Humanize, voice ranges and a reference pitch. Presets from hard tune to subtle.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3DTHC - VST - Tuney\" && if [ -f \"./plugins/tuney/tuney.so\" ]; then cp -rf ./plugins/tuney/* \"$TARGET_SYNTH_DIR/3DTHC - VST - Tuney/\"; else (wget -q -O /tmp/tuney.zip \"https://github.com/3dthc/Tuney-MPC/releases/download/tuney-vst-v1.4.3/Tuney-1.4.3-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/tuney.zip \"https://github.com/3dthc/Tuney-MPC/releases/download/tuney-vst-v1.4.3/Tuney-1.4.3-mpc-armv7.zip\" || curl -k -sL \"https://github.com/3dthc/Tuney-MPC/releases/download/tuney-vst-v1.4.3/Tuney-1.4.3-mpc-armv7.zip\" -o /tmp/tuney.zip) && unzip -o /tmp/tuney.zip -d \"$TARGET_SYNTH_DIR/3DTHC - VST - Tuney/\" && rm -f /tmp/tuney.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/3dthc/Tuney-MPC/55862ef83ab6938b5f1e3e20f5fa1ead7449e9b2/docs/tuney.png", "https://github.com/3dthc/Tuney-MPC/releases/download/tuney-vst-v1.4.3/Tuney-1.4.3-mpc-armv7.zip", "plugins/tuney/thumb.png",
+            "Real-time vocal pitch correction: key and scale or your own notes on a touch keyboard, a pitch dial, Retune, Transition, Amount, Vibrato and Humanize, voice ranges and a reference pitch. Presets from hard tune to subtle.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/3DTHC - VST - Tuney\" && if [ -f \"./plugins/tuney/tuney.so\" ]; then cp -rf ./plugins/tuney/* \"$TARGET_SYNTH_DIR/3DTHC - VST - Tuney/\"; else (wget --no-check-certificate -q -O /tmp/tuney.zip \"https://github.com/3dthc/Tuney-MPC/releases/download/tuney-vst-v1.4.3/Tuney-1.4.3-mpc-armv7.zip\" || wget -q -O /tmp/tuney.zip \"https://github.com/3dthc/Tuney-MPC/releases/download/tuney-vst-v1.4.3/Tuney-1.4.3-mpc-armv7.zip\") && unzip -o /tmp/tuney.zip -d \"$TARGET_SYNTH_DIR/3DTHC - VST - Tuney/\" && rm -f /tmp/tuney.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4158,10 +4226,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "verglas", "Verglas", "saustin2010", "v1.2.1", "Granular",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1362", "642 KB", "14%",
+            "1371", "642 KB", "14%",
             "Émilie Gillet - VST - [FX] Verglas", "verglas.so",
-            "https://raw.githubusercontent.com/saustin2010/mpc-vst-verglas/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-verglas/releases/download/v1.2.1/FX-Verglas-1.2.1-mpc-armv7.zip", "plugins/verglas/thumb.ppm",
-            "Verglas: granular, stretch, looper and spectral modes and freeze as an insert effect; 12 presets, from Émilie Gillet's open-source Clouds.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Verglas\" && if [ -f \"./plugins/verglas/verglas.so\" ]; then cp -rf ./plugins/verglas/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Verglas/\"; else (wget -q -O /tmp/verglas.zip \"https://github.com/saustin2010/mpc-vst-verglas/releases/download/v1.2.1/FX-Verglas-1.2.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/verglas.zip \"https://github.com/saustin2010/mpc-vst-verglas/releases/download/v1.2.1/FX-Verglas-1.2.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/saustin2010/mpc-vst-verglas/releases/download/v1.2.1/FX-Verglas-1.2.1-mpc-armv7.zip\" -o /tmp/verglas.zip) && unzip -o /tmp/verglas.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Verglas/\" && rm -f /tmp/verglas.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/saustin2010/mpc-vst-verglas/v1.2.1/screenshots/page_0.png", "https://github.com/saustin2010/mpc-vst-verglas/releases/download/v1.2.1/FX-Verglas-1.2.1-mpc-armv7.zip", "plugins/verglas/thumb.png",
+            "Verglas: granular, stretch, looper and spectral modes and freeze as an insert effect; 12 presets, from Émilie Gillet's open-source Clouds.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Verglas\" && if [ -f \"./plugins/verglas/verglas.so\" ]; then cp -rf ./plugins/verglas/* \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Verglas/\"; else (wget --no-check-certificate -q -O /tmp/verglas.zip \"https://github.com/saustin2010/mpc-vst-verglas/releases/download/v1.2.1/FX-Verglas-1.2.1-mpc-armv7.zip\" || wget -q -O /tmp/verglas.zip \"https://github.com/saustin2010/mpc-vst-verglas/releases/download/v1.2.1/FX-Verglas-1.2.1-mpc-armv7.zip\") && unzip -o /tmp/verglas.zip -d \"$TARGET_SYNTH_DIR/Émilie Gillet - VST - [FX] Verglas/\" && rm -f /tmp/verglas.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4170,9 +4238,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "vibe-fx", "Vibe FX", "nachtaktiv303", "v1.0.0", "Multi Fx",
             "FX", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 3.x", "2026-10-23",
-            "1078", "906 KB", "14%",
+            "1084", "906 KB", "14%",
             "nachtaktiv303 - VST - Vibe FX", "mpc_fx.so",
-            "https://raw.githubusercontent.com/nachtaktiv303/mpc-vst-vibe-fx/main/preview_1.png", "https://github.com/nachtaktiv303/mpc-vst-vibe-fx/releases/download/vibe-fx-vst-v1.0.0/Vibe-FX-1.0.0-mpc-armv7.zip", "plugins/vibe-fx/thumb.ppm",
+            "https://raw.githubusercontent.com/nachtaktiv303/mpc-vst-vibe-fx/main/preview_1.png", "https://github.com/nachtaktiv303/mpc-vst-vibe-fx/releases/download/vibe-fx-vst-v1.0.0/Vibe-FX-1.0.0-mpc-armv7.zip", "plugins/vibe-fx/thumb.png",
             "Drive, chorus, FDN reverb and tape delay in one native MPC OS insert effect, with a touchscreen skin and Q-Links.", "./plugins/vibe-fx/install.sh", 0,
             false,
             false,
@@ -4189,9 +4257,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "force-link-audio", "Force Link Audio", "Mac Digi / Rare Data", "v1.1.0", "Network Audio",
             "ADDIN", "Stable", "Akai Force (3.9.1.2)", "MPC OS 2.x & 3.x", "2026-10-14",
-            "323", "257 KB", "14%",
+            "324", "257 KB", "14%",
             "Mac Digi / Rare Data - VST - Force Link Audio", "forceLinkAudioAddin.so",
-            "https://github.com/macdigi/force-link-audio/releases/download/v1.1.0/force-link-audio-card.png", "https://github.com/macdigi/force-link-audio/releases/download/v1.1.0/Force-Link-Audio-1.1.0-mpc-armv7.zip", "plugins/force-link-audio/thumb.ppm",
+            "https://github.com/macdigi/force-link-audio/releases/download/v1.1.0/force-link-audio-card.png", "https://github.com/macdigi/force-link-audio/releases/download/v1.1.0/Force-Link-Audio-1.1.0-mpc-armv7.zip", "plugins/force-link-audio/thumb.png",
             "Publish the Force stereo main mix to Link Audio receivers on your trusted LAN while staying standalone. Disable the legacy Force Link Audio addon first. Off until enabled in settings; no remote-control server. Other MPC hardware is unverified.", "./plugins/force-link-audio/install.sh", 0,
             false,
             false,
@@ -4201,10 +4269,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "commander", "MPC Commander", "jacob-sabella", "v1.1.1", "Utility",
             "ADDIN", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
-            "2808", "64 KB", "14%",
+            "2815", "64 KB", "14%",
             "jacob-sabella - VST - MPC Commander", "mpc_commander_addin.so",
-            "", "https://github.com/jacob-sabella/mpc-addin-commander/releases/download/commander-addin-v1.1.1/MPC-Commander-addin-1.1.1-mpc-armv7.zip", "plugins/commander/thumb.ppm",
-            "The plugins MPC loads, with their own skins, and MPC's transport, on a desktop app. Listens on the device only: reach it through an SSH tunnel (no login; bind=0.0.0.0 opens it to your network).", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC Commander\" && if [ -f \"./plugins/commander/mpc_commander_addin.so\" ]; then cp -rf ./plugins/commander/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC Commander/\"; else (wget -q -O /tmp/commander.zip \"https://github.com/jacob-sabella/mpc-addin-commander/releases/download/commander-addin-v1.1.1/MPC-Commander-addin-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/commander.zip \"https://github.com/jacob-sabella/mpc-addin-commander/releases/download/commander-addin-v1.1.1/MPC-Commander-addin-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/jacob-sabella/mpc-addin-commander/releases/download/commander-addin-v1.1.1/MPC-Commander-addin-1.1.1-mpc-armv7.zip\" -o /tmp/commander.zip) && unzip -o /tmp/commander.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC Commander/\" && rm -f /tmp/commander.zip; fi && sync", 1,
+            "", "https://github.com/jacob-sabella/mpc-addin-commander/releases/download/commander-addin-v1.1.1/MPC-Commander-addin-1.1.1-mpc-armv7.zip", "plugins/commander/thumb.png",
+            "The plugins MPC loads, with their own skins, and MPC's transport, on a desktop app. Listens on the device only: reach it through an SSH tunnel (no login; bind=0.0.0.0 opens it to your network).", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC Commander\" && if [ -f \"./plugins/commander/mpc_commander_addin.so\" ]; then cp -rf ./plugins/commander/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC Commander/\"; else (wget --no-check-certificate -q -O /tmp/commander.zip \"https://github.com/jacob-sabella/mpc-addin-commander/releases/download/commander-addin-v1.1.1/MPC-Commander-addin-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/commander.zip \"https://github.com/jacob-sabella/mpc-addin-commander/releases/download/commander-addin-v1.1.1/MPC-Commander-addin-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/commander.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC Commander/\" && rm -f /tmp/commander.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4213,10 +4281,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "filebrowser", "MPC File Browser", "jacob-sabella", "v1.0.1", "Utility",
             "ADDIN", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
-            "454", "19.2 MB", "14%",
+            "459", "19.2 MB", "14%",
             "jacob-sabella - VST - MPC File Browser", "mpc_filebrowser_addin.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-addin-filebrowser/88b86eb39f907485995497cf0eaeeb5ddd7aa3e4/docs/tile.png", "https://github.com/jacob-sabella/mpc-addin-filebrowser/releases/download/filebrowser-addin-v1.0.1/MPC-File-Browser-1.0.1-mpc-armv7.zip", "plugins/filebrowser/thumb.ppm",
-            "FileBrowser Quantum beside MPC: browse the device's drives in a web browser, upload and download samples and projects, play audio, edit text files. Listens on the device only: reach it through an SSH tunnel (login admin / mpcadmin; change it). bind=0.0.0.0 opens it to your network.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC File Browser\" && if [ -f \"./plugins/filebrowser/mpc_filebrowser_addin.so\" ]; then cp -rf ./plugins/filebrowser/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC File Browser/\"; else (wget -q -O /tmp/filebrowser.zip \"https://github.com/jacob-sabella/mpc-addin-filebrowser/releases/download/filebrowser-addin-v1.0.1/MPC-File-Browser-1.0.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/filebrowser.zip \"https://github.com/jacob-sabella/mpc-addin-filebrowser/releases/download/filebrowser-addin-v1.0.1/MPC-File-Browser-1.0.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/jacob-sabella/mpc-addin-filebrowser/releases/download/filebrowser-addin-v1.0.1/MPC-File-Browser-1.0.1-mpc-armv7.zip\" -o /tmp/filebrowser.zip) && unzip -o /tmp/filebrowser.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC File Browser/\" && rm -f /tmp/filebrowser.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-addin-filebrowser/88b86eb39f907485995497cf0eaeeb5ddd7aa3e4/docs/tile.png", "https://github.com/jacob-sabella/mpc-addin-filebrowser/releases/download/filebrowser-addin-v1.0.1/MPC-File-Browser-1.0.1-mpc-armv7.zip", "plugins/filebrowser/thumb.png",
+            "FileBrowser Quantum beside MPC: browse the device's drives in a web browser, upload and download samples and projects, play audio, edit text files. Listens on the device only: reach it through an SSH tunnel (login admin / mpcadmin; change it). bind=0.0.0.0 opens it to your network.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC File Browser\" && if [ -f \"./plugins/filebrowser/mpc_filebrowser_addin.so\" ]; then cp -rf ./plugins/filebrowser/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC File Browser/\"; else (wget --no-check-certificate -q -O /tmp/filebrowser.zip \"https://github.com/jacob-sabella/mpc-addin-filebrowser/releases/download/filebrowser-addin-v1.0.1/MPC-File-Browser-1.0.1-mpc-armv7.zip\" || wget -q -O /tmp/filebrowser.zip \"https://github.com/jacob-sabella/mpc-addin-filebrowser/releases/download/filebrowser-addin-v1.0.1/MPC-File-Browser-1.0.1-mpc-armv7.zip\") && unzip -o /tmp/filebrowser.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC File Browser/\" && rm -f /tmp/filebrowser.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4225,9 +4293,9 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "remote", "MPC Remote", "jacob-sabella", "v1.1.1", "Utility",
             "ADDIN", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
-            "3235", "68 KB", "14%",
+            "3259", "68 KB", "14%",
             "jacob-sabella - VST - MPC Remote", "mpc_remote_addin.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-addin-remote/c9cc05422873025693cf5527b485ef44da51c5a0/docs/tile.png", "https://github.com/jacob-sabella/mpc-addin-remote/releases/download/remote-addin-v1.1.1/MPC-Remote-addin-1.1.1-mpc-armv7.zip", "plugins/remote/thumb.ppm",
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-addin-remote/c9cc05422873025693cf5527b485ef44da51c5a0/docs/tile.png", "https://github.com/jacob-sabella/mpc-addin-remote/releases/download/remote-addin-v1.1.1/MPC-Remote-addin-1.1.1-mpc-armv7.zip", "plugins/remote/thumb.png",
             "The MPC screen in a browser, and an MCP server so an AI model can see and touch it, play MIDI and read files. Listens on the device only: reach it through an SSH tunnel (no login; bind=0.0.0.0 opens it to your network).", "./plugins/remote/install.sh", 0,
             false,
             false,
@@ -4237,10 +4305,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "skipback", "MPC Skipback", "sd88me", "v0.6.2", "Utility",
             "ADDIN", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-03",
-            "1059", "64 KB", "14%",
+            "1069", "64 KB", "14%",
             "sd88me - VST - MPC Skipback", "libmpc_skipback.so",
-            "https://raw.githubusercontent.com/sd88me/mpc-addin-skipback/dc82602b2a05354d42445c8a330fb92a864892fb/docs/img/skipback.png", "https://github.com/sd88me/mpc-addin-skipback/releases/download/v0.6.2/MPC-Skipback-0.6.2-mpc-armv7.zip", "plugins/skipback/thumb.ppm",
-            "Records the main output all the time and saves the last 30 to 60 seconds as a WAV when you double-press a hardware button (Rec Arm on a Force; Overdub, or a button you teach it, on other models). Tested on a Gen1 Force; other models are unverified.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - MPC Skipback\" && if [ -f \"./plugins/skipback/libmpc_skipback.so\" ]; then cp -rf ./plugins/skipback/* \"$TARGET_SYNTH_DIR/sd88me - VST - MPC Skipback/\"; else (wget -q -O /tmp/skipback.zip \"https://github.com/sd88me/mpc-addin-skipback/releases/download/v0.6.2/MPC-Skipback-0.6.2-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/skipback.zip \"https://github.com/sd88me/mpc-addin-skipback/releases/download/v0.6.2/MPC-Skipback-0.6.2-mpc-armv7.zip\" || curl -k -sL \"https://github.com/sd88me/mpc-addin-skipback/releases/download/v0.6.2/MPC-Skipback-0.6.2-mpc-armv7.zip\" -o /tmp/skipback.zip) && unzip -o /tmp/skipback.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - MPC Skipback/\" && rm -f /tmp/skipback.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/sd88me/mpc-addin-skipback/dc82602b2a05354d42445c8a330fb92a864892fb/docs/img/skipback.png", "https://github.com/sd88me/mpc-addin-skipback/releases/download/v0.6.2/MPC-Skipback-0.6.2-mpc-armv7.zip", "plugins/skipback/thumb.png",
+            "Records the main output all the time and saves the last 30 to 60 seconds as a WAV when you double-press a hardware button (Rec Arm on a Force; Overdub, or a button you teach it, on other models). Tested on a Gen1 Force; other models are unverified.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/sd88me - VST - MPC Skipback\" && if [ -f \"./plugins/skipback/libmpc_skipback.so\" ]; then cp -rf ./plugins/skipback/* \"$TARGET_SYNTH_DIR/sd88me - VST - MPC Skipback/\"; else (wget --no-check-certificate -q -O /tmp/skipback.zip \"https://github.com/sd88me/mpc-addin-skipback/releases/download/v0.6.2/MPC-Skipback-0.6.2-mpc-armv7.zip\" || wget -q -O /tmp/skipback.zip \"https://github.com/sd88me/mpc-addin-skipback/releases/download/v0.6.2/MPC-Skipback-0.6.2-mpc-armv7.zip\") && unzip -o /tmp/skipback.zip -d \"$TARGET_SYNTH_DIR/sd88me - VST - MPC Skipback/\" && rm -f /tmp/skipback.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4249,10 +4317,10 @@ void LauncherConfig::loadEmbeddedDefaults() {
         {
             "usb-audio", "MPC USB audio", "jacob-sabella", "v1.1.1", "Audio Interface",
             "ADDIN", "Stable", "MPC Live II / Force (Gen1)", "MPC OS 2.x & 3.x", "2026-11-04",
-            "3186", "64 KB", "14%",
+            "3210", "64 KB", "14%",
             "jacob-sabella - VST - MPC USB audio", "libmpc_usb_audio.so",
-            "https://raw.githubusercontent.com/jacob-sabella/mpc-addin-usb-audio/f73cf3a1de3c3d005f30b6d38caddf587376e6d4/docs/tile.png", "https://github.com/jacob-sabella/mpc-addin-usb-audio/releases/download/usb-audio-addin-v1.1.1/MPC-USB-audio-addin-1.1.1-mpc-armv7.zip", "plugins/usb-audio/thumb.ppm",
-            "The MPC as a USB audio interface: its outputs and inputs as channels on the computer, next to its MIDI ports.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC USB audio\" && if [ -f \"./plugins/usb-audio/libmpc_usb_audio.so\" ]; then cp -rf ./plugins/usb-audio/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC USB audio/\"; else (wget -q -O /tmp/usb-audio.zip \"https://github.com/jacob-sabella/mpc-addin-usb-audio/releases/download/usb-audio-addin-v1.1.1/MPC-USB-audio-addin-1.1.1-mpc-armv7.zip\" || wget --no-check-certificate -q -O /tmp/usb-audio.zip \"https://github.com/jacob-sabella/mpc-addin-usb-audio/releases/download/usb-audio-addin-v1.1.1/MPC-USB-audio-addin-1.1.1-mpc-armv7.zip\" || curl -k -sL \"https://github.com/jacob-sabella/mpc-addin-usb-audio/releases/download/usb-audio-addin-v1.1.1/MPC-USB-audio-addin-1.1.1-mpc-armv7.zip\" -o /tmp/usb-audio.zip) && unzip -o /tmp/usb-audio.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC USB audio/\" && rm -f /tmp/usb-audio.zip; fi && sync", 1,
+            "https://raw.githubusercontent.com/jacob-sabella/mpc-addin-usb-audio/f73cf3a1de3c3d005f30b6d38caddf587376e6d4/docs/tile.png", "https://github.com/jacob-sabella/mpc-addin-usb-audio/releases/download/usb-audio-addin-v1.1.1/MPC-USB-audio-addin-1.1.1-mpc-armv7.zip", "plugins/usb-audio/thumb.png",
+            "The MPC as a USB audio interface: its outputs and inputs as channels on the computer, next to its MIDI ports.", "export TARGET_SYNTH_DIR=\"${TARGET_SYNTH_DIR:-${SYNTH_INSTALL_DIR:-./Synths}}\" && mkdir -p \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC USB audio\" && if [ -f \"./plugins/usb-audio/libmpc_usb_audio.so\" ]; then cp -rf ./plugins/usb-audio/* \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC USB audio/\"; else (wget --no-check-certificate -q -O /tmp/usb-audio.zip \"https://github.com/jacob-sabella/mpc-addin-usb-audio/releases/download/usb-audio-addin-v1.1.1/MPC-USB-audio-addin-1.1.1-mpc-armv7.zip\" || wget -q -O /tmp/usb-audio.zip \"https://github.com/jacob-sabella/mpc-addin-usb-audio/releases/download/usb-audio-addin-v1.1.1/MPC-USB-audio-addin-1.1.1-mpc-armv7.zip\") && unzip -o /tmp/usb-audio.zip -d \"$TARGET_SYNTH_DIR/jacob-sabella - VST - MPC USB audio/\" && rm -f /tmp/usb-audio.zip; fi && sync", 1,
             false,
             false,
             false,
@@ -4270,8 +4338,8 @@ void LauncherConfig::loadEmbeddedDefaults() {
             "PATCH", "Stable", "MPC OS Gen1 (Akai Force 3.9.1)", "MPC OS 2.x & 3.x (armv7l)", "2026-10-14",
             "412", "18 KB", "1%",
             "patches/auto-exec", "auto-exec-patch.sh",
-            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/1a6251e5dc90386a010179cb2173a51831cbbf4b/tools/mpc_patch/auto_exec/auto-exec-patch.sh", "plugins/patch-auto-exec/thumb.ppm",
-            "Recommended for a noexec drive. Makes the Synths folder of every noexec drive (SSD, USB stick, SD card) executable through a small boot-time service, with nothing to choose; the drives stay noexec. No MPC restart required and undo is built in.", "curl -sL \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/1a6251e5dc90386a010179cb2173a51831cbbf4b/tools/mpc_patch/auto_exec/auto-exec-patch.sh\" -o /tmp/auto-exec-patch.sh && sh /tmp/auto-exec-patch.sh", 1,
+            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/1a6251e5dc90386a010179cb2173a51831cbbf4b/tools/mpc_patch/auto_exec/auto-exec-patch.sh", "plugins/patch-auto-exec/thumb.png",
+            "Recommended for a noexec drive. Makes the Synths folder of every noexec drive (SSD, USB stick, SD card) executable through a small boot-time service, with nothing to choose; the drives stay noexec. No MPC restart required and undo is built in.", "(wget --no-check-certificate -q -O /tmp/auto-exec-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/1a6251e5dc90386a010179cb2173a51831cbbf4b/tools/mpc_patch/auto_exec/auto-exec-patch.sh\" || wget -q -O /tmp/auto-exec-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/1a6251e5dc90386a010179cb2173a51831cbbf4b/tools/mpc_patch/auto_exec/auto-exec-patch.sh\") && sh /tmp/auto-exec-patch.sh", 1,
             false,
             false,
             false,
@@ -4282,8 +4350,8 @@ void LauncherConfig::loadEmbeddedDefaults() {
             "PATCH", "Stable", "MPC OS 3.9.1.2 (armv7l)", "MPC OS 3.9.1.2", "2026-10-12",
             "318", "24 KB", "1%",
             "patches/drum-pad-layout", "mpc-drum-pad-patch.sh",
-            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/6ddf68cf92b3f1c0bdd322231ed133c0cc2eed48/tools/mpc_patch/mpc-drum-pad-patch.sh", "plugins/patch-16-pad-drum-layout/thumb.ppm",
-            "Machinedrum Module / Machinemodule, 6W6, 8W8, CW-78, 9W9, TR-MPC and Lucky Dip get MPC's drum layout with all 16 pads lit. Backs up /usr/bin/MPC to /sdcard/MPC-backup with built-in undo.", "curl -sL \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/6ddf68cf92b3f1c0bdd322231ed133c0cc2eed48/tools/mpc_patch/mpc-drum-pad-patch.sh\" -o /tmp/mpc-drum-pad-patch.sh && sh /tmp/mpc-drum-pad-patch.sh", 1,
+            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/6ddf68cf92b3f1c0bdd322231ed133c0cc2eed48/tools/mpc_patch/mpc-drum-pad-patch.sh", "plugins/patch-16-pad-drum-layout/thumb.png",
+            "Machinedrum Module / Machinemodule, 6W6, 8W8, CW-78, 9W9, TR-MPC and Lucky Dip get MPC's drum layout with all 16 pads lit. Backs up /usr/bin/MPC to /sdcard/MPC-backup with built-in undo.", "(wget --no-check-certificate -q -O /tmp/mpc-drum-pad-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/6ddf68cf92b3f1c0bdd322231ed133c0cc2eed48/tools/mpc_patch/mpc-drum-pad-patch.sh\" || wget -q -O /tmp/mpc-drum-pad-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/6ddf68cf92b3f1c0bdd322231ed133c0cc2eed48/tools/mpc_patch/mpc-drum-pad-patch.sh\") && sh /tmp/mpc-drum-pad-patch.sh", 1,
             false,
             false,
             false,
@@ -4294,8 +4362,8 @@ void LauncherConfig::loadEmbeddedDefaults() {
             "PATCH", "Stable", "MPC Live (Hakai 3.9.1), Force (3.9.0)", "MPC OS 3.9 (armv7l)", "2026-10-10",
             "275", "42 KB", "1%",
             "patches/hwremap", "hwremap-patch.sh",
-            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/a9bb8c71ba382fa6c3902fbbdead6d5f620222a5/tools/mpc_patch/hwremap/hwremap-patch.sh", "plugins/patch-button-remap/thumb.ppm",
-            "Remap hardware buttons on a standalone MPC or Force via an LD_PRELOAD shim (/usr/lib/hwremap.so): a button can become other buttons, a pad, or a screen tap. Pick which remaps you want at install (Mixer, Edit, Clip, Menu, and Knobs options).", "curl -sL \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/a9bb8c71ba382fa6c3902fbbdead6d5f620222a5/tools/mpc_patch/hwremap/hwremap-patch.sh\" -o /tmp/hwremap-patch.sh && sh /tmp/hwremap-patch.sh", 1,
+            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/a9bb8c71ba382fa6c3902fbbdead6d5f620222a5/tools/mpc_patch/hwremap/hwremap-patch.sh", "plugins/patch-button-remap/thumb.png",
+            "Remap hardware buttons on a standalone MPC or Force via an LD_PRELOAD shim (/usr/lib/hwremap.so): a button can become other buttons, a pad, or a screen tap. Pick which remaps you want at install (Mixer, Edit, Clip, Menu, and Knobs options).", "(wget --no-check-certificate -q -O /tmp/hwremap-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/a9bb8c71ba382fa6c3902fbbdead6d5f620222a5/tools/mpc_patch/hwremap/hwremap-patch.sh\" || wget -q -O /tmp/hwremap-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/a9bb8c71ba382fa6c3902fbbdead6d5f620222a5/tools/mpc_patch/hwremap/hwremap-patch.sh\") && sh /tmp/hwremap-patch.sh", 1,
             false,
             false,
             false,
@@ -4306,8 +4374,8 @@ void LauncherConfig::loadEmbeddedDefaults() {
             "PATCH", "Beta", "MPC OS Gen1 (Akai Force 3.9.1)", "MPC OS Gen1 (armv7l)", "2026-10-08",
             "164", "16 KB", "1%",
             "patches/drive-exec", "drive-exec-patch.sh",
-            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/f036a8791daff1ccf426c3953e84a8942c979564/tools/mpc_patch/drive_exec/drive-exec-patch.sh", "plugins/patch-drive-exec/thumb.ppm",
-            "Makes one selected drive Synths folder executable through a boot-time systemd bind-mount service while keeping the drive itself noexec. (Superseded by Auto exec, retained for uninstall compatibility.)", "curl -sL \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/f036a8791daff1ccf426c3953e84a8942c979564/tools/mpc_patch/drive_exec/drive-exec-patch.sh\" -o /tmp/drive-exec-patch.sh && sh /tmp/drive-exec-patch.sh", 1,
+            "", "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/f036a8791daff1ccf426c3953e84a8942c979564/tools/mpc_patch/drive_exec/drive-exec-patch.sh", "plugins/patch-drive-exec/thumb.png",
+            "Makes one selected drive Synths folder executable through a boot-time systemd bind-mount service while keeping the drive itself noexec. (Superseded by Auto exec, retained for uninstall compatibility.)", "(wget --no-check-certificate -q -O /tmp/drive-exec-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/f036a8791daff1ccf426c3953e84a8942c979564/tools/mpc_patch/drive_exec/drive-exec-patch.sh\" || wget -q -O /tmp/drive-exec-patch.sh \"https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/f036a8791daff1ccf426c3953e84a8942c979564/tools/mpc_patch/drive_exec/drive-exec-patch.sh\") && sh /tmp/drive-exec-patch.sh", 1,
             false,
             false,
             false,
@@ -4325,7 +4393,7 @@ void LauncherConfig::loadEmbeddedDefaults() {
             "APP", "Stable", "MPC X, MPC OS 3.9.1 (macOS & Windows)", "MPC OS 2.x & 3.x (SSH)", "2026-10-15",
             "690", "4.1 MB", "2%",
             "companion/mpc-link", "mpc-link-sshfs",
-            "https://raw.githubusercontent.com/padbangers/mpc-link/main/assets/catalog.png", "https://github.com/padbangers/mpc-link/releases/download/v1.0.2/MPC-Link-1.0.2-macOS.zip", "plugins/companion-mpc-link/thumb.ppm",
+            "https://raw.githubusercontent.com/padbangers/mpc-link/main/assets/catalog.png", "https://github.com/padbangers/mpc-link/releases/download/v1.0.2/MPC-Link-1.0.2-macOS.zip", "plugins/companion-mpc-link/thumb.png",
             "Menu bar / tray app that puts folders from your computer into the MPC's browser over the network: load samples straight from the computer, save projects back to it. Connects over SSH, copies a static sshfs to the device and mounts the shared folders on a drive MPC already shows.", "echo \"[MPC Link] Companion app runs on macOS/Windows and connects to root@<mpc-ip> via SSHFS.\" && mkdir -p /media/AKAI_FORCE_SSD/MPC_Link_Shares", 1,
             false,
             false,
@@ -4459,15 +4527,6 @@ bool ConfigParser::loadFromFile(const std::string& configPath, LauncherConfig& o
     outConfig.config_path = configPath;
     std::ifstream file(configPath, std::ios::binary);
     if (!file.is_open()) {
-        std::ifstream catFile("plugins/tkgl_catalog.json", std::ios::binary);
-        if (catFile.is_open()) {
-            catFile.close();
-            std::printf("[TKGL-CFG] %s not found, loading cached plugins/tkgl_catalog.json\n", configPath.c_str());
-            std::vector<std::string> syncLogs;
-            syncFromOnlineCatalog(outConfig, syncLogs);
-            refreshInstallStates(outConfig);
-            return true;
-        }
         std::printf("[TKGL-CFG] %s not found, loading embedded catalog.\n", configPath.c_str());
         outConfig.loadEmbeddedDefaults();
         refreshInstallStates(outConfig);
@@ -4488,9 +4547,13 @@ bool ConfigParser::loadFromFile(const std::string& configPath, LauncherConfig& o
             extract_string_field(brace, end_brace, "title", outConfig.app_title);
             extract_int_field(brace, end_brace, "rotation", outConfig.screen_rotation);
             extract_string_field(brace, end_brace, "catalog_url", outConfig.catalog_url);
+            extract_string_field(brace, end_brace, "ping_host", outConfig.ping_host);
             extract_string_field(brace, end_brace, "synth_dir", outConfig.synth_dir_name);
             extract_string_field(brace, end_brace, "usb_mount", outConfig.usb_mount_path);
         }
+    }
+    if (outConfig.ping_host.empty()) {
+        outConfig.ping_host = "github.com";
     }
 
     // 2. Parse "sections": [ ... ]
@@ -4552,7 +4615,7 @@ bool ConfigParser::loadFromFile(const std::string& configPath, LauncherConfig& o
                                 item.tags = {"mpc", "standalone", "vst2", "armv7"};
                             }
                             if (!item.id.empty()) {
-                                item.thumbPpmPath = "plugins/" + item.id + "/thumb.ppm";
+                                item.thumbPpmPath = "plugins/" + item.id + "/thumb.png";
                             }
 
                             if (extract_raw_code_field(item_open, item_close, item.cmd)) {
@@ -4594,47 +4657,65 @@ bool ConfigParser::loadFromFile(const std::string& configPath, LauncherConfig& o
     return true;
 }
 
+static std::string escapeJsonString(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size() + 16);
+    for (char c : raw) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
 bool ConfigParser::saveToFile(const std::string& configPath, const LauncherConfig& config) {
     std::ofstream out(configPath, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return false;
 
+    std::string pingHost = config.ping_host.empty() ? "github.com" : config.ping_host;
     out << "{\n";
     out << "  \"global\": {\n";
-    out << "    \"title\": \"" << config.app_title << "\",\n";
+    out << "    \"title\": \"" << escapeJsonString(config.app_title) << "\",\n";
     out << "    \"rotation\": " << config.screen_rotation << ",\n";
-    out << "    \"catalog_url\": \"" << config.catalog_url << "\",\n";
-    out << "    \"synth_dir\": \"" << config.synth_dir_name << "\",\n";
-    out << "    \"usb_mount\": \"" << config.usb_mount_path << "\"\n";
+    out << "    \"catalog_url\": \"" << escapeJsonString(config.catalog_url) << "\",\n";
+    out << "    \"ping_host\": \"" << escapeJsonString(pingHost) << "\",\n";
+    out << "    \"synth_dir\": \"" << escapeJsonString(config.synth_dir_name) << "\",\n";
+    out << "    \"usb_mount\": \"" << escapeJsonString(config.usb_mount_path) << "\"\n";
     out << "  },\n";
     out << "  \"sections\": [\n";
 
     for (size_t s = 0; s < config.sections.size(); ++s) {
         const auto& sec = config.sections[s];
         out << "    {\n";
-        out << "      \"section\": \"" << sec.title << "\",\n";
+        out << "      \"section\": \"" << escapeJsonString(sec.title) << "\",\n";
         out << "      \"items\": [\n";
         for (size_t i = 0; i < sec.items.size(); ++i) {
             const auto& it = sec.items[i];
             out << "        {\n";
-            out << "          \"id\": \"" << it.id << "\",\n";
-            out << "          \"item\": \"" << it.label << "\",\n";
-            out << "          \"author\": \"" << it.author << "\",\n";
-            out << "          \"version\": \"" << it.version << "\",\n";
-            out << "          \"size\": \"" << it.sizeMb << "\",\n";
-            out << "          \"updated\": \"" << it.updatedDate << "\",\n";
-            out << "          \"downloads\": \"" << it.downloads << "\",\n";
-            out << "          \"tested\": \"" << it.testedDevice << "\",\n";
-            out << "          \"screenshot\": \"" << it.screenshotUrl << "\",\n";
-            out << "          \"url\": \"" << it.downloadUrl << "\",\n";
-            out << "          \"description\": \"" << it.description << "\",\n";
-            out << "          \"target_subdir\": \"" << it.targetSubdir << "\",\n";
-            out << "          \"binary\": \"" << it.targetBinary << "\",\n";
+            out << "          \"id\": \"" << escapeJsonString(it.id) << "\",\n";
+            out << "          \"item\": \"" << escapeJsonString(it.label) << "\",\n";
+            out << "          \"author\": \"" << escapeJsonString(it.author) << "\",\n";
+            out << "          \"version\": \"" << escapeJsonString(it.version) << "\",\n";
+            out << "          \"size\": \"" << escapeJsonString(it.sizeMb) << "\",\n";
+            out << "          \"updated\": \"" << escapeJsonString(it.updatedDate) << "\",\n";
+            out << "          \"downloads\": \"" << escapeJsonString(it.downloads) << "\",\n";
+            out << "          \"tested\": \"" << escapeJsonString(it.testedDevice) << "\",\n";
+            out << "          \"screenshot\": \"" << escapeJsonString(it.screenshotUrl) << "\",\n";
+            out << "          \"url\": \"" << escapeJsonString(it.downloadUrl) << "\",\n";
+            out << "          \"description\": \"" << escapeJsonString(it.description) << "\",\n";
+            out << "          \"target_subdir\": \"" << escapeJsonString(it.targetSubdir) << "\",\n";
+            out << "          \"binary\": \"" << escapeJsonString(it.targetBinary) << "\",\n";
             out << "          \"installed\": " << (it.installed ? 1 : 0) << ",\n";
             out << "          \"broken\": " << (it.broken ? 1 : 0) << ",\n";
             if (it.is_inline) {
                 out << "          \"code\": {\n            " << it.cmd << "\n          }\n";
             } else {
-                out << "          \"script\": \"" << it.cmd << "\"\n";
+                out << "          \"script\": \"" << escapeJsonString(it.cmd) << "\"\n";
             }
             out << "        }" << (i + 1 < sec.items.size() ? "," : "") << "\n";
         }
@@ -4655,25 +4736,39 @@ bool ConfigParser::syncFromOnlineCatalog(
         chdir(mgrDir.c_str());
     }
 
+    // 1. Mandatory internet reachability check before any refresh operation
+    std::string pingHost = config.ping_host.empty() ? "github.com" : config.ping_host;
+    outLogs.push_back("[TKGL-SYNC] Checking internet access (ping " + pingHost + ")...");
+    if (onProgress) onProgress("[TKGL-SYNC] Pinging " + pingHost + "...");
+    if (!checkInternetReachable(pingHost, &outLogs)) {
+        outLogs.push_back("[ERROR] No internet access (ping " + pingHost + " failed). Refresh aborted.");
+        if (onProgress) onProgress("[ERROR] No internet (" + pingHost + " unreachable). Refresh impossible.");
+        return false;
+    }
+
     std::string url = config.catalog_url;
     if (url.empty()) url = "https://sd88me.github.io/mpc-vst-plugins/catalog.json";
     if (url.back() == '/') url += "catalog.json";
-    std::string fallbackUrl = "https://open-mpc.github.io/catalog.json";
+    std::string fallbackUrl = "https://raw.githubusercontent.com/sd88me/mpc-vst-plugins/gh-pages/catalog.json";
 
     mkdir("plugins", 0755);
-    outLogs.push_back("[TKGL-SYNC] Connecting to online catalog via libcurl.so.4: " + url);
-    if (onProgress) onProgress("[TKGL-SYNC] Fetching catalog JSON via libcurl.so.4...");
+    outLogs.push_back("[TKGL-SYNC] Downloading online catalog via wget: " + url);
+    if (onProgress) onProgress("[TKGL-SYNC] Fetching catalog JSON via wget...");
 
-    // Download to a temporary file first via native libcurl.so.4 (dlopen) so we never truncate
-    // plugins/tkgl_catalog.json to 0 bytes on network failure.
     std::string tmpCat = "/tmp/tkgl_catalog_dl.json";
     unlink(tmpCat.c_str());
-    bool dlOk = downloadFile(url, tmpCat, 30, onProgress, "[TKGL-SYNC] Downloading catalog");
-    if (!dlOk) {
-        outLogs.push_back("[TKGL-SYNC] Primary URL failed, trying fallback: " + fallbackUrl);
-        dlOk = downloadFile(fallbackUrl, tmpCat, 30, onProgress, "[TKGL-SYNC] Downloading fallback catalog");
+    bool dlOk = downloadFile(url, tmpCat, 20, onProgress, "[TKGL-SYNC] Downloading catalog");
+    if (!dlOk && url != fallbackUrl) {
+        outLogs.push_back("[TKGL-SYNC] Trying raw GitHub mirror: " + fallbackUrl);
+        dlOk = downloadFile(fallbackUrl, tmpCat, 20, onProgress, "[TKGL-SYNC] Downloading mirror catalog");
     }
-    if (dlOk) {
+    if (!dlOk) {
+        outLogs.push_back("[ERROR] Failed to download online catalog via wget. Refresh aborted.");
+        if (onProgress) onProgress("[ERROR] Catalog download failed via wget.");
+        return false;
+    }
+
+    {
         std::ifstream src(tmpCat, std::ios::binary);
         std::ofstream dst("plugins/tkgl_catalog.json", std::ios::binary | std::ios::trunc);
         if (src.is_open() && dst.is_open()) {
@@ -4685,7 +4780,7 @@ bool ConfigParser::syncFromOnlineCatalog(
 
     struct stat stCat;
     if (stat("plugins/tkgl_catalog.json", &stCat) != 0 || stCat.st_size < 64) {
-        outLogs.push_back("[ERROR] Failed to download or read plugins/tkgl_catalog.json (network/SSL error).");
+        outLogs.push_back("[ERROR] Invalid or empty plugins/tkgl_catalog.json.");
         return false;
     }
 
@@ -4694,7 +4789,7 @@ bool ConfigParser::syncFromOnlineCatalog(
         outLogs.push_back("[ERROR] Could not open plugins/tkgl_catalog.json.");
         return false;
     }
-    outLogs.push_back("[TKGL-SYNC] Saved catalog to plugins/tkgl_catalog.json (" + std::to_string(stCat.st_size / 1024) + " KB)");
+    outLogs.push_back(std::string("[TKGL-SYNC] Loaded catalog plugins/tkgl_catalog.json (") + std::to_string(stCat.st_size / 1024) + " KB)");
     if (onProgress) onProgress("[TKGL-SYNC] Parsing catalog entries...");
 
     std::stringstream ss;
@@ -4732,6 +4827,58 @@ bool ConfigParser::syncFromOnlineCatalog(
         }
     }
 
+    auto ensureThumbDownloaded = [&](MenuItem& it, int itemNumber) {
+        if (it.id.empty()) return;
+        std::string plugDir = "plugins/" + it.id;
+        mkdir("plugins", 0755);
+        mkdir(plugDir.c_str(), 0755);
+        std::string localPng = plugDir + "/thumb.png";
+        std::string localPpm = plugDir + "/thumb.ppm";
+
+        // Normalize relative screenshot URL if needed
+        if (!it.screenshotUrl.empty() &&
+            it.screenshotUrl.rfind("http://", 0) != 0 &&
+            it.screenshotUrl.rfind("https://", 0) != 0) {
+            std::string baseUrl = url;
+            size_t slashPos = baseUrl.find_last_of('/');
+            if (slashPos != std::string::npos) {
+                baseUrl = baseUrl.substr(0, slashPos + 1);
+            } else {
+                baseUrl += "/";
+            }
+            if (!it.screenshotUrl.empty() && it.screenshotUrl[0] == '/') {
+                it.screenshotUrl.erase(0, 1);
+            }
+            it.screenshotUrl = baseUrl + it.screenshotUrl;
+        }
+
+        struct stat stPng;
+        if (stat(localPng.c_str(), &stPng) == 0 && stPng.st_size < 64) {
+            unlink(localPng.c_str());
+        }
+        bool hasPng = (stat(localPng.c_str(), &stPng) == 0 && stPng.st_size >= 64);
+
+        // If thumb.png does not exist on disk, download it via wget
+        if (!hasPng && !it.screenshotUrl.empty()) {
+            if (onProgress) {
+                int dotCount = (itemNumber % 5) + 1;
+                std::string dots;
+                for (int d = 0; d < 5; ++d) dots += (d < dotCount) ? " * " : " . ";
+                onProgress("[SYNC " + dots + "] Downloading thumb: " + it.label);
+            }
+            if (downloadFile(it.screenshotUrl, localPng, 15)) {
+                hasPng = (stat(localPng.c_str(), &stPng) == 0 && stPng.st_size >= 64);
+                if (hasPng) {
+                    unlink(localPpm.c_str());
+                    outLogs.push_back("[TKGL-SYNC] Downloaded thumb: " + localPng);
+                }
+            } else {
+                outLogs.push_back("[WARNING] Failed to download thumb for " + it.label + ": " + it.screenshotUrl);
+            }
+        }
+        it.thumbPpmPath = localPng;
+    };
+
     const char* p = arr_open + 1;
     int count = 0;
     while (p < arr_close) {
@@ -4747,6 +4894,8 @@ bool ConfigParser::syncFromOnlineCatalog(
         extract_string_field(p_open, p_close, "style", item.category);
         extract_string_field(p_open, p_close, "summary", item.description);
         extract_string_field(p_open, p_close, "screenshot", item.screenshotUrl);
+        if (item.screenshotUrl.empty()) extract_string_field(p_open, p_close, "image", item.screenshotUrl);
+        if (item.screenshotUrl.empty()) extract_string_field(p_open, p_close, "thumbnail", item.screenshotUrl);
         extract_string_array(p_open, p_close, "tags", item.tags);
         if (item.tags.empty()) item.tags = {"synth", "mpc", "vst2"};
 
@@ -4764,7 +4913,46 @@ bool ConfigParser::syncFromOnlineCatalog(
                 std::string ver;
                 if (extract_string_field(v_obj, v_close, "version", ver)) item.version = "v" + ver;
                 extract_string_field(v_obj, v_close, "date", item.updatedDate);
-                extract_string_field(v_obj, v_close, "url", item.downloadUrl);
+                if (item.screenshotUrl.empty()) {
+                    extract_string_field(v_obj, v_close, "screenshot", item.screenshotUrl);
+                }
+
+                // Extract download URL: check assets.armv7.url first, then download_url/package_url, then scan all "url" fields for .zip/release asset
+                const char* armv7_key = std::strstr(v_obj, "\"armv7\"");
+                if (armv7_key && armv7_key < v_close) {
+                    const char* arm_open = std::strchr(armv7_key, '{');
+                    const char* arm_close = arm_open ? find_matching_delim(arm_open, '{', '}') : nullptr;
+                    if (arm_open && arm_close && arm_close <= v_close) {
+                        extract_string_field(arm_open, arm_close, "url", item.downloadUrl);
+                    }
+                }
+                if (item.downloadUrl.empty()) {
+                    extract_string_field(v_obj, v_close, "download_url", item.downloadUrl);
+                }
+                if (item.downloadUrl.empty()) {
+                    extract_string_field(v_obj, v_close, "package_url", item.downloadUrl);
+                }
+                if (item.downloadUrl.empty()) {
+                    const char* scanP = v_obj;
+                    std::string firstUrl;
+                    while (scanP < v_close) {
+                        const char* uFound = std::strstr(scanP, "\"url\"");
+                        if (!uFound || uFound >= v_close) break;
+                        std::string candidate;
+                        if (extract_string_field(uFound, v_close, "url", candidate) && !candidate.empty()) {
+                            if (firstUrl.empty()) firstUrl = candidate;
+                            if (candidate.find(".zip") != std::string::npos ||
+                                candidate.find("/releases/download/") != std::string::npos ||
+                                candidate.find("raw.githubusercontent.com") != std::string::npos) {
+                                item.downloadUrl = candidate;
+                                break;
+                            }
+                        }
+                        scanP = uFound + 5;
+                    }
+                    if (item.downloadUrl.empty()) item.downloadUrl = firstUrl;
+                }
+
                 int sizeB = 0, dl = 0;
                 if (extract_int_field(v_obj, v_close, "size", sizeB) && sizeB > 0) {
                     char mbBuf[32];
@@ -4781,6 +4969,9 @@ bool ConfigParser::syncFromOnlineCatalog(
                 if (extract_string_field(v_obj, v_close, "device", dev)) item.testedDevice = dev;
             }
         }
+        if (item.downloadUrl.empty()) {
+            extract_string_field(p_open, p_close, "url", item.downloadUrl);
+        }
 
         if (item.targetSubdir.empty()) item.targetSubdir = item.author + " - VST - " + item.label;
         if (item.targetBinary.empty()) item.targetBinary = item.id + ".so";
@@ -4790,34 +4981,11 @@ bool ConfigParser::syncFromOnlineCatalog(
             item.installed = true;
         }
 
-        std::string plugDir = "plugins/" + item.id;
-        mkdir("plugins", 0755);
-        mkdir(plugDir.c_str(), 0755);
-        item.thumbPpmPath = plugDir + "/thumb.ppm";
-
-        // Adjustment 1: Download all thumbnails during catalog refresh via libcurl.so.4
-        if (!item.screenshotUrl.empty()) {
-            std::string localPng = plugDir + "/thumb.png";
-            std::string localPpm = plugDir + "/thumb.ppm";
-            struct stat stPng, stPpm;
-            if (stat(localPng.c_str(), &stPng) == 0 && stPng.st_size == 0) {
-                unlink(localPng.c_str());
-            }
-            bool hasThumb = ((stat(localPng.c_str(), &stPng) == 0 && stPng.st_size > 0) ||
-                             (stat(localPpm.c_str(), &stPpm) == 0 && stPpm.st_size > 0));
-            if (!hasThumb) {
-                if (onProgress) {
-                    int dotCount = (count % 5) + 1;
-                    std::string dots;
-                    for (int d = 0; d < 5; ++d) dots += (d < dotCount) ? " * " : " . ";
-                    onProgress("[SYNC " + dots + "] Downloading thumb: " + item.label);
-                }
-                downloadFile(item.screenshotUrl, localPng, 8);
-            }
-        }
+        // Download thumb.png if it does not exist on disk
+        ensureThumbDownloaded(item, count + 1);
 
         item.is_inline = 1;
-        item.cmd = "mkdir -p \"$SYNTH_INSTALL_DIR/" + item.targetSubdir + "\" && (/proc/self/exe --fetch \"" + item.downloadUrl + "\" /tmp/" + item.id + ".zip || wget --no-check-certificate -q -O /tmp/" + item.id + ".zip \"" + item.downloadUrl + "\" || wget -q -O /tmp/" + item.id + ".zip \"" + item.downloadUrl + "\") && unzip -o /tmp/" + item.id + ".zip -d \"$SYNTH_INSTALL_DIR/" + item.targetSubdir + "/\" && rm -f /tmp/" + item.id + ".zip && sync";
+        item.cmd = "mkdir -p \"$SYNTH_INSTALL_DIR/" + item.targetSubdir + "\" && (wget --no-check-certificate -q -O /tmp/" + item.id + ".zip \"" + item.downloadUrl + "\" || wget -q -O /tmp/" + item.id + ".zip \"" + item.downloadUrl + "\") && unzip -o /tmp/" + item.id + ".zip -d \"$SYNTH_INSTALL_DIR/" + item.targetSubdir + "/\" && rm -f /tmp/" + item.id + ".zip && sync";
 
         if (!item.label.empty()) {
             if (kind == "addin") {
@@ -4844,6 +5012,14 @@ bool ConfigParser::syncFromOnlineCatalog(
         p = p_close + 1;
     }
 
+    // Also ensure thumbnails are downloaded for any preserved DEVICE PATCHES and COMPANION APPS items
+    for (auto& patchIt : secPatches.items) {
+        ensureThumbDownloaded(patchIt, ++count);
+    }
+    for (auto& appIt : secApps.items) {
+        ensureThumbDownloaded(appIt, ++count);
+    }
+
     if (count > 0) {
         config.sections.clear();
         if (!secInst.items.empty())    config.sections.push_back(secInst);
@@ -4860,9 +5036,70 @@ bool ConfigParser::syncFromOnlineCatalog(
     return false;
 }
 
-void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std::string>* outLogs) {
-    // 1. Determine MPC.settings file path
-    std::string mpcSettingsPath = "/media/az01-internal/Settings/MPC/MPC.settings";
+// ============================================================================
+// Safe MPC.settings XML Manipulation & Integrity Engine
+// ============================================================================
+
+static std::string getBackupTimestampYYYYMMDDHHMMSS() {
+    std::time_t now = std::time(nullptr);
+    struct tm tmBuf;
+    struct tm* lt = localtime_r(&now, &tmBuf);
+    char buf[32];
+    if (lt && std::strftime(buf, sizeof(buf), "%Y%m%d%H%M%S", lt) > 0) {
+        return std::string(buf);
+    }
+    return "20260101000000";
+}
+
+static std::string xmlUnescape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '&') {
+            if (s.compare(i, 6, "&apos;") == 0) { out += '\''; i += 5; continue; }
+            if (s.compare(i, 6, "&quot;") == 0) { out += '"';  i += 5; continue; }
+            if (s.compare(i, 4, "&lt;")   == 0) { out += '<';  i += 3; continue; }
+            if (s.compare(i, 4, "&gt;")   == 0) { out += '>';  i += 3; continue; }
+            if (s.compare(i, 5, "&amp;")  == 0) { out += '&';  i += 4; continue; }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+static std::string xmlEscapeAttr(const std::string& raw) {
+    std::string unescaped = xmlUnescape(raw);
+    std::string out;
+    out.reserve(unescaped.size() + 16);
+    for (char c : unescaped) {
+        switch (c) {
+            case '&':  out += "&amp;";  break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            default:   out += c;        break;
+        }
+    }
+    return out;
+}
+
+static std::string xmlEscapeText(const std::string& raw) {
+    std::string unescaped = xmlUnescape(raw);
+    std::string out;
+    out.reserve(unescaped.size() + 16);
+    for (char c : unescaped) {
+        switch (c) {
+            case '&':  out += "&amp;";  break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            default:   out += c;        break;
+        }
+    }
+    return out;
+}
+
+static std::string resolveMpcSettingsPath() {
     const char* candMpc[] = {
         "/media/az01-internal/Settings/MPC/MPC.settings",
         "/media/internal/Settings/MPC/MPC.settings",
@@ -4872,10 +5109,508 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
     for (const char* cp : candMpc) {
         struct stat st;
         if (stat(cp, &st) == 0 && S_ISREG(st.st_mode)) {
-            mpcSettingsPath = cp;
-            break;
+            return std::string(cp);
         }
     }
+    return "/media/az01-internal/Settings/MPC/MPC.settings";
+}
+
+// Finds the closing '>' of an XML tag starting at tagStart (quote-aware across multiple lines).
+// Sets outIsSelfClosing = true if the tag ends with "/>". Returns index right after '>', or npos.
+static size_t findXmlTagEnd(const std::string& xml, size_t tagStart, bool& outIsSelfClosing) {
+    outIsSelfClosing = false;
+    if (tagStart >= xml.size() || xml[tagStart] != '<') return std::string::npos;
+    bool inDoubleQuote = false;
+    bool inSingleQuote = false;
+    char lastNonSpace = 0;
+    for (size_t i = tagStart + 1; i < xml.size(); ++i) {
+        char c = xml[i];
+        if (c == '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+        } else if (c == '\'' && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+        } else if (!inDoubleQuote && !inSingleQuote) {
+            if (c == '>') {
+                outIsSelfClosing = (lastNonSpace == '/');
+                return i + 1;
+            }
+            if (c == '<') {
+                // Unexpected '<' before closing '>' -> malformed tag
+                return std::string::npos;
+            }
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                lastNonSpace = c;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+static std::string getXmlTagAttribute(const std::string& tag, const std::string& attrName) {
+    std::string needle = attrName + "=";
+    size_t pos = 0;
+    while ((pos = tag.find(needle, pos)) != std::string::npos) {
+        if (pos > 0) {
+            char prev = tag[pos - 1];
+            if (prev != ' ' && prev != '\t' && prev != '\r' && prev != '\n') {
+                pos += needle.size();
+                continue;
+            }
+        }
+        size_t valStart = pos + needle.size();
+        if (valStart < tag.size() && (tag[valStart] == '"' || tag[valStart] == '\'')) {
+            char quote = tag[valStart];
+            size_t valEnd = tag.find(quote, valStart + 1);
+            if (valEnd != std::string::npos) {
+                return xmlUnescape(tag.substr(valStart + 1, valEnd - (valStart + 1)));
+            }
+        }
+        pos += needle.size();
+    }
+    return "";
+}
+
+static std::string setXmlTagAttribute(const std::string& tag, const std::string& attrName, const std::string& newRawValue) {
+    std::string escapedVal = xmlEscapeAttr(newRawValue);
+    std::string needle = attrName + "=";
+    size_t pos = 0;
+    while ((pos = tag.find(needle, pos)) != std::string::npos) {
+        if (pos > 0) {
+            char prev = tag[pos - 1];
+            if (prev != ' ' && prev != '\t' && prev != '\r' && prev != '\n') {
+                pos += needle.size();
+                continue;
+            }
+        }
+        size_t valStart = pos + needle.size();
+        if (valStart < tag.size() && (tag[valStart] == '"' || tag[valStart] == '\'')) {
+            char quote = tag[valStart];
+            size_t valEnd = tag.find(quote, valStart + 1);
+            if (valEnd != std::string::npos) {
+                std::string updated = tag;
+                updated.replace(valStart, (valEnd - valStart) + 1, std::string("\"") + escapedVal + "\"");
+                return updated;
+            }
+        }
+        pos += needle.size();
+    }
+    return tag;
+}
+
+// Locates <VALUE name="valueName"...> block in MPC.settings.
+// Properly distinguishes self-closing <VALUE name="..."/> from <VALUE name="...">...</VALUE>.
+static bool findValueBlock(
+    const std::string& xml,
+    const std::string& valueName,
+    size_t& outBlockStart,
+    size_t& outOpenTagEnd,
+    size_t& outBlockEnd,
+    bool& outIsSelfClosing
+) {
+    size_t pos = 0;
+    while ((pos = xml.find("<VALUE", pos)) != std::string::npos) {
+        if (pos + 6 < xml.size()) {
+            char nextC = xml[pos + 6];
+            if (nextC != ' ' && nextC != '\t' && nextC != '\r' && nextC != '\n' && nextC != '/' && nextC != '>') {
+                pos += 6;
+                continue;
+            }
+        }
+        bool selfClosing = false;
+        size_t openEnd = findXmlTagEnd(xml, pos, selfClosing);
+        if (openEnd == std::string::npos) return false;
+        std::string openTag = xml.substr(pos, openEnd - pos);
+        if (getXmlTagAttribute(openTag, "name") == valueName) {
+            outBlockStart = pos;
+            outOpenTagEnd = openEnd;
+            outIsSelfClosing = selfClosing;
+            if (selfClosing) {
+                outBlockEnd = openEnd;
+                return true;
+            }
+            size_t closeVal = xml.find("</VALUE>", openEnd);
+            if (closeVal == std::string::npos) return false;
+            outBlockEnd = closeVal + 8;
+            return true;
+        }
+        pos = openEnd;
+    }
+    return false;
+}
+
+struct MpcPluginXmlEntry {
+    size_t startPos = 0;
+    size_t endPos   = 0;
+    std::string rawTag;
+    std::string name;
+    std::string descName;
+    std::string file;
+};
+
+// Extracts all <PLUGIN .../> (or <PLUGIN ...>...</PLUGIN>) elements within [rangeStart, rangeEnd),
+// including multi-line <PLUGIN> elements wrapped by JUCE XmlElement!
+static std::vector<MpcPluginXmlEntry> extractPluginXmlEntries(const std::string& xml, size_t rangeStart, size_t rangeEnd) {
+    std::vector<MpcPluginXmlEntry> entries;
+    size_t pos = rangeStart;
+    while (pos < rangeEnd && (pos = xml.find("<PLUGIN", pos)) != std::string::npos && pos < rangeEnd) {
+        if (pos + 7 < xml.size()) {
+            char c = xml[pos + 7];
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '/' && c != '>') {
+                pos += 7;
+                continue;
+            }
+        }
+        bool selfClosing = false;
+        size_t tagEnd = findXmlTagEnd(xml, pos, selfClosing);
+        if (tagEnd == std::string::npos || tagEnd > rangeEnd) break;
+        size_t elemEnd = tagEnd;
+        if (!selfClosing) {
+            size_t closeTag = xml.find("</PLUGIN>", tagEnd);
+            if (closeTag != std::string::npos && closeTag + 9 <= rangeEnd) {
+                elemEnd = closeTag + 9;
+            }
+        }
+        MpcPluginXmlEntry e;
+        e.startPos = pos;
+        e.endPos   = elemEnd;
+        e.rawTag   = xml.substr(pos, elemEnd - pos);
+        e.name     = getXmlTagAttribute(e.rawTag, "name");
+        e.descName = getXmlTagAttribute(e.rawTag, "descriptiveName");
+        e.file     = getXmlTagAttribute(e.rawTag, "file");
+        entries.push_back(e);
+        pos = elemEnd;
+    }
+    return entries;
+}
+
+// Collapses multi-line whitespace inside an XML tag (outside quotes) into single spaces
+static std::string normalizeSingleLineXmlTag(const std::string& tag) {
+    std::string out;
+    out.reserve(tag.size());
+    bool inDoubleQuote = false;
+    bool inSingleQuote = false;
+    bool lastWasSpace  = false;
+    for (size_t i = 0; i < tag.size(); ++i) {
+        char c = tag[i];
+        if (c == '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+            out += c;
+            lastWasSpace = false;
+        } else if (c == '\'' && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+            out += c;
+            lastWasSpace = false;
+        } else if (!inDoubleQuote && !inSingleQuote && (c == ' ' || c == '\t' || c == '\r' || c == '\n')) {
+            if (!lastWasSpace && !out.empty() && out.back() != '<') {
+                out += ' ';
+                lastWasSpace = true;
+            }
+        } else {
+            if (!inDoubleQuote && !inSingleQuote && (c == '>' || (c == '/' && i + 1 < tag.size() && tag[i + 1] == '>'))) {
+                if (!out.empty() && out.back() == ' ') out.pop_back();
+            }
+            out += c;
+            lastWasSpace = false;
+        }
+    }
+    return out;
+}
+
+// Strict structural XML validator for MPC.settings before committing any changes to disk
+static bool validateMpcSettingsXml(const std::string& xml, std::string& outErrorReason) {
+    if (xml.size() < 32) {
+        outErrorReason = "XML content is too short or empty";
+        return false;
+    }
+    size_t propOpen = xml.find("<PROPERTIES");
+    size_t propClose = xml.rfind("</PROPERTIES>");
+    if (propOpen == std::string::npos || propClose == std::string::npos || propClose <= propOpen) {
+        outErrorReason = "Missing or mismatched <PROPERTIES> root element";
+        return false;
+    }
+
+    // Verify all '<' and '>' tags and quotes are balanced across the entire document
+    int openValueCount = 0;
+    int closeValueCount = 0;
+    int openSynthLocCount = 0;
+    int closeSynthLocCount = 0;
+    int openKnownPluginsCount = 0;
+    int closeKnownPluginsCount = 0;
+
+    size_t i = 0;
+    while (i < xml.size()) {
+        size_t lt = xml.find('<', i);
+        if (lt == std::string::npos) break;
+
+        // Skip XML declaration <?...?> or comments <!--...--> or CDATA
+        if (lt + 1 < xml.size() && xml[lt + 1] == '?') {
+            size_t qEnd = xml.find("?>", lt + 2);
+            if (qEnd == std::string::npos) {
+                outErrorReason = "Unclosed XML declaration <?xml ...?>";
+                return false;
+            }
+            i = qEnd + 2;
+            continue;
+        }
+        if (xml.compare(lt, 4, "<!--") == 0) {
+            size_t cEnd = xml.find("-->", lt + 4);
+            if (cEnd == std::string::npos) {
+                outErrorReason = "Unclosed XML comment";
+                return false;
+            }
+            i = cEnd + 3;
+            continue;
+        }
+
+        bool isSelfClosing = false;
+        size_t gtEnd = findXmlTagEnd(xml, lt, isSelfClosing);
+        if (gtEnd == std::string::npos) {
+            outErrorReason = "Malformed or unclosed XML tag near offset " + std::to_string(lt);
+            return false;
+        }
+
+        std::string tag = xml.substr(lt, gtEnd - lt);
+        auto tagMatchesElement = [](const std::string& t, const char* elemName, bool isClosing) -> bool {
+            std::string prefix = std::string(isClosing ? "</" : "<") + elemName;
+            if (t.rfind(prefix, 0) != 0) return false;
+            if (t.size() == prefix.size()) return true;
+            char next = t[prefix.size()];
+            return (next == '>' || next == '/' || next == ' ' || next == '\t' || next == '\r' || next == '\n');
+        };
+
+        if (tagMatchesElement(tag, "VALUE", true)) {
+            closeValueCount++;
+        } else if (tagMatchesElement(tag, "VALUE", false)) {
+            if (!isSelfClosing) openValueCount++;
+        } else if (tagMatchesElement(tag, "SynthContentLocations", true)) {
+            closeSynthLocCount++;
+        } else if (tagMatchesElement(tag, "SynthContentLocations", false)) {
+            if (!isSelfClosing) openSynthLocCount++;
+        } else if (tagMatchesElement(tag, "KNOWNPLUGINS", true)) {
+            closeKnownPluginsCount++;
+        } else if (tagMatchesElement(tag, "KNOWNPLUGINS", false)) {
+            if (!isSelfClosing) openKnownPluginsCount++;
+        }
+
+        i = gtEnd;
+    }
+
+    if (openValueCount != closeValueCount) {
+        outErrorReason = "Mismatched <VALUE> (" + std::to_string(openValueCount) + ") and </VALUE> (" + std::to_string(closeValueCount) + ") tags";
+        return false;
+    }
+    if (openSynthLocCount != closeSynthLocCount) {
+        outErrorReason = "Mismatched <SynthContentLocations> (" + std::to_string(openSynthLocCount) + ") and </SynthContentLocations> (" + std::to_string(closeSynthLocCount) + ") tags";
+        return false;
+    }
+    if (openKnownPluginsCount != closeKnownPluginsCount) {
+        outErrorReason = "Mismatched <KNOWNPLUGINS> (" + std::to_string(openKnownPluginsCount) + ") and </KNOWNPLUGINS> (" + std::to_string(closeKnownPluginsCount) + ") tags";
+        return false;
+    }
+    return true;
+}
+
+static bool backupAndWriteMpcSettings(
+    const std::string& mpcSettingsPath,
+    const std::string& newContent,
+    std::vector<std::string>* outLogs,
+    std::string* outBackupPath = nullptr
+) {
+    std::string errReason;
+    if (!validateMpcSettingsXml(newContent, errReason)) {
+        std::string errMsg = "[ERROR] MPC.settings integrity check failed (" + errReason + "). Aborting write to preserve MPC.settings!";
+        std::fprintf(stderr, "%s\n", errMsg.c_str());
+        if (outLogs) outLogs->push_back(errMsg);
+        return false;
+    }
+
+    // 1. Gold Rule: Create human-readable backup MPC.settings.bak-YYYYMMDDHHMMSS
+    std::string ts = getBackupTimestampYYYYMMDDHHMMSS();
+    std::string bakPath = mpcSettingsPath + ".bak-" + ts;
+    {
+        std::ifstream src(mpcSettingsPath, std::ios::binary);
+        if (src.is_open()) {
+            std::ofstream bak(bakPath, std::ios::binary | std::ios::trunc);
+            if (bak.is_open()) {
+                bak << src.rdbuf();
+                bak.flush();
+                bak.close();
+                if (outBackupPath) *outBackupPath = bakPath;
+            }
+            src.close();
+        }
+    }
+
+    // 2. Write to temporary file first, verify size, then atomically rename over MPC.settings
+    std::string tmpPath = mpcSettingsPath + ".tmp";
+    {
+        std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            if (outLogs) outLogs->push_back("[ERROR] Could not open " + tmpPath + " for writing.");
+            return false;
+        }
+        out.write(newContent.data(), static_cast<std::streamsize>(newContent.size()));
+        out.flush();
+        if (out.fail()) {
+            out.close();
+            unlink(tmpPath.c_str());
+            if (outLogs) outLogs->push_back("[ERROR] Failed to write full XML buffer to " + tmpPath);
+            return false;
+        }
+        out.close();
+    }
+
+    struct stat stTmp;
+    if (stat(tmpPath.c_str(), &stTmp) != 0 || static_cast<size_t>(stTmp.st_size) != newContent.size()) {
+        unlink(tmpPath.c_str());
+        if (outLogs) outLogs->push_back("[ERROR] Temporary MPC.settings size mismatch. Aborting update.");
+        return false;
+    }
+
+    if (std::rename(tmpPath.c_str(), mpcSettingsPath.c_str()) != 0) {
+        unlink(tmpPath.c_str());
+        if (outLogs) outLogs->push_back("[ERROR] Failed to rename " + tmpPath + " to " + mpcSettingsPath);
+        return false;
+    }
+    sync();
+    return true;
+}
+
+// Safely ensures that targetSynthDir is present inside <VALUE name="SynthContentLocations"> in an in-memory XML string.
+// Returns true if the XML string was modified.
+static bool ensureSynthLocationInXmlString(std::string& content, const std::string& targetSynthDir) {
+    if (targetSynthDir.empty() || targetSynthDir[0] != '/') return false;
+    std::string cleanDir = targetSynthDir;
+    while (cleanDir.size() > 1 && cleanDir.back() == '/') cleanDir.pop_back();
+
+    bool modified = false;
+
+    // Safely strip any invalid relative <Location>./Synths</Location> element
+    const std::string badRelTag = "<Location>./Synths</Location>";
+    size_t badPos = 0;
+    while ((badPos = content.find(badRelTag, badPos)) != std::string::npos) {
+        size_t eraseStart = badPos;
+        while (eraseStart > 0 && (content[eraseStart - 1] == ' ' || content[eraseStart - 1] == '\t')) {
+            eraseStart--;
+        }
+        size_t eraseEnd = badPos + badRelTag.size();
+        if (eraseStart > 0 && content[eraseStart - 1] == '\n') {
+            if (eraseEnd < content.size() && content[eraseEnd] == '\r') eraseEnd++;
+            if (eraseEnd < content.size() && content[eraseEnd] == '\n') eraseEnd++;
+            content.erase(eraseStart, eraseEnd - eraseStart);
+        } else {
+            content.erase(badPos, badRelTag.size());
+        }
+        modified = true;
+    }
+
+    std::string escapedDir = xmlEscapeText(cleanDir);
+    std::string expectedTag = "<Location>" + escapedDir + "</Location>";
+    std::string rawExpectedTag = "<Location>" + cleanDir + "</Location>";
+
+    size_t valStart = 0, valOpenEnd = 0, valEnd = 0;
+    bool valSelfClosing = false;
+    if (findValueBlock(content, "SynthContentLocations", valStart, valOpenEnd, valEnd, valSelfClosing)) {
+        if (valSelfClosing) {
+            std::string replacement =
+                std::string("<VALUE name=\"SynthContentLocations\">\n") +
+                "    <SynthContentLocations>\n" +
+                "      " + expectedTag + "\n" +
+                "    </SynthContentLocations>\n" +
+                "  </VALUE>";
+            content.replace(valStart, valEnd - valStart, replacement);
+            modified = true;
+        } else {
+            std::string block = content.substr(valStart, valEnd - valStart);
+            if (block.find(expectedTag) == std::string::npos && block.find(rawExpectedTag) == std::string::npos) {
+                size_t closeLocs = block.find("</SynthContentLocations>");
+                if (closeLocs != std::string::npos) {
+                    size_t absCloseLocs = valStart + closeLocs;
+                    size_t lineStart = absCloseLocs;
+                    while (lineStart > valStart && (content[lineStart - 1] == ' ' || content[lineStart - 1] == '\t')) {
+                        lineStart--;
+                    }
+                    std::string indent = content.substr(lineStart, absCloseLocs - lineStart);
+                    std::string inject = "  " + expectedTag + "\n" + indent;
+                    content.insert(absCloseLocs, inject);
+                    modified = true;
+                } else {
+                    // Check for self-closing <SynthContentLocations/>
+                    size_t innerPos = block.find("<SynthContentLocations");
+                    if (innerPos != std::string::npos) {
+                        size_t absInner = valStart + innerPos;
+                        bool innerSelf = false;
+                        size_t innerEnd = findXmlTagEnd(content, absInner, innerSelf);
+                        if (innerEnd != std::string::npos && innerSelf) {
+                            std::string replacement =
+                                std::string("<SynthContentLocations>\n") +
+                                "      " + expectedTag + "\n" +
+                                "    </SynthContentLocations>";
+                            content.replace(absInner, innerEnd - absInner, replacement);
+                            modified = true;
+                        }
+                    } else {
+                        size_t closeValPos = valEnd - 8; // before </VALUE>
+                        std::string inject =
+                            std::string("  <SynthContentLocations>\n") +
+                            "      " + expectedTag + "\n" +
+                            "    </SynthContentLocations>\n  ";
+                        content.insert(closeValPos, inject);
+                        modified = true;
+                    }
+                }
+            }
+        }
+    } else {
+        size_t propEnd = content.rfind("</PROPERTIES>");
+        if (propEnd != std::string::npos) {
+            std::string block =
+                std::string("  <VALUE name=\"SynthContentLocations\">\n") +
+                "    <SynthContentLocations>\n" +
+                "      " + expectedTag + "\n" +
+                "    </SynthContentLocations>\n" +
+                "  </VALUE>\n";
+            content.insert(propEnd, block);
+            modified = true;
+        }
+    }
+    return modified;
+}
+
+void ConfigParser::ensureManagerSynthsInMpcSettings(std::vector<std::string>* outLogs) {
+    std::string mgrDir = getManagerRootDir();
+    while (mgrDir.size() > 1 && mgrDir.back() == '/') mgrDir.pop_back();
+    std::string defaultMgrSynths = mgrDir + "/Synths";
+    mkdir(defaultMgrSynths.c_str(), 0755);
+
+    std::string mpcSettingsPath = resolveMpcSettingsPath();
+    struct stat st;
+    if (stat(mpcSettingsPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return;
+
+    std::ifstream inFile(mpcSettingsPath, std::ios::binary);
+    if (!inFile.is_open()) return;
+    std::stringstream ss;
+    ss << inFile.rdbuf();
+    std::string content = ss.str();
+    inFile.close();
+    if (content.empty()) return;
+
+    if (ensureSynthLocationInXmlString(content, defaultMgrSynths)) {
+        std::string bakPath;
+        if (backupAndWriteMpcSettings(mpcSettingsPath, content, outLogs, &bakPath)) {
+            std::string msg = "[TKGL-INIT] Added <Location>" + defaultMgrSynths + "</Location> to MPC.settings (backup: " + bakPath + ")";
+            std::printf("%s\n", msg.c_str());
+            if (outLogs) outLogs->push_back(msg);
+        }
+    }
+}
+
+void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std::string>* outLogs) {
+    // 0. Ensure the Manager's Synths subdirectory is present in <SynthContentLocations> of MPC.settings
+    ensureManagerSynthsInMpcSettings(outLogs);
+
+    // 1. Determine MPC.settings file path
+    std::string mpcSettingsPath = resolveMpcSettingsPath();
 
     // 2. Gather all SynthContentLocations from MPC.settings + Manager's Synths + mounted media
     std::vector<SynthLocation> synthLocs = getSynthContentLocations(mpcSettingsPath);
@@ -4914,63 +5649,25 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
         closedir(mediaDir);
     }
 
-    // Remove duplicates from search paths
     std::sort(searchPaths.begin(), searchPaths.end());
     searchPaths.erase(std::unique(searchPaths.begin(), searchPaths.end()), searchPaths.end());
 
-    // 3. Read MPC.settings to check registered plugins in <VALUE name="pluginList-arm"><KNOWNPLUGINS>
+    // 3. Read MPC.settings and extract <PLUGIN .../> entries inside <VALUE name="pluginList-arm">
     std::string mpcSettingsContent;
     std::ifstream fSett(mpcSettingsPath, std::ios::binary);
     if (fSett.is_open()) {
         std::stringstream ss;
         ss << fSett.rdbuf();
         mpcSettingsContent = ss.str();
+        fSett.close();
     }
 
-    struct RegPlugin {
-        std::string rawTag;
-        std::string name;
-        std::string descName;
-        std::string file;
-    };
-    std::vector<RegPlugin> regPlugins;
+    std::vector<MpcPluginXmlEntry> regPlugins;
     if (!mpcSettingsContent.empty()) {
-        size_t armPos = mpcSettingsContent.find("name=\"pluginList-arm\"");
-        size_t searchStart = (armPos != std::string::npos) ? armPos : 0;
-        size_t searchEnd = mpcSettingsContent.size();
-        if (armPos != std::string::npos) {
-            size_t closeVal = mpcSettingsContent.find("</VALUE>", armPos);
-            if (closeVal != std::string::npos) searchEnd = closeVal;
-        }
-
-        size_t ppos = searchStart;
-        while ((ppos = mpcSettingsContent.find("<PLUGIN ", ppos)) != std::string::npos && ppos < searchEnd) {
-            size_t endp = mpcSettingsContent.find("/>", ppos);
-            if (endp == std::string::npos || endp > searchEnd) {
-                endp = mpcSettingsContent.find(">", ppos);
-                if (endp == std::string::npos || endp > searchEnd) break;
-                endp += 1;
-            } else {
-                endp += 2;
-            }
-            std::string tag = mpcSettingsContent.substr(ppos, endp - ppos);
-            ppos = endp;
-
-            RegPlugin rp;
-            rp.rawTag = tag;
-            auto getAttr = [](const std::string& str, const std::string& key) -> std::string {
-                std::string needle = key + "=\"";
-                size_t kpos = str.find(needle);
-                if (kpos == std::string::npos) return "";
-                size_t vstart = kpos + needle.size();
-                size_t vend = str.find("\"", vstart);
-                if (vend == std::string::npos) return "";
-                return str.substr(vstart, vend - vstart);
-            };
-            rp.name = getAttr(tag, "name");
-            rp.descName = getAttr(tag, "descriptiveName");
-            rp.file = getAttr(tag, "file");
-            regPlugins.push_back(rp);
+        size_t valStart = 0, valOpenEnd = 0, valEnd = 0;
+        bool valSelfClosing = false;
+        if (findValueBlock(mpcSettingsContent, "pluginList-arm", valStart, valOpenEnd, valEnd, valSelfClosing) && !valSelfClosing) {
+            regPlugins = extractPluginXmlEntries(mpcSettingsContent, valOpenEnd, valEnd);
         }
     }
 
@@ -4999,7 +5696,6 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
                         outFoundBin = binName;
                         return true;
                     }
-                    // Scan directory for any *.so
                     DIR* pd = opendir(dirPath.c_str());
                     if (pd) {
                         struct dirent* de;
@@ -5020,7 +5716,6 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
                     }
                 }
             }
-            // Direct .so check in basePath
             std::string directSo = basePath + "/" + binName;
             if (stat(directSo.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
                 outFoundSo = directSo;
@@ -5032,52 +5727,81 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
 
     bool mpcSettingsModified = false;
 
-    // 4. For each plugin in each section, verify installation state and MPC.settings integrity
+    // 4. Match each catalog item to at most one <PLUGIN> entry in MPC.settings (2-pass priority:
+    //    Pass 1 matches exact targetSubdir in file="...", Pass 2 matches exact plugin name/id)
+    //    so distinct plugins sharing a binary name (e.g. "OB-Xd" by reales vs "OB-Xd MPC" by sd88me)
+    //    never collide on the same <PLUGIN> entry.
+    std::vector<bool> regClaimed(regPlugins.size(), false);
+    std::unordered_map<std::string, int> itemMatchedRegIdx;
+
+    // Pass 1: Exact subdirectory match in rp.file
+    for (const auto& sec : config.sections) {
+        for (const auto& item : sec.items) {
+            std::string subDir = !item.targetSubdir.empty() ? item.targetSubdir : (item.author + " - VST - " + item.label);
+            std::string altSubDir = item.author + " - VST - " + item.label;
+            for (size_t r = 0; r < regPlugins.size(); ++r) {
+                if (regClaimed[r]) continue;
+                const auto& rp = regPlugins[r];
+                bool subMatch = (!subDir.empty() && rp.file.find("/" + subDir + "/") != std::string::npos) ||
+                                (!altSubDir.empty() && rp.file.find("/" + altSubDir + "/") != std::string::npos);
+                if (subMatch) {
+                    regClaimed[r] = true;
+                    itemMatchedRegIdx[item.id + "::" + item.label] = static_cast<int>(r);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Pass 2: Name / ID match for items not yet matched in Pass 1
+    for (const auto& sec : config.sections) {
+        for (const auto& item : sec.items) {
+            std::string key = item.id + "::" + item.label;
+            if (itemMatchedRegIdx.find(key) != itemMatchedRegIdx.end()) continue;
+            for (size_t r = 0; r < regPlugins.size(); ++r) {
+                if (regClaimed[r]) continue;
+                const auto& rp = regPlugins[r];
+                bool nameMatch = (!item.label.empty() && (rp.name == item.label || rp.descName == item.label));
+                bool idMatch = (!item.id.empty() && (rp.name == item.id || rp.descName == item.id));
+                if (nameMatch || idMatch) {
+                    regClaimed[r] = true;
+                    itemMatchedRegIdx[key] = static_cast<int>(r);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Verify each plugin's installation state and MPC.settings .so path integrity
     for (auto& sec : config.sections) {
         for (auto& item : sec.items) {
             std::string subDir = !item.targetSubdir.empty() ? item.targetSubdir : (item.author + " - VST - " + item.label);
             std::string binName = !item.targetBinary.empty() ? item.targetBinary : (item.id + ".so");
+            std::string key = item.id + "::" + item.label;
 
             int matchedIdx = -1;
-            for (size_t r = 0; r < regPlugins.size(); ++r) {
-                const auto& rp = regPlugins[r];
-                bool nameMatch = (!item.label.empty() && (rp.name == item.label || rp.descName == item.label));
-                bool idMatch = (!item.id.empty() && (rp.name == item.id || rp.descName == item.id));
-                bool fileSubMatch = (!subDir.empty() && rp.file.find("/" + subDir + "/") != std::string::npos);
-                bool fileBinMatch = (!binName.empty() && rp.file.find("/" + binName) != std::string::npos);
-                if (nameMatch || idMatch || fileSubMatch || fileBinMatch) {
-                    matchedIdx = static_cast<int>(r);
-                    break;
-                }
+            auto itMatch = itemMatchedRegIdx.find(key);
+            if (itMatch != itemMatchedRegIdx.end()) {
+                matchedIdx = itMatch->second;
             }
 
-            bool wasDetectedInstalled = item.installed || (matchedIdx >= 0);
-
-            if (wasDetectedInstalled) {
-                // Adjustment 2: Verify existence of the .so file in <KNOWNPLUGINS><PLUGIN file="..."/>
-                bool regFileValid = false;
-                std::string regFilePath;
-                if (matchedIdx >= 0) {
-                    regFilePath = regPlugins[matchedIdx].file;
-                    struct stat stSo;
-                    if (!regFilePath.empty() && stat(regFilePath.c_str(), &stSo) == 0 && S_ISREG(stSo.st_mode)) {
-                        regFileValid = true;
-                        size_t lastSlash = regFilePath.find_last_of('/');
-                        if (lastSlash != std::string::npos) {
-                            item.targetBinary = regFilePath.substr(lastSlash + 1);
-                            size_t prevSlash = regFilePath.find_last_of('/', lastSlash - 1);
-                            if (prevSlash != std::string::npos) {
-                                item.targetSubdir = regFilePath.substr(prevSlash + 1, lastSlash - prevSlash - 1);
-                            }
+            if (matchedIdx >= 0) {
+                // Plugin IS registered in MPC.settings <pluginList-arm><KNOWNPLUGINS>
+                std::string regFilePath = regPlugins[matchedIdx].file;
+                struct stat stSo;
+                if (!regFilePath.empty() && stat(regFilePath.c_str(), &stSo) == 0 && S_ISREG(stSo.st_mode)) {
+                    size_t lastSlash = regFilePath.find_last_of('/');
+                    if (lastSlash != std::string::npos) {
+                        item.targetBinary = regFilePath.substr(lastSlash + 1);
+                        size_t prevSlash = regFilePath.find_last_of('/', lastSlash - 1);
+                        if (prevSlash != std::string::npos) {
+                            item.targetSubdir = regFilePath.substr(prevSlash + 1, lastSlash - prevSlash - 1);
                         }
                     }
-                }
-
-                if (regFileValid) {
                     item.installed = true;
                     item.broken = false;
                 } else {
-                    // The .so file in MPC.settings was not found! Check if it exists somewhere in <SynthContentLocations>
+                    // Registered .so path is missing; check if the plugin's .so was relocated to another SynthContentLocations dir
                     std::string foundSo, foundSubdir, foundBin;
                     if (findSoInSynthLocations(item, subDir, binName, foundSo, foundSubdir, foundBin)) {
                         item.targetSubdir = foundSubdir;
@@ -5085,18 +5809,9 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
                         item.installed = true;
                         item.broken = false;
 
-                        if (matchedIdx >= 0 && !mpcSettingsContent.empty()) {
+                        if (!mpcSettingsContent.empty()) {
                             std::string oldTag = regPlugins[matchedIdx].rawTag;
-                            std::string newTag = oldTag;
-                            std::string fileKey = "file=\"";
-                            size_t fkPos = newTag.find(fileKey);
-                            if (fkPos != std::string::npos) {
-                                size_t fvStart = fkPos + fileKey.size();
-                                size_t fvEnd = newTag.find("\"", fvStart);
-                                if (fvEnd != std::string::npos) {
-                                    newTag.replace(fvStart, fvEnd - fvStart, foundSo);
-                                }
-                            }
+                            std::string newTag = setXmlTagAttribute(oldTag, "file", foundSo);
                             size_t tagPos = mpcSettingsContent.find(oldTag);
                             if (tagPos != std::string::npos && newTag != oldTag) {
                                 mpcSettingsContent.replace(tagPos, oldTag.size(), newTag);
@@ -5111,7 +5826,7 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
                         std::printf("%s\n", warnMsg.c_str());
                         if (outLogs) outLogs->push_back(warnMsg);
                     } else {
-                        // Not found in MPC.settings path nor in any SynthContentLocations -> installation is BROKEN
+                        // Registered in MPC.settings, but .so does not exist anywhere on disk -> BROKEN
                         item.installed = true;
                         item.broken = true;
                         std::string brkMsg = "[WARNING] " + item.label + ": .so file '" +
@@ -5122,7 +5837,7 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
                     }
                 }
             } else {
-                // Not previously marked installed: check if present on disk in SynthContentLocations
+                // Plugin is NOT registered in MPC.settings: check if its folder/.so exists on disk
                 std::string foundSo, foundSubdir, foundBin;
                 if (findSoInSynthLocations(item, subDir, binName, foundSo, foundSubdir, foundBin)) {
                     item.targetSubdir = foundSubdir;
@@ -5137,19 +5852,11 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
         }
     }
 
-    // Save updated MPC.settings if any relocated file="..." properties were repaired
+    // 5. Save updated MPC.settings with XML validation and YYYYMMDDHHMMSS backup if modified
     if (mpcSettingsModified && !mpcSettingsContent.empty()) {
-        std::string bakPath = mpcSettingsPath + ".bak-" + std::to_string(static_cast<long>(std::time(nullptr)));
-        std::ifstream src(mpcSettingsPath, std::ios::binary);
-        std::ofstream bak(bakPath, std::ios::binary | std::ios::trunc);
-        if (src.is_open() && bak.is_open()) {
-            bak << src.rdbuf();
-        }
-        std::ofstream outSett(mpcSettingsPath, std::ios::binary | std::ios::trunc);
-        if (outSett.is_open()) {
-            outSett << mpcSettingsContent;
-            outSett.close();
-            if (outLogs) outLogs->push_back("[TKGL-SYNC] Updated relocated plugin file paths in " + mpcSettingsPath);
+        std::string bakPath;
+        if (backupAndWriteMpcSettings(mpcSettingsPath, mpcSettingsContent, outLogs, &bakPath)) {
+            if (outLogs) outLogs->push_back("[TKGL-SYNC] Updated relocated plugin file paths in " + mpcSettingsPath + " (backup: " + bakPath + ")");
         }
     }
 }
@@ -5157,8 +5864,6 @@ void ConfigParser::refreshInstallStates(LauncherConfig& config, std::vector<std:
 std::vector<SynthLocation> ConfigParser::getSynthContentLocations(const std::string& mpcSettingsPath) {
     std::vector<SynthLocation> locs;
 
-    // Rule 2 & 3: Manager's subfolder "Synths" is always added as an ABSOLUTE path
-    // Uses PLG_MAN_DIR if defined, otherwise /proc/self/exe directory
     std::string mgrDir = getManagerRootDir();
     std::string defaultMgrSynths = mgrDir + "/Synths";
     mkdir(defaultMgrSynths.c_str(), 0755);
@@ -5192,25 +5897,23 @@ std::vector<SynthLocation> ConfigParser::getSynthContentLocations(const std::str
     mgrLoc.isManagerDefault = true;
     locs.push_back(mgrLoc);
 
-    // Read MPC.settings for registered SynthContentLocations
+    // Read MPC.settings for registered SynthContentLocations using quote-safe findValueBlock
     std::ifstream f(mpcSettingsPath, std::ios::binary);
     if (f.is_open()) {
         std::stringstream ss;
         ss << f.rdbuf();
         std::string content = ss.str();
-        const char* locKey = "<VALUE name=\"SynthContentLocations\">";
-        size_t pos = content.find(locKey);
-        if (pos != std::string::npos) {
-            size_t endPos = content.find("</VALUE>", pos);
-            std::string sub = content.substr(pos, endPos - pos);
+        size_t valStart = 0, valOpenEnd = 0, valEnd = 0;
+        bool valSelfClosing = false;
+        if (findValueBlock(content, "SynthContentLocations", valStart, valOpenEnd, valEnd, valSelfClosing) && !valSelfClosing) {
+            std::string sub = content.substr(valOpenEnd, valEnd - valOpenEnd);
             size_t tag = 0;
             while ((tag = sub.find("<Location>", tag)) != std::string::npos) {
                 size_t closeTag = sub.find("</Location>", tag);
                 if (closeTag == std::string::npos) break;
-                std::string path = sub.substr(tag + 10, closeTag - (tag + 10));
+                std::string path = xmlUnescape(sub.substr(tag + 10, closeTag - (tag + 10)));
                 tag = closeTag + 11;
                 while (path.size() > 1 && path.back() == '/') path.pop_back();
-                // Only keep absolute paths, ignore relative ./Synths or duplicate of defaultMgrSynths
                 if (!path.empty() && path[0] == '/' && path != defaultMgrSynths && path != "./Synths") {
                     bool alreadyIn = false;
                     for (const auto& l : locs) { if (l.path == path) { alreadyIn = true; break; } }
@@ -5264,6 +5967,21 @@ std::vector<SynthLocation> ConfigParser::getSynthContentLocations(const std::str
     return locs;
 }
 
+// Helper: Removes a span [elemStart, elemEnd) from an XML string along with its line indentation and trailing newline
+static void eraseXmlElementLineCleanly(std::string& xml, size_t elemStart, size_t elemEnd) {
+    size_t lineStart = elemStart;
+    while (lineStart > 0 && (xml[lineStart - 1] == ' ' || xml[lineStart - 1] == '\t')) {
+        lineStart--;
+    }
+    size_t lineEnd = elemEnd;
+    while (lineEnd < xml.size() && (xml[lineEnd] == ' ' || xml[lineEnd] == '\t')) {
+        lineEnd++;
+    }
+    if (lineEnd < xml.size() && xml[lineEnd] == '\r') lineEnd++;
+    if (lineEnd < xml.size() && xml[lineEnd] == '\n') lineEnd++;
+    xml.erase(lineStart, lineEnd - lineStart);
+}
+
 int ConfigParser::executeItemInstall(
     const LauncherConfig& cfg,
     const MenuItem& item,
@@ -5277,32 +5995,23 @@ int ConfigParser::executeItemInstall(
     std::string synthDir = (targetSynthDir.empty() || targetSynthDir == "./Synths") ? defaultMgrSynths : targetSynthDir;
     while (synthDir.size() > 1 && synthDir.back() == '/') synthDir.pop_back();
 
-    std::time_t ts = std::time(nullptr);
-    std::string tsStr = std::to_string(static_cast<long>(ts));
+    std::string tsStr = getBackupTimestampYYYYMMDDHHMMSS();
+    std::string mpcSettings = resolveMpcSettingsPath();
+    std::string defaultSubdir = !item.targetSubdir.empty() ? item.targetSubdir : (item.author + " - VST - " + item.label);
+    std::string defaultBin    = !item.targetBinary.empty() ? item.targetBinary : (item.id + ".so");
 
-    // Discover MPC.settings file
-    std::string mpcSettings = "/media/az01-internal/Settings/MPC/MPC.settings";
-    const char* candMpc[] = {
-        "/media/az01-internal/Settings/MPC/MPC.settings",
-        "/media/internal/Settings/MPC/MPC.settings",
-        "/var/lib/MPC/MPC.settings",
-        "/root/.config/Akai/MPC/MPC.settings"
+    auto emitLog = [&](const std::string& line) {
+        outLogs.push_back(line);
+        if (onProgress) onProgress(line);
     };
-    for (const char* cp : candMpc) {
-        struct stat st;
-        if (stat(cp, &st) == 0 && S_ISREG(st.st_mode)) {
-            mpcSettings = cp;
-            break;
-        }
-    }
 
-    char scriptPath[] = "/tmp/tkgl_inst_XXXXXX";
-    int fd = mkstemp(scriptPath);
-    if (fd < 0) {
-        outLogs.push_back("[ERROR] Could not create temp installer script.");
-        return -1;
-    }
+    emitLog("[TKGL-INSTALL] Step 1/4 (Gold Rule): Preparing MPC.settings backup (" + tsStr + ")...");
 
+    // Step 2: Ensure target Synth directory exists on disk
+    mkdir(synthDir.c_str(), 0755);
+    emitLog("[TKGL-INSTALL] Step 2/4: Target Synth location: " + synthDir);
+
+    // Step 3A: Download package via wget
     std::string pkgUrl = item.downloadUrl;
     if (pkgUrl.empty() && !item.cmd.empty()) {
         size_t hpos = item.cmd.find("https://");
@@ -5314,48 +6023,17 @@ int ConfigParser::executeItemInstall(
         }
     }
 
-    std::ostringstream ss;
-    ss << "#!/bin/sh\n";
-    ss << "export PLG_MAN_DIR=\"" << mgrDir << "\"\n";
-    ss << "cd \"$PLG_MAN_DIR\" 2>/dev/null || true\n";
-    ss << "SYNTH_DIR=\"" << synthDir << "\"\n";
-    ss << "MPC_SETT=\"" << mpcSettings << "\"\n";
-    ss << "TS=\"" << tsStr << "\"\n";
-    ss << "ITEM_LABEL=\"" << item.label << "\"\n";
-    ss << "ITEM_AUTHOR=\"" << item.author << "\"\n";
-    ss << "ITEM_VER=\"" << item.version << "\"\n";
-    ss << "ITEM_CAT=\"" << item.category << "\"\n";
-    ss << "DEFAULT_SUBDIR=\"" << (!item.targetSubdir.empty() ? item.targetSubdir : (item.author + " - VST - " + item.label)) << "\"\n";
-    ss << "DEFAULT_BIN=\"" << (!item.targetBinary.empty() ? item.targetBinary : (item.id + ".so")) << "\"\n";
-
-    ss << "echo \"[TKGL-INSTALL] Step 1/4 (Gold Rule): Backing up MPC.settings...\"\n";
-    ss << "if [ -f \"$MPC_SETT\" ]; then\n";
-    ss << "  cp -f \"$MPC_SETT\" \"${MPC_SETT}.bak-${TS}\"\n";
-    ss << "  echo \"[TKGL-INSTALL] Backup created: ${MPC_SETT}.bak-${TS}\"\n";
-    ss << "fi\n";
-
-    ss << "echo \"[TKGL-INSTALL] Step 2/4: Ensuring SynthContentLocations has $SYNTH_DIR...\"\n";
-    ss << "mkdir -p \"$SYNTH_DIR\"\n";
-    ss << "if [ -f \"$MPC_SETT\" ]; then\n";
-    ss << "  # Strip erroneous relative ./Synths if present\n";
-    ss << "  awk '!index($0, \"<Location>./Synths</Location>\")' \"$MPC_SETT\" > \"${MPC_SETT}.tmp\" && mv \"${MPC_SETT}.tmp\" \"$MPC_SETT\" 2>/dev/null || true\n";
-    ss << "  if ! grep -q \"<Location>$SYNTH_DIR</Location>\" \"$MPC_SETT\"; then\n";
-    ss << "    awk -v loc=\"      <Location>$SYNTH_DIR</Location>\" '\n";
-    ss << "      index($0, \"name=\\\"SynthContentLocations\\\"\") { in_synth=1 }\n";
-    ss << "      in_synth && index($0, \"</SynthContentLocations>\") { print loc; in_synth=0 }\n";
-    ss << "      { print }\n";
-    ss << "    ' \"$MPC_SETT\" > \"${MPC_SETT}.tmp\" && mv \"${MPC_SETT}.tmp\" \"$MPC_SETT\"\n";
-    ss << "    echo \"[TKGL-INSTALL] Added $SYNTH_DIR to SynthContentLocations\"\n";
-    ss << "  fi\n";
-    ss << "fi\n";
-
-    // Step 3A: Pre-download package directly in C++ via native libcurl.so.4 / libcurl.so.4.8.0 (dlopen)
     std::string tmpZipPath = "/tmp/" + item.id + "_" + tsStr + ".zip";
     if (!pkgUrl.empty()) {
+        std::string pingHost = cfg.ping_host.empty() ? "github.com" : cfg.ping_host;
+        if (!checkInternetReachable(pingHost, &outLogs)) {
+            emitLog("[ERROR] No internet connection (ping " + pingHost + " failed). Download aborted.");
+            return -1;
+        }
+
         std::string sizeLabel = item.sizeMb.empty() ? "ZIP" : item.sizeMb;
-        std::string dlMsg = "[TKGL-INSTALL] Step 3/4: Downloading " + item.label + " (" + sizeLabel + ") via libcurl.so.4...";
-        outLogs.push_back(dlMsg);
-        if (onProgress) onProgress(dlMsg);
+        emitLog("[TKGL-INSTALL] Step 3/4: Downloading " + item.label + " (" + sizeLabel + ") via wget...");
+        emitLog("[TKGL-NET] Source: " + pkgUrl);
 
         bool preDownloaded = downloadFile(pkgUrl, tmpZipPath, 180, [&](const std::string& progLine) {
             if (onProgress) onProgress(progLine);
@@ -5365,51 +6043,46 @@ int ConfigParser::executeItemInstall(
             struct stat stZip;
             double mb = (stat(tmpZipPath.c_str(), &stZip) == 0) ? (static_cast<double>(stZip.st_size) / 1048576.0) : 0.0;
             char doneBuf[128];
-            std::snprintf(doneBuf, sizeof(doneBuf), "[TKGL-NET] libcurl.so.4 download complete (%.2f MB).", mb);
-            outLogs.push_back(doneBuf);
-            if (onProgress) onProgress(doneBuf);
+            std::snprintf(doneBuf, sizeof(doneBuf), "[TKGL-NET] Download complete (%.2f MB).", mb);
+            emitLog(doneBuf);
         } else {
-            outLogs.push_back("[TKGL-NET] Notice: direct libcurl.so.4 download did not complete, trying shell fallback...");
+            emitLog("[ERROR] wget download failed for: " + pkgUrl);
+            unlink(tmpZipPath.c_str());
+            return -1;
         }
+    } else {
+        emitLog("[TKGL-NET] Warning: No download URL configured for " + item.label + " (" + item.id + ").");
     }
 
-    ss << "echo \"[TKGL-INSTALL] Step 3/4: Deploying portable/ subdirectory...\"\n";
+    // Step 3B: Extract package to $SYNTH_DIR and record the extracted directory path to /tmp/tkgl_target_dir_<ts>
+    char scriptPath[] = "/tmp/tkgl_inst_XXXXXX";
+    int fd = mkstemp(scriptPath);
+    if (fd < 0) {
+        outLogs.push_back("[ERROR] Could not create temp installer script.");
+        return -1;
+    }
+    std::string outTargetDirFile = std::string(scriptPath) + ".dir";
+
+    std::ostringstream ss;
+    ss << "#!/bin/sh\n";
+    ss << "export PLG_MAN_DIR=\"" << mgrDir << "\"\n";
+    ss << "cd \"$PLG_MAN_DIR\" 2>/dev/null || true\n";
+    ss << "SYNTH_DIR=\"" << synthDir << "\"\n";
+    ss << "TS=\"" << tsStr << "\"\n";
+    ss << "DEFAULT_SUBDIR=\"" << defaultSubdir << "\"\n";
+    ss << "mkdir -p \"$SYNTH_DIR\"\n";
+    ss << "echo \"[TKGL-INSTALL] Extracting portable/ plugin bundle...\"\n";
+
     if (!pkgUrl.empty()) {
-        ss << "PKG_URL=\"" << pkgUrl << "\"\n";
         ss << "TMP_ZIP=\"" << tmpZipPath << "\"\n";
         ss << "TMP_EXT=\"/tmp/" << item.id << "_${TS}_pkg\"\n";
         ss << "rm -rf \"$TMP_EXT\"\n";
         ss << "mkdir -p \"$TMP_EXT\"\n";
         ss << "if [ ! -s \"$TMP_ZIP\" ]; then\n";
-        ss << "  echo \"[TKGL-INSTALL] Source: $PKG_URL\"\n";
-        ss << "  tkgl_dl() {\n";
-        ss << "    _URL=\"$1\"\n";
-        ss << "    _OUT=\"$2\"\n";
-        ss << "    rm -f \"$_OUT\"\n";
-        ss << "    /proc/self/exe --fetch \"$_URL\" \"$_OUT\" 2>/dev/null && [ -s \"$_OUT\" ] && return 0\n";
-        ss << "    if command -v wget >/dev/null 2>&1; then\n";
-        ss << "      wget --no-check-certificate -q -O \"$_OUT\" \"$_URL\" 2>/dev/null && [ -s \"$_OUT\" ] && return 0\n";
-        ss << "      rm -f \"$_OUT\"\n";
-        ss << "      wget -q -O \"$_OUT\" \"$_URL\" 2>/dev/null && [ -s \"$_OUT\" ] && return 0\n";
-        ss << "      rm -f \"$_OUT\"\n";
-        ss << "    fi\n";
-        ss << "    if command -v python3 >/dev/null 2>&1; then\n";
-        ss << "      python3 -c 'import urllib.request,ssl,shutil,sys; ctx=ssl._create_unverified_context(); req=urllib.request.Request(sys.argv[1],headers={\"User-Agent\":\"Wget/1.21\"}); r=urllib.request.urlopen(req,context=ctx,timeout=60); f=open(sys.argv[2],\"wb\"); shutil.copyfileobj(r,f,65536); f.close()' \"$_URL\" \"$_OUT\" 2>/dev/null && [ -s \"$_OUT\" ] && return 0\n";
-        ss << "      rm -f \"$_OUT\"\n";
-        ss << "    fi\n";
-        ss << "    return 1\n";
-        ss << "  }\n";
-        ss << "  tkgl_dl \"$PKG_URL\" \"$TMP_ZIP\" || true\n";
-        ss << "fi\n";
-        ss << "if [ ! -s \"$TMP_ZIP\" ]; then\n";
-        ss << "  echo \"[ERROR] Download failed (0 bytes received) from $PKG_URL\"\n";
+        ss << "  echo \"[ERROR] Downloaded archive missing or empty: $TMP_ZIP\"\n";
         ss << "  rm -rf \"$TMP_ZIP\" \"$TMP_EXT\"\n";
         ss << "  exit 1\n";
         ss << "fi\n";
-        ss << "FINAL_SZ=$(stat -c%s \"$TMP_ZIP\" 2>/dev/null || wc -c < \"$TMP_ZIP\" 2>/dev/null | tr -d ' ' || echo 0)\n";
-        ss << "[ -z \"$FINAL_SZ\" ] && FINAL_SZ=0\n";
-        ss << "FINAL_MB=$(awk -v s=\"$FINAL_SZ\" 'BEGIN { printf \"%.1f\", (s + 0) / 1048576 }')\n";
-        ss << "echo \"[TKGL-INSTALL] Package ready (${FINAL_MB} MB). Extracting archive...\"\n";
         ss << "if ! unzip -q -o \"$TMP_ZIP\" -d \"$TMP_EXT\"; then\n";
         ss << "  echo \"[ERROR] Failed to unzip $TMP_ZIP\"\n";
         ss << "  rm -rf \"$TMP_ZIP\" \"$TMP_EXT\"\n";
@@ -5448,75 +6121,8 @@ int ConfigParser::executeItemInstall(
         ss << "fi\n";
     }
     ss << "chmod -R 755 \"$TARGET_DIR\" 2>/dev/null || true\n";
-
-    ss << "echo \"[TKGL-INSTALL] Step 4/4: Registering in MPC.settings pluginList-arm...\"\n";
-    ss << "if [ -f \"$MPC_SETT\" ]; then\n";
-    ss << "  META_LINE=\"\"\n";
-    ss << "  if [ -f \"$TARGET_DIR/plugin-meta.xml\" ]; then\n";
-    ss << "    if grep -q \"%payload-path%/$PLUGIN_DIR_NAME\" \"$TARGET_DIR/plugin-meta.xml\"; then\n";
-    ss << "      META_LINE=$(grep \"<PLUGIN \" \"$TARGET_DIR/plugin-meta.xml\" | sed \"s|%payload-path%|$SYNTH_DIR|g\" | tr -d '\r')\n";
-    ss << "    else\n";
-    ss << "      META_LINE=$(grep \"<PLUGIN \" \"$TARGET_DIR/plugin-meta.xml\" | sed \"s|%payload-path%|$TARGET_DIR|g\" | tr -d '\r')\n";
-    ss << "    fi\n";
-    ss << "  fi\n";
-    ss << "  if [ -z \"$META_LINE\" ]; then\n";
-    ss << "    SO_FILE=$(find \"$TARGET_DIR\" -name \"*.so\" | head -n 1)\n";
-    ss << "    if [ -n \"$SO_FILE\" ]; then\n";
-    ss << "      META_LINE=\"<PLUGIN name=\\\"$ITEM_LABEL\\\" descriptiveName=\\\"$ITEM_LABEL\\\" format=\\\"VST\\\" category=\\\"$ITEM_CAT\\\" manufacturer=\\\"$ITEM_AUTHOR\\\" version=\\\"$ITEM_VER\\\" file=\\\"$SO_FILE\\\" isInstrument=\\\"1\\\" fileTime=\\\"0\\\" infoUpdateTime=\\\"0\\\" numInputs=\\\"0\\\" numOutputs=\\\"2\\\" isShell=\\\"0\\\"/>\"\n";
-    ss << "    fi\n";
-    ss << "  fi\n";
-    ss << "  if [ -n \"$META_LINE\" ]; then\n";
-    ss << "    if ! grep -q 'name=\"pluginList-arm\"' \"$MPC_SETT\"; then\n";
-    ss << "      awk '\n";
-    ss << "        index($0, \"</PROPERTIES>\") {\n";
-    ss << "          print \"  <VALUE name=\\\"pluginList-arm\\\">\"\n";
-    ss << "          print \"    <KNOWNPLUGINS>\"\n";
-    ss << "          print \"    </KNOWNPLUGINS>\"\n";
-    ss << "          print \"  </VALUE>\"\n";
-    ss << "        }\n";
-    ss << "        { print }\n";
-    ss << "      ' \"$MPC_SETT\" > \"${MPC_SETT}.tmp\" && mv \"${MPC_SETT}.tmp\" \"$MPC_SETT\"\n";
-    ss << "    fi\n";
-    ss << "    # Purge any previous or broken registration lines in MPC.settings\n";
-    ss << "    awk -v pdir=\"$PLUGIN_DIR_NAME\" -v defdir=\"$DEFAULT_SUBDIR\" -v defbin=\"$DEFAULT_BIN\" -v pname=\"name=\\\"$ITEM_LABEL\\\"\" -v is_repair=\"" << (item.broken ? "1" : "0") << "\" '\n";
-    ss << "      index($0, \"<PLUGIN \") {\n";
-    ss << "        if ((length(pdir) > 2 && index($0, pdir)) || (length(defdir) > 2 && index($0, defdir)) || (length(defbin) > 2 && index($0, defbin)) || (length(pname) > 6 && index($0, pname))) {\n";
-    ss << "          next\n";
-    ss << "        }\n";
-    ss << "        if (is_repair == \"1\" && match($0, /file=\"[^\"]+\"/)) {\n";
-    ss << "          fpath = substr($0, RSTART + 6, RLENGTH - 7)\n";
-    ss << "          cmd = \"test -f \\\"\" fpath \"\\\"\"\n";
-    ss << "          if (system(cmd) != 0) {\n";
-    ss << "            next\n";
-    ss << "          }\n";
-    ss << "        }\n";
-    ss << "      }\n";
-    ss << "      { print }\n";
-    ss << "    ' \"$MPC_SETT\" > \"${MPC_SETT}.tmp\" && mv \"${MPC_SETT}.tmp\" \"$MPC_SETT\"\n";
-    ss << "    # Insert new clean registration line into pluginList-arm\n";
-    ss << "    awk -v newline=\"      $META_LINE\" '\n";
-    ss << "      index($0, \"name=\\\"pluginList-arm\\\"\") { in_arm=1 }\n";
-    ss << "      in_arm && index($0, \"<KNOWNPLUGINS/>\") {\n";
-    ss << "        print \"    <KNOWNPLUGINS>\"\n";
-    ss << "        print newline\n";
-    ss << "        print \"    </KNOWNPLUGINS>\"\n";
-    ss << "        in_arm=0\n";
-    ss << "        next\n";
-    ss << "      }\n";
-    ss << "      in_arm && index($0, \"</KNOWNPLUGINS>\") {\n";
-    ss << "        print newline\n";
-    ss << "        in_arm=0\n";
-    ss << "      }\n";
-    ss << "      { print }\n";
-    ss << "    ' \"$MPC_SETT\" > \"${MPC_SETT}.tmp\" && mv \"${MPC_SETT}.tmp\" \"$MPC_SETT\"\n";
-    ss << "    echo \"[TKGL-INSTALL] Clean plugin entry registered in KNOWNPLUGINS:\"\n";
-    ss << "    echo \"  $META_LINE\"\n";
-    ss << "  else\n";
-    ss << "    echo \"[WARNING] No <PLUGIN ... /> line found or created for $TARGET_DIR\"\n";
-    ss << "  fi\n";
-    ss << "fi\n";
+    ss << "printf '%s' \"$TARGET_DIR\" > \"" << outTargetDirFile << "\"\n";
     ss << "sync\n";
-    ss << "echo \"[TKGL-INSTALL] SUCCESS: $PLUGIN_DIR_NAME " << (item.broken ? "repaired" : "installed") << " in $SYNTH_DIR\"\n";
 
     std::string sBody = ss.str();
     ssize_t written = write(fd, sBody.c_str(), sBody.size());
@@ -5527,7 +6133,8 @@ int ConfigParser::executeItemInstall(
     std::string runCmd = std::string("/bin/sh ") + scriptPath + " 2>&1; rm -f " + scriptPath;
     FILE* pipe = popen(runCmd.c_str(), "r");
     if (!pipe) {
-        outLogs.push_back("[ERROR] Failed to run installer script.");
+        unlink(outTargetDirFile.c_str());
+        outLogs.push_back("[ERROR] Failed to run extraction script.");
         return -1;
     }
 
@@ -5535,29 +6142,234 @@ int ConfigParser::executeItemInstall(
     while (fgets(line, sizeof(line), pipe)) {
         line[strcspn(line, "\r\n")] = 0;
         if (line[0] == 0) continue;
-        outLogs.emplace_back(line);
-        if (onProgress) {
-            onProgress(line);
+        emitLog(line);
+    }
+    int extractRc = pclose(pipe);
+
+    std::string targetDir = synthDir + "/" + defaultSubdir;
+    {
+        std::ifstream dirFile(outTargetDirFile, std::ios::binary);
+        if (dirFile.is_open()) {
+            std::stringstream dss;
+            dss << dirFile.rdbuf();
+            if (!dss.str().empty()) targetDir = dss.str();
+            dirFile.close();
+        }
+        unlink(outTargetDirFile.c_str());
+    }
+    if (extractRc != 0) {
+        return extractRc;
+    }
+
+    std::string pluginDirName = defaultSubdir;
+    size_t lastSlash = targetDir.find_last_of('/');
+    if (lastSlash != std::string::npos && lastSlash + 1 < targetDir.size()) {
+        pluginDirName = targetDir.substr(lastSlash + 1);
+    }
+
+    // Step 4: Register in MPC.settings using our multi-line-safe C++ XML parser & validator
+    emitLog("[TKGL-INSTALL] Step 4/4: Registering in MPC.settings <pluginList-arm><KNOWNPLUGINS>...");
+    struct stat stSett;
+    if (stat(mpcSettings.c_str(), &stSett) == 0 && S_ISREG(stSett.st_mode)) {
+        std::ifstream inSett(mpcSettings, std::ios::binary);
+        std::stringstream sss;
+        sss << inSett.rdbuf();
+        std::string settXml = sss.str();
+        inSett.close();
+
+        if (!settXml.empty()) {
+            // 4A. Ensure synthDir is in <SynthContentLocations>
+            ensureSynthLocationInXmlString(settXml, synthDir);
+
+            // 4B. Build clean single-line <PLUGIN .../> tag(s) from plugin-meta.xml or .so scan
+            std::vector<std::string> newPluginTags;
+            std::string metaXmlPath = targetDir + "/plugin-meta.xml";
+            std::ifstream metaFile(metaXmlPath, std::ios::binary);
+            if (metaFile.is_open()) {
+                std::stringstream mss;
+                mss << metaFile.rdbuf();
+                std::string metaXml = mss.str();
+                metaFile.close();
+                auto metaEntries = extractPluginXmlEntries(metaXml, 0, metaXml.size());
+                for (const auto& me : metaEntries) {
+                    std::string singleTag = normalizeSingleLineXmlTag(me.rawTag);
+                    std::string rawFileAttr = getXmlTagAttribute(singleTag, "file");
+                    if (!rawFileAttr.empty()) {
+                        std::string resolvedFile = rawFileAttr;
+                        const std::string token = "%payload-path%";
+                        size_t tpos = resolvedFile.find(token);
+                        if (tpos != std::string::npos) {
+                            std::string cand1 = resolvedFile;
+                            cand1.replace(tpos, token.size(), synthDir);
+                            std::string cand2 = resolvedFile;
+                            cand2.replace(tpos, token.size(), targetDir);
+                            struct stat stSo;
+                            if (stat(cand1.c_str(), &stSo) == 0) {
+                                resolvedFile = cand1;
+                            } else if (stat(cand2.c_str(), &stSo) == 0) {
+                                resolvedFile = cand2;
+                            } else {
+                                resolvedFile = (rawFileAttr.find(token + "/" + pluginDirName) != std::string::npos) ? cand1 : cand2;
+                            }
+                        }
+                        singleTag = setXmlTagAttribute(singleTag, "file", resolvedFile);
+                    }
+                    newPluginTags.push_back(singleTag);
+                }
+            }
+
+            if (newPluginTags.empty()) {
+                // Fallback: scan targetDir for *.so
+                std::string foundSo;
+                std::string prefSo = targetDir + "/" + defaultBin;
+                struct stat stSo;
+                if (stat(prefSo.c_str(), &stSo) == 0 && S_ISREG(stSo.st_mode)) {
+                    foundSo = prefSo;
+                } else {
+                    DIR* d = opendir(targetDir.c_str());
+                    if (d) {
+                        struct dirent* de;
+                        while ((de = readdir(d)) != nullptr) {
+                            size_t len = std::strlen(de->d_name);
+                            if (len > 3 && std::strcmp(de->d_name + len - 3, ".so") == 0) {
+                                foundSo = targetDir + "/" + de->d_name;
+                                break;
+                            }
+                        }
+                        closedir(d);
+                    }
+                }
+                if (!foundSo.empty()) {
+                    std::string isInst = (item.shortType == "FX") ? "0" : "1";
+                    std::string nIn    = (item.shortType == "FX") ? "2" : "0";
+                    std::string genTag =
+                        "<PLUGIN name=\"" + xmlEscapeAttr(item.label) +
+                        "\" descriptiveName=\"" + xmlEscapeAttr(item.label) +
+                        "\" format=\"VST\" category=\"" + xmlEscapeAttr(item.category) +
+                        "\" manufacturer=\"" + xmlEscapeAttr(item.author) +
+                        "\" version=\"" + xmlEscapeAttr(item.version) +
+                        "\" file=\"" + xmlEscapeAttr(foundSo) +
+                        "\" isInstrument=\"" + isInst +
+                        "\" fileTime=\"0\" infoUpdateTime=\"0\" numInputs=\"" + nIn +
+                        "\" numOutputs=\"2\" isShell=\"0\"/>";
+                    newPluginTags.push_back(genTag);
+                }
+            }
+
+            if (!newPluginTags.empty()) {
+                // 4C. Ensure <VALUE name="pluginList-arm"> exists and is not self-closing
+                size_t armStart = 0, armOpenEnd = 0, armEnd = 0;
+                bool armSelfClosing = false;
+                if (!findValueBlock(settXml, "pluginList-arm", armStart, armOpenEnd, armEnd, armSelfClosing)) {
+                    size_t propEnd = settXml.rfind("</PROPERTIES>");
+                    if (propEnd != std::string::npos) {
+                        std::string armBlock =
+                            "  <VALUE name=\"pluginList-arm\">\n"
+                            "    <KNOWNPLUGINS>\n"
+                            "    </KNOWNPLUGINS>\n"
+                            "  </VALUE>\n";
+                        settXml.insert(propEnd, armBlock);
+                    }
+                } else if (armSelfClosing) {
+                    std::string armBlock =
+                        "<VALUE name=\"pluginList-arm\">\n"
+                        "    <KNOWNPLUGINS>\n"
+                        "    </KNOWNPLUGINS>\n"
+                        "  </VALUE>";
+                    settXml.replace(armStart, armEnd - armStart, armBlock);
+                }
+
+                // 4D. Re-locate pluginList-arm block and purge any previous/duplicate/broken <PLUGIN .../> entries
+                if (findValueBlock(settXml, "pluginList-arm", armStart, armOpenEnd, armEnd, armSelfClosing) && !armSelfClosing) {
+                    auto existing = extractPluginXmlEntries(settXml, armOpenEnd, armEnd);
+                    for (int idx = static_cast<int>(existing.size()) - 1; idx >= 0; --idx) {
+                        const auto& ep = existing[idx];
+                        bool matchesThisPlugin = false;
+                        if (!item.label.empty() && (ep.name == item.label || ep.descName == item.label)) matchesThisPlugin = true;
+                        if (!item.id.empty() && (ep.name == item.id || ep.descName == item.id)) matchesThisPlugin = true;
+                        if (!pluginDirName.empty() && ep.file.find("/" + pluginDirName + "/") != std::string::npos) matchesThisPlugin = true;
+                        if (!defaultSubdir.empty() && ep.file.find("/" + defaultSubdir + "/") != std::string::npos) matchesThisPlugin = true;
+                        if (!defaultBin.empty() && ep.file.find("/" + defaultBin) != std::string::npos) matchesThisPlugin = true;
+                        for (const auto& nt : newPluginTags) {
+                            std::string ntName = getXmlTagAttribute(nt, "name");
+                            std::string ntFile = getXmlTagAttribute(nt, "file");
+                            if (!ntName.empty() && ep.name == ntName) matchesThisPlugin = true;
+                            if (!ntFile.empty() && ep.file == ntFile) matchesThisPlugin = true;
+                        }
+
+                        bool isBrokenEntry = false;
+                        if (item.broken && !ep.file.empty()) {
+                            struct stat stCheck;
+                            if (stat(ep.file.c_str(), &stCheck) != 0) {
+                                isBrokenEntry = true;
+                            }
+                        }
+
+                        if (matchesThisPlugin || isBrokenEntry) {
+                            eraseXmlElementLineCleanly(settXml, ep.startPos, ep.endPos);
+                        }
+                    }
+                }
+
+                // 4E. Insert the new clean <PLUGIN .../> entry/entries into <KNOWNPLUGINS>
+                if (findValueBlock(settXml, "pluginList-arm", armStart, armOpenEnd, armEnd, armSelfClosing) && !armSelfClosing) {
+                    std::string block = settXml.substr(armStart, armEnd - armStart);
+                    std::string allNewLines;
+                    for (const auto& nt : newPluginTags) {
+                        allNewLines += "      " + nt + "\n";
+                    }
+
+                    size_t closeKp = block.find("</KNOWNPLUGINS>");
+                    if (closeKp != std::string::npos) {
+                        size_t absCloseKp = armStart + closeKp;
+                        size_t lineStart = absCloseKp;
+                        while (lineStart > armStart && (settXml[lineStart - 1] == ' ' || settXml[lineStart - 1] == '\t')) {
+                            lineStart--;
+                        }
+                        settXml.insert(lineStart, allNewLines);
+                    } else {
+                        size_t kpPos = block.find("<KNOWNPLUGINS");
+                        if (kpPos != std::string::npos) {
+                            size_t absKp = armStart + kpPos;
+                            bool kpSelf = false;
+                            size_t kpEnd = findXmlTagEnd(settXml, absKp, kpSelf);
+                            if (kpEnd != std::string::npos && kpSelf) {
+                                std::string replacement = "<KNOWNPLUGINS>\n" + allNewLines + "    </KNOWNPLUGINS>";
+                                settXml.replace(absKp, kpEnd - absKp, replacement);
+                            }
+                        } else {
+                            size_t closeValPos = armEnd - 8;
+                            std::string inject = "  <KNOWNPLUGINS>\n" + allNewLines + "    </KNOWNPLUGINS>\n  ";
+                            settXml.insert(closeValPos, inject);
+                        }
+                    }
+                }
+
+                // 4F. Validate XML integrity, create MPC.settings.bak-YYYYMMDDHHMMSS backup, and write atomically
+                std::string bakPath;
+                if (backupAndWriteMpcSettings(mpcSettings, settXml, &outLogs, &bakPath)) {
+                    emitLog("[TKGL-INSTALL] Backup saved: " + bakPath);
+                    emitLog("[TKGL-INSTALL] Clean plugin entry registered in MPC.settings KNOWNPLUGINS.");
+                } else {
+                    return -1;
+                }
+            }
         }
     }
-    return pclose(pipe);
+
+    emitLog("[TKGL-INSTALL] SUCCESS: " + pluginDirName + " " + (item.broken ? "repaired" : "installed") + " in " + synthDir);
+    return 0;
 }
 
 int ConfigParser::executeItemUninstall(
     const LauncherConfig& cfg,
     const MenuItem& item,
     std::vector<std::string>& outLogs,
-    const std::function<void(const std::string&)>& onProgress
+    std::function<void(const std::string&)> onProgress
 ) {
     (void)cfg;
     std::string mgrDir = getManagerRootDir();
-    char scriptPath[] = "/tmp/tkgl_uninst_XXXXXX";
-    int fd = mkstemp(scriptPath);
-    if (fd < 0) {
-        outLogs.push_back("[ERROR] Failed to create temporary uninstall script in /tmp.");
-        return -1;
-    }
-
+    std::string mpcSettings = resolveMpcSettingsPath();
     std::string defaultSubdir = item.targetSubdir.empty()
         ? (item.author + " - VST - " + item.label)
         : item.targetSubdir;
@@ -5565,35 +6377,64 @@ int ConfigParser::executeItemUninstall(
         ? (item.id + ".so")
         : item.targetBinary;
 
+    auto emitLog = [&](const std::string& line) {
+        outLogs.push_back(line);
+        if (onProgress) onProgress(line);
+    };
+
+    emitLog("[TKGL-REMOVE] Step 1/3 (Gold Rule): Backing up MPC.settings & unregistering plugin...");
+
+    // Step 1 & 2: Safely remove <PLUGIN .../> (including multi-line entries) from MPC.settings in C++
+    struct stat stSett;
+    if (stat(mpcSettings.c_str(), &stSett) == 0 && S_ISREG(stSett.st_mode)) {
+        std::ifstream inSett(mpcSettings, std::ios::binary);
+        std::stringstream sss;
+        sss << inSett.rdbuf();
+        std::string settXml = sss.str();
+        inSett.close();
+
+        if (!settXml.empty()) {
+            size_t armStart = 0, armOpenEnd = 0, armEnd = 0;
+            bool armSelfClosing = false;
+            bool removedAny = false;
+            if (findValueBlock(settXml, "pluginList-arm", armStart, armOpenEnd, armEnd, armSelfClosing) && !armSelfClosing) {
+                auto existing = extractPluginXmlEntries(settXml, armOpenEnd, armEnd);
+                for (int idx = static_cast<int>(existing.size()) - 1; idx >= 0; --idx) {
+                    const auto& ep = existing[idx];
+                    bool matches = false;
+                    if (!item.label.empty() && (ep.name == item.label || ep.descName == item.label)) matches = true;
+                    if (!item.id.empty() && (ep.name == item.id || ep.descName == item.id)) matches = true;
+                    if (!defaultSubdir.empty() && ep.file.find("/" + defaultSubdir + "/") != std::string::npos) matches = true;
+                    if (!defaultBin.empty() && ep.file.find("/" + defaultBin) != std::string::npos) matches = true;
+                    if (matches) {
+                        eraseXmlElementLineCleanly(settXml, ep.startPos, ep.endPos);
+                        removedAny = true;
+                    }
+                }
+            }
+            if (removedAny) {
+                std::string bakPath;
+                if (backupAndWriteMpcSettings(mpcSettings, settXml, &outLogs, &bakPath)) {
+                    emitLog("[TKGL-REMOVE] Backup saved: " + bakPath);
+                    emitLog("[TKGL-REMOVE] Unregistered " + item.label + " from MPC.settings.");
+                }
+            }
+        }
+    }
+
+    // Step 3: Remove plugin directories across all SynthContentLocations
+    emitLog("[TKGL-REMOVE] Step 3/3: Removing plugin files from SynthContentLocations...");
+    char scriptPath[] = "/tmp/tkgl_uninst_XXXXXX";
+    int fd = mkstemp(scriptPath);
+    if (fd < 0) {
+        outLogs.push_back("[ERROR] Failed to create temporary uninstall script in /tmp.");
+        return -1;
+    }
+
     std::ostringstream ss;
     ss << "#!/bin/sh\n";
-    ss << "export PLG_MAN_DIR=\"" << mgrDir << "\"\n";
-    ss << "cd \"$PLG_MAN_DIR\" 2>/dev/null || true\n";
-    ss << "MPC_SETT=\"/media/az01-internal/Settings/MPC/MPC.settings\"\n";
     ss << "DEFAULT_SUBDIR=\"" << defaultSubdir << "\"\n";
-    ss << "DEFAULT_BIN=\"" << defaultBin << "\"\n";
-    ss << "ITEM_LABEL=\"" << item.label << "\"\n";
-    ss << "TS=$(date +%s)\n\n";
-
-    ss << "echo \"[TKGL-REMOVE] Step 1/3 (Gold Rule): Backing up MPC.settings...\"\n";
-    ss << "if [ -f \"$MPC_SETT\" ]; then\n";
-    ss << "  cp -f \"$MPC_SETT\" \"${MPC_SETT}.bak-${TS}\"\n";
-    ss << "  echo \"[TKGL-REMOVE] Backup saved: ${MPC_SETT}.bak-${TS}\"\n";
-    ss << "fi\n\n";
-
-    ss << "echo \"[TKGL-REMOVE] Step 2/3: Removing plugin entry from MPC.settings KNOWNPLUGINS...\"\n";
-    ss << "if [ -f \"$MPC_SETT\" ]; then\n";
-    ss << "  awk -v defdir=\"$DEFAULT_SUBDIR\" -v defbin=\"$DEFAULT_BIN\" -v pname=\"name=\\\"$ITEM_LABEL\\\"\" '\n";
-    ss << "    index($0, \"<PLUGIN \") && ((length(defdir) > 2 && index($0, defdir)) || (length(defbin) > 2 && index($0, defbin)) || (length(pname) > 6 && index($0, pname))) {\n";
-    ss << "      next\n";
-    ss << "    }\n";
-    ss << "    { print }\n";
-    ss << "  ' \"$MPC_SETT\" > \"${MPC_SETT}.tmp\" && mv \"${MPC_SETT}.tmp\" \"$MPC_SETT\"\n";
-    ss << "  echo \"[TKGL-REMOVE] Unregistered $ITEM_LABEL from MPC.settings.\"\n";
-    ss << "fi\n\n";
-
-    ss << "echo \"[TKGL-REMOVE] Step 3/3: Removing plugin files from SynthContentLocations...\"\n";
-    auto locs = getSynthContentLocations();
+    auto locs = getSynthContentLocations(mpcSettings);
     for (const auto& loc : locs) {
         if (loc.path.empty()) continue;
         ss << "if [ -d \"" << loc.path << "/$DEFAULT_SUBDIR\" ]; then\n";
@@ -5601,12 +6442,12 @@ int ConfigParser::executeItemUninstall(
         ss << "  echo \"[TKGL-REMOVE] Deleted: " << loc.path << "/$DEFAULT_SUBDIR\"\n";
         ss << "fi\n";
     }
-    ss << "if [ -d \"$PLG_MAN_DIR/Synths/$DEFAULT_SUBDIR\" ]; then\n";
-    ss << "  rm -rf \"$PLG_MAN_DIR/Synths/$DEFAULT_SUBDIR\"\n";
-    ss << "  echo \"[TKGL-REMOVE] Deleted: $PLG_MAN_DIR/Synths/$DEFAULT_SUBDIR\"\n";
+    ss << "if [ -d \"" << mgrDir << "/Synths/$DEFAULT_SUBDIR\" ]; then\n";
+    ss << "  rm -rf \"" << mgrDir << "/Synths/$DEFAULT_SUBDIR\"\n";
+    ss << "  echo \"[TKGL-REMOVE] Deleted: " << mgrDir << "/Synths/$DEFAULT_SUBDIR\"\n";
     ss << "fi\n";
     ss << "sync\n";
-    ss << "echo \"[TKGL-REMOVE] SUCCESS: $ITEM_LABEL cleanly uninstalled.\"\n";
+    ss << "echo \"[TKGL-REMOVE] SUCCESS: " << item.label << " cleanly uninstalled.\"\n";
 
     std::string sBody = ss.str();
     ssize_t written = write(fd, sBody.c_str(), sBody.size());
@@ -5625,10 +6466,7 @@ int ConfigParser::executeItemUninstall(
     while (fgets(line, sizeof(line), pipe)) {
         line[strcspn(line, "\r\n")] = 0;
         if (line[0] == 0) continue;
-        outLogs.emplace_back(line);
-        if (onProgress) {
-            onProgress(line);
-        }
+        emitLog(line);
     }
     return pclose(pipe);
 }
@@ -5733,6 +6571,7 @@ private:
     bool                               execFinished_        = false;
     int                                animFrame_           = 0;
     bool                               isRefreshing_        = false;
+    bool                               isOnline_            = false;
     std::vector<config::SynthLocation> synthLocations_;
     int                                selectedSynthLocIdx_ = 0;
 
@@ -5805,6 +6644,7 @@ using namespace tkgl::gfx;
 PluginManagerView::PluginManagerView(DrmFramebufferCanvas& canvas, config::LauncherConfig& config)
     : canvas_(canvas), config_(config) {
     lastActivityTime_ = std::time(nullptr);
+    isOnline_ = config::ConfigParser::checkInternetReachable(config_.ping_host);
     rebuildFilteredItems();
 }
 
@@ -5866,6 +6706,18 @@ void PluginManagerView::triggerCatalogRefresh() {
     execFinished_ = false;
     render();
 
+    std::string pingTarget = config_.ping_host.empty() ? "github.com" : config_.ping_host;
+    isOnline_ = config::ConfigParser::checkInternetReachable(pingTarget, &execLogs_);
+    if (!isOnline_) {
+        execLogs_.push_back("[ERROR] No internet access (ping " + pingTarget + " failed).");
+        execLogs_.push_back("[ERROR] Refresh aborted: internet connection is required.");
+        isRefreshing_ = false;
+        execFinished_ = true;
+        lastActivityTime_ = std::time(nullptr);
+        render();
+        return;
+    }
+
     canvas_.clearImageCache();
     auto progressCb = [this](const std::string& msg) {
         animFrame_++;
@@ -5915,10 +6767,16 @@ void PluginManagerView::confirmInstall() {
     render();
 
     auto stepCb = [this](const std::string& line) {
-        (void)line;
         animFrame_++;
         lastActivityTime_ = std::time(nullptr);
-        if (execLogs_.size() > 18) {
+        if (line.rfind("[TKGL-NET] Downloading", 0) == 0) {
+            if (!execLogs_.empty() && execLogs_.back().rfind("[TKGL-NET] Downloading", 0) == 0) {
+                execLogs_.back() = line;
+            } else {
+                execLogs_.push_back(line);
+            }
+        }
+        while (execLogs_.size() > 18) {
             execLogs_.erase(execLogs_.begin() + 1);
         }
         render();
@@ -6045,9 +6903,14 @@ void PluginManagerView::drawTopHeader() {
         canvas_.drawText(refreshBtn.x + 38, refreshBtn.y + 12, "REFRESH", Palette::TextPrimary, 1, true);
     }
 
-    // 4. Glowing Green ONLINE Dot + "ONLINE" Label
-    canvas_.drawGlowDot(W - 292, 31, 5, Palette::StatusGreen);
-    canvas_.drawText(W - 278, 23, "ONLINE", Palette::TextPrimary, 2, true);
+    // 4. Glowing ONLINE / OFFLINE Dot + Status Label (verified via ping_host)
+    if (isOnline_) {
+        canvas_.drawGlowDot(W - 292, 31, 5, Palette::StatusGreen);
+        canvas_.drawText(W - 278, 23, "ONLINE", Palette::TextPrimary, 2, true);
+    } else {
+        canvas_.drawGlowDot(W - 292, 31, 5, Palette::AkaiCrimson);
+        canvas_.drawText(W - 278, 23, "OFFLINE", Palette::TextSecondary, 2, true);
+    }
 
     // 5. USB /Synth Free Space Progress Pill + GB Free Label
     double freeGB = 202.8;
@@ -6609,7 +7472,7 @@ void PluginManagerView::drawInstallPopup() {
     canvas_.drawTextRight(infoBox.x + infoBox.w - 14, infoBox.y + 10, "RULE 1 (GOLD RULE) ENFORCED", Palette::StatusGreen, 1, true);
     canvas_.drawHLine(infoBox.x + 14, infoBox.y + 28, infoBox.w - 28, Palette::BorderDark);
 
-    canvas_.drawText(infoBox.x + 14, infoBox.y + 36, "1. Gold Rule: Auto-snapshot MPC.settings.bak-(timestamp) before any modification", Palette::TextSecondary, 1, false);
+    canvas_.drawText(infoBox.x + 14, infoBox.y + 36, "1. Gold Rule: Auto-snapshot MPC.settings.bak-YYYYMMDDHHMMSS before modification", Palette::TextSecondary, 1, false);
     std::string r2 = "2. Target: Extracts portable/" + item.author + " - VST - " + item.label + " to selected location";
     canvas_.drawTextClipped({infoBox.x + 14, infoBox.y + 56, infoBox.w - 28, 16}, r2, Palette::TextSecondary, 1, false);
     if (item.broken) {

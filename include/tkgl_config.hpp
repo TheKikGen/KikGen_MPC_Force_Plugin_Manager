@@ -60,6 +60,7 @@ struct LauncherConfig {
     std::string app_title       = "AKAI MPCs PLUGINS MANAGER";
     int         screen_rotation = 270;
     std::string catalog_url     = "https://sd88me.github.io/mpc-vst-plugins/catalog.json";
+    std::string ping_host       = "github.com";
     std::string usb_mount_path  = "/media/AKAI_FORCE_SSD";
     std::string synth_dir_name  = "/media/AKAI_FORCE_SSD/Synth";
     std::string config_path     = "mpc_plugins.conf";
@@ -71,6 +72,10 @@ struct LauncherConfig {
 class ConfigParser {
 public:
     static std::string getManagerRootDir();
+    static bool checkInternetReachable(
+        const std::string& pingHost = "github.com",
+        std::vector<std::string>* outLogs = nullptr
+    );
     static bool downloadFile(
         const std::string& url,
         const std::string& destPath,
@@ -85,6 +90,7 @@ public:
     static int  executeItemInstall(const LauncherConfig& cfg, const MenuItem& item, const std::string& targetSynthDir, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
     static int  executeItemUninstall(const LauncherConfig& cfg, const MenuItem& item, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
     static int  executeItemCommand(const LauncherConfig& cfg, const MenuItem& item, std::vector<std::string>& outLogs);
+    static void ensureManagerSynthsInMpcSettings(std::vector<std::string>* outLogs = nullptr);
     static void refreshInstallStates(LauncherConfig& config, std::vector<std::string>* outLogs = nullptr);
 };
 

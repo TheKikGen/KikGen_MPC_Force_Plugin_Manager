@@ -26,6 +26,7 @@ using namespace tkgl::gfx;
 PluginManagerView::PluginManagerView(DrmFramebufferCanvas& canvas, config::LauncherConfig& config)
     : canvas_(canvas), config_(config) {
     lastActivityTime_ = std::time(nullptr);
+    isOnline_ = config::ConfigParser::checkInternetReachable(config_.ping_host);
     rebuildFilteredItems();
 }
 
@@ -87,6 +88,18 @@ void PluginManagerView::triggerCatalogRefresh() {
     execFinished_ = false;
     render();
 
+    std::string pingTarget = config_.ping_host.empty() ? "github.com" : config_.ping_host;
+    isOnline_ = config::ConfigParser::checkInternetReachable(pingTarget, &execLogs_);
+    if (!isOnline_) {
+        execLogs_.push_back("[ERROR] No internet access (ping " + pingTarget + " failed).");
+        execLogs_.push_back("[ERROR] Refresh aborted: internet connection is required.");
+        isRefreshing_ = false;
+        execFinished_ = true;
+        lastActivityTime_ = std::time(nullptr);
+        render();
+        return;
+    }
+
     canvas_.clearImageCache();
     auto progressCb = [this](const std::string& msg) {
         animFrame_++;
@@ -136,10 +149,16 @@ void PluginManagerView::confirmInstall() {
     render();
 
     auto stepCb = [this](const std::string& line) {
-        (void)line;
         animFrame_++;
         lastActivityTime_ = std::time(nullptr);
-        if (execLogs_.size() > 18) {
+        if (line.rfind("[TKGL-NET] Downloading", 0) == 0) {
+            if (!execLogs_.empty() && execLogs_.back().rfind("[TKGL-NET] Downloading", 0) == 0) {
+                execLogs_.back() = line;
+            } else {
+                execLogs_.push_back(line);
+            }
+        }
+        while (execLogs_.size() > 18) {
             execLogs_.erase(execLogs_.begin() + 1);
         }
         render();
@@ -266,9 +285,14 @@ void PluginManagerView::drawTopHeader() {
         canvas_.drawText(refreshBtn.x + 38, refreshBtn.y + 12, "REFRESH", Palette::TextPrimary, 1, true);
     }
 
-    // 4. Glowing Green ONLINE Dot + "ONLINE" Label
-    canvas_.drawGlowDot(W - 292, 31, 5, Palette::StatusGreen);
-    canvas_.drawText(W - 278, 23, "ONLINE", Palette::TextPrimary, 2, true);
+    // 4. Glowing ONLINE / OFFLINE Dot + Status Label (verified via ping_host)
+    if (isOnline_) {
+        canvas_.drawGlowDot(W - 292, 31, 5, Palette::StatusGreen);
+        canvas_.drawText(W - 278, 23, "ONLINE", Palette::TextPrimary, 2, true);
+    } else {
+        canvas_.drawGlowDot(W - 292, 31, 5, Palette::AkaiCrimson);
+        canvas_.drawText(W - 278, 23, "OFFLINE", Palette::TextSecondary, 2, true);
+    }
 
     // 5. USB /Synth Free Space Progress Pill + GB Free Label
     double freeGB = 202.8;
@@ -830,7 +854,7 @@ void PluginManagerView::drawInstallPopup() {
     canvas_.drawTextRight(infoBox.x + infoBox.w - 14, infoBox.y + 10, "RULE 1 (GOLD RULE) ENFORCED", Palette::StatusGreen, 1, true);
     canvas_.drawHLine(infoBox.x + 14, infoBox.y + 28, infoBox.w - 28, Palette::BorderDark);
 
-    canvas_.drawText(infoBox.x + 14, infoBox.y + 36, "1. Gold Rule: Auto-snapshot MPC.settings.bak-(timestamp) before any modification", Palette::TextSecondary, 1, false);
+    canvas_.drawText(infoBox.x + 14, infoBox.y + 36, "1. Gold Rule: Auto-snapshot MPC.settings.bak-YYYYMMDDHHMMSS before modification", Palette::TextSecondary, 1, false);
     std::string r2 = "2. Target: Extracts portable/" + item.author + " - VST - " + item.label + " to selected location";
     canvas_.drawTextClipped({infoBox.x + 14, infoBox.y + 56, infoBox.w - 28, 16}, r2, Palette::TextSecondary, 1, false);
     if (item.broken) {
