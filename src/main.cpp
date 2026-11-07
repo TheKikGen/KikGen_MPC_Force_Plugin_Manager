@@ -229,8 +229,15 @@ static void touch_thread_func(tkgl::gfx::DrmFramebufferCanvas* canvas, tkgl::ui:
 }
 
 int main(int argc, char* argv[]) {
-    // Headless helper mode: mpc_plugin_manager_fb --fetch <url> <dest>
-    // Uses dynamic libcurl.so.4 / libcurl.so.4.8.0 (dlopen) for background/script downloads.
+    // 1. Startup Prompt & Version identification per specification
+    std::printf("The KikGen Labs - Plugins Manager for Akai MPC and Force Devices\n");
+    std::printf("Version: %s - Compiled on %s %s\n", tkgl::config::TKGL_MANAGER_VERSION, __DATE__, __TIME__);
+
+    if (argc >= 2 && (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0)) {
+        return 0;
+    }
+
+    // Headless helper mode: mpc_plugin_manager_fb --fetch <url> <dest> (uses libcurl IPv4)
     if (argc >= 4 && std::strcmp(argv[1], "--fetch") == 0) {
         return tkgl::config::ConfigParser::downloadFile(argv[2], argv[3], 60) ? 0 : 1;
     }

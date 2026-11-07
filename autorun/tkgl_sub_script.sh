@@ -158,9 +158,24 @@ else
     "$TARGET_BIN" || true
 fi
 
-# 5. Grace period and restore native MPC services
-echo "[*] Plugin manager closed. Waiting 5 seconds before restarting MPC services..."
-sleep 5
+# Flush any pending disk writes to storage
+sync
 
+# 6. Grace period and restore native MPC services
+echo "[*] Plugin manager closed. Waiting 2 seconds before restarting MPC services..."
+sleep 2
 start_mpc
+
+# 7. Clean unmount of the USB drive hosting the autorun
+
+echo "[+] Unmounting USB volume $MNT_POINT... "
+# Leave the mount point to prevent EBUSY (Device or resource busy)
+cd /tmp
+
+# Attempt standard unmount; fall back to lazy unmount if still held
+if ! umount "$USB_MOUNT" 2>/dev/null; then
+     umount -l "$USB_MOUNT" 2>/dev/null
+fi
+
+
 exit 0

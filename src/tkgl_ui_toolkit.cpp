@@ -266,11 +266,11 @@ void PluginManagerView::drawTopHeader() {
     canvas_.fillRoundedRect({29, 33, 11, 11}, 3, Color(161, 161, 170));
     canvas_.fillRoundedRect({44, 33, 11, 11}, 3, Palette::AkaiCrimson);
 
-    // 2. Main Title + "By The KikGen Labs" on same baseline (matching image_22ce5693.png)
+    // 2. Main Title + "By The KikGen Labs - V1.1.2" on same baseline (matching image_22ce5693.png)
     int titleX = 76;
     canvas_.drawTextClipped({titleX, 21, 430, 22}, config_.app_title, Palette::TextPrimary, 2, true);
     int titleW = std::min(430, canvas_.measureText(config_.app_title, 2) + 14);
-    canvas_.drawText(titleX + titleW, 26, "By The KikGen Labs", Palette::TextSecondary, 1, false);
+    canvas_.drawText(titleX + titleW, 26, "By The KikGen Labs - V1.1.2", Palette::TextSecondary, 1, false);
 
     // 3. REFRESH Button with Circular Sync Arrow Icon
     Rect refreshBtn = {W - 442, 13, 128, 36};
@@ -298,7 +298,9 @@ void PluginManagerView::drawTopHeader() {
     double freeGB = 202.8;
     int usedPct = 24;
     struct statvfs vfs;
-    if (statvfs(config_.usb_mount_path.c_str(), &vfs) == 0 && vfs.f_blocks > 0) {
+    std::string statDir = config::ConfigParser::getManagerRootDir();
+    if (statDir.empty()) statDir = ".";
+    if (statvfs(statDir.c_str(), &vfs) == 0 && vfs.f_blocks > 0) {
         double totalBytes = static_cast<double>(vfs.f_blocks) * vfs.f_frsize;
         double freeBytes  = static_cast<double>(vfs.f_bavail) * vfs.f_frsize;
         freeGB = freeBytes / (1024.0 * 1024.0 * 1024.0);

@@ -1,6 +1,8 @@
-# The KikGen Labs — MPC & Force Standalone Plugin Manager
+# The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.1.2 — v1.1.2)
 
 Standalone VST2 / Addin / Patch manager for **Akai MPC Live / Live II / One / One+ / X / Key 37 / Key 61 / Force** written in native **C++17** (Linux Framebuffer `/dev/fb0`, ALSA RawMIDI & `evdev` Touchscreen, zero external build dependencies).
+
+- **Release Tag**: `V1.1.2` (`v1.1.2`)
 
 ---
 
@@ -10,7 +12,7 @@ Standalone VST2 / Addin / Patch manager for **Akai MPC Live / Live II / One / On
 KikGen_MPC_Force_Plugin_Manager/
 ├── README.md                     # Complete documentation (this file)
 ├── Makefile                      # Cross-compilation Makefile (ARMv7hf, AArch64, x86_64, Single-File)
-├── mpc_plugins.conf              # Configuration & local catalog file (JSON + code blocks)
+├── mpc_plugins.conf              # Configuration & local catalog file (JSON + code blocks, ping_host)
 ├── mpc_plugin_manager_fb.cpp     # Amalgamated single-file C++17 source build
 ├── include/
 │   ├── tkgl_gfx.hpp              # 2D Framebuffer graphics engine (anti-aliased SDF, EPX font, PNG/PPM decoder)
@@ -18,12 +20,12 @@ KikGen_MPC_Force_Plugin_Manager/
 │   └── tkgl_ui_toolkit.hpp       # Touch & MIDI UI toolkit (List view, Detail view, popups, screensaver)
 ├── src/
 │   ├── tkgl_gfx.cpp              # /dev/fb0 Framebuffer rendering implementation
-│   ├── tkgl_config.cpp           # Path resolution (PLG_MAN_DIR), dynamic libcurl.so.4 loader & MPC.settings engine
+│   ├── tkgl_config.cpp           # Path resolution (PLG_MAN_DIR), libcurl IPv4 downloader, ping_host check & MPC.settings engine
 │   ├── tkgl_ui_toolkit.cpp       # Plugin cards, Detail view (Install/Reinstall/Uninstall/Repair) & live logs
 │   └── main.cpp                  # Entry point, ALSA Private MIDI & evdev touchscreen threads
 ├── plugins/                      # Local catalog cache (tkgl_catalog.json) and per-plugin assets
 │   └── <plugin-id>/
-│       ├── thumb.ppm / thumb.png # Downloaded or pre-rendered plugin thumbnail
+│       ├── thumb.png             # Downloaded plugin screenshot thumbnail (fetched via libcurl IPv4 on REFRESH if missing)
 │       ├── manifest.json         # Plugin metadata
 │       ├── install.sh            # Standalone installation script
 │       └── uninstall.sh          # Standalone uninstallation script
@@ -62,6 +64,13 @@ The compiled binary is named `mpc_plugin_manager_fb`.
 
 ## 3. Running on MPC / Force & `PLG_MAN_DIR` Support (`noexec` USB Drives)
 
+### Startup Prompt & Version Identification
+On launch (or with `--version` / `-v`), the binary outputs its identification banner with the compilation timestamp:
+```text
+The KikGen Labs - Plugins Manager for Akai MPC and Force Devices
+Version: V1.1.2 (v1.1.2) - Compiled on Nov  7 2026 02:53:01
+```
+
 ### Case A — Direct Execution (`ext4` partition or executable storage)
 If the manager directory resides on a partition with execution permissions:
 ```bash
@@ -94,16 +103,20 @@ Because the Akai MPC OS application periodically cleans up `MPC.settings`, the P
 
 ---
 
-## 4. Online Catalog Refresh (`REFRESH`) & `MPC.settings` Integrity Verification
+## 4. Internet Connectivity Check (`ping_host`), Online Catalog Refresh (`REFRESH`) & `MPC.settings` Verification
 
 Pressing the **`[REFRESH]`** button in the top bar performs a complete online synchronization and integrity audit:
-1. **Catalog Download via `libcurl.so.4`**:
-   - Downloads the latest community catalog JSON defined by `catalog_url` in `mpc_plugins.conf` (default: `https://sd88me.github.io/mpc-vst-plugins/catalog.json`) using dynamic `dlopen("libcurl.so.4")` / `libcurl.so.4.8.0`.
-2. **Download All Thumbnails**:
-   - Automatically downloads all plugin thumbnails into `plugins/<plugin-id>/thumb.png` during the refresh operation so every card and detail view renders its real screenshot offline.
-3. **Verification of Previously Installed Plugins in `MPC.settings`**:
+1. **Internet Connectivity Verification via `ping_host`**:
+   - Before any refresh or online download, `ConfigParser::checkInternetReachable()` pings the host configured under `"ping_host"` in `mpc_plugins.conf` (default: `"github.com"`).
+   - Even if the local Wi-Fi or Ethernet interface has an IP address, no refresh is permitted unless Internet access is confirmed via `ping`. The header displays `ONLINE` (green) or `OFFLINE` (red) accordingly.
+2. **Catalog Download via `libcurl` (Forced IPv4)**:
+   - Downloads the latest community catalog JSON defined by `catalog_url` in `mpc_plugins.conf` (default: `https://sd88me.github.io/mpc-vst-plugins/catalog.json`) exclusively using `libcurl` with `CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4`.
+   - If `libcurl` does not respond or encounters an error, no fallback is executed and a clear error message is reported.
+3. **Automatic Missing Thumbnail Download (`thumb.png`)**:
+   - For every plugin in the catalog, checks whether `plugins/<plugin-id>/thumb.png` exists on disk. If the file is missing, it is automatically downloaded from `screenshotUrl` via `libcurl` (IPv4), verified against the 8-byte PNG signature, and linked in `mpc_plugins.conf`.
+4. **Verification of Previously Installed Plugins in `MPC.settings`**:
    - For every plugin registered or previously detected as installed, scans `/media/az01-internal/Settings/MPC/MPC.settings` inside `<VALUE name="pluginList-arm"><KNOWNPLUGINS><PLUGIN ... file="..."/>` (supporting both single-line and JUCE multi-line `<PLUGIN>` tags) and verifies that the referenced `.so` binary exists on disk so the plugin and its skin load properly.
-   - **Auto-Relocation**: If the `.so` file is missing at the registered path, the manager searches all directories listed in `<SynthContentLocations>`. If the `.so` file is found in another `SynthContentLocations` path, `MPC.settings` is backed up (`MPC.settings.bak-YYYYMMDDHHMMSS`), the `file="..."` attribute is automatically updated to the valid path, and a `[WARNING]` is logged.
+   - **Auto-Relocation**: If the `.so` file is missing at the registered path, the manager searches all directories listed in `<SynthContentLocations>` (requiring both subdir and binary filename to match when `targetSubdir` is specified). If found in another `SynthContentLocations` path, `MPC.settings` is backed up (`MPC.settings.bak-YYYYMMDDHHMMSS`), the `file="..."` attribute is automatically updated to the valid path, and a `[WARNING]` is logged.
    - **Broken Installation Detection**: If the `.so` file cannot be found in any `SynthContentLocations` directory, the plugin installation is marked as **`BROKEN`** (`! BROKEN (.SO MISSING)`).
 
 ---
@@ -116,8 +129,9 @@ Pressing the **`[REFRESH]`** button in the top bar performs a complete online sy
    Creates a human-readable timestamped backup `MPC.settings.bak-YYYYMMDDHHMMSS` before any modification, and validates the XML document structure before atomically replacing `MPC.settings`.
 3. **Step 2/4 — `SynthContentLocations` Registration**:
    Ensures the selected `Synths` directory is registered inside `<VALUE name="SynthContentLocations">` in `MPC.settings`.
-4. **Step 3/4 — Native Download via `libcurl.so.4` & Archive Extraction**:
-   - Uses the dynamically loaded `libcurl.so.4` / `libcurl.so.4.8.0` library (and CLI helper mode `mpc_plugin_manager_fb --fetch <url> <dest>`) with full HTTPS/TLS and HTTP 302 redirect support.
+4. **Step 3/4 — Download via `libcurl` (IPv4) & Archive Extraction**:
+   - Verifies Internet connectivity via `ping_host`, then downloads the release archive via `libcurl` (IPv4) with automatic parent directory creation.
+   - If `libcurl` fails or does not respond, download is aborted with an error message (no fallback).
    - Extracts `portable/<Author> - VST - <Plugin>/` into the target `Synths` directory.
 5. **Step 4/4 — Registration in `pluginList-arm` (`INSTALL` / `REINSTALL` / `REPAIR`)**:
    - **Healthy Installed Plugins**: Opening the Detail View displays **`UNINSTALL`** right next to **`REINSTALL`**.

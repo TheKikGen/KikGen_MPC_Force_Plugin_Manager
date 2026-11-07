@@ -16,11 +16,13 @@
 
 namespace tkgl::config {
 
+constexpr const char* TKGL_MANAGER_VERSION = "V1.1.2 (v1.1.2)";
+
 struct MenuItem {
     std::string id;
     std::string label;
     std::string author        = "The KikGen Labs";
-    std::string version       = "v1.0.0";
+    std::string version       = "v1.1.2";
     std::string category      = "Synthesizer";
     std::string shortType     = "INST";
     std::string channel       = "Stable";
@@ -61,8 +63,6 @@ struct LauncherConfig {
     int         screen_rotation = 270;
     std::string catalog_url     = "https://sd88me.github.io/mpc-vst-plugins/catalog.json";
     std::string ping_host       = "github.com";
-    std::string usb_mount_path  = "/media/AKAI_FORCE_SSD";
-    std::string synth_dir_name  = "/media/AKAI_FORCE_SSD/Synth";
     std::string config_path     = "mpc_plugins.conf";
     std::vector<Section> sections;
 
