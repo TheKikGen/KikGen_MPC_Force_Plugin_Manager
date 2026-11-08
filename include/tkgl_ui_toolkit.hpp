@@ -22,7 +22,9 @@ enum class UIState {
     LAUNCH_SCREEN = 1, // High-definition Detail View matching image_22ce5693.png
     EXEC_SCREEN   = 2, // Live Shell Script / Online Catalog Sync Console
     INSTALL_POPUP = 3, // Installation Popup with SynthContentLocations pick list
-    EXIT_POPUP    = 4  // Confirmation Popup to quit the Plugin Manager
+    EXIT_POPUP    = 4, // Confirmation Popup to quit the Plugin Manager
+    REFRESH_POPUP = 5, // Prompt: CACHE ALL PLUGIN PACKAGES? (YES / NO / CANCEL)
+    PURGE_POPUP   = 6  // Confirmation Popup to delete/purge local cached ZIP package
 };
 
 enum class FilterTab {
@@ -66,12 +68,19 @@ private:
     bool wakeIfScreensaver();
     void rebuildFilteredItems();
     void triggerCatalogRefresh();
+    void triggerCacheAllBinaries();
+    void triggerCacheCurrentItem();
+    void triggerDeleteCurrentItemBinary();
     void openInstallPopup();
     void closeInstallPopup();
     void confirmInstall();
     void triggerUninstall();
     void openExitPopup();
     void closeExitPopup();
+    void openRefreshPopup();
+    void closeRefreshPopup();
+    void openPurgePopup();
+    void closePurgePopup();
     void drawTopHeader();
     void drawFilterBar();
     void drawCardThumbnail(gfx::Rect r, const config::MenuItem& item, int index, bool large = false);
@@ -79,6 +88,8 @@ private:
     void drawDetailView();
     void drawInstallPopup();
     void drawExitPopup();
+    void drawRefreshPopup();
+    void drawPurgePopup();
     void drawExecutionScreen();
     void drawBottomPaginationBar();
     void drawScreensaver();

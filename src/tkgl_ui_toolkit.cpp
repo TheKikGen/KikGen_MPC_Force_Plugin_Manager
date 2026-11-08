@@ -120,6 +120,137 @@ void PluginManagerView::triggerCatalogRefresh() {
     render();
 }
 
+void PluginManagerView::openRefreshPopup() {
+    if (uiState_ != UIState::REFRESH_POPUP) {
+        prevUiState_ = uiState_;
+        uiState_ = UIState::REFRESH_POPUP;
+        render();
+    }
+}
+
+void PluginManagerView::closeRefreshPopup() {
+    if (uiState_ == UIState::REFRESH_POPUP) {
+        uiState_ = (prevUiState_ == UIState::REFRESH_POPUP) ? UIState::MENU : prevUiState_;
+        render();
+    }
+}
+
+void PluginManagerView::triggerCacheAllBinaries() {
+    uiState_ = UIState::EXEC_SCREEN;
+    isRefreshing_ = true;
+    animFrame_ = 0;
+    execLogs_.clear();
+    execLogs_.push_back("=== The KikGen Labs: Full Online Sync & Binary Mirroring ===");
+    execFinished_ = false;
+    render();
+
+    std::string pingTarget = config_.ping_host.empty() ? "github.com" : config_.ping_host;
+    isOnline_ = config::ConfigParser::checkInternetReachable(pingTarget, &execLogs_);
+    if (!isOnline_) {
+        execLogs_.push_back("[ERROR] No internet access (ping " + pingTarget + " failed).");
+        execLogs_.push_back("[ERROR] Caching aborted: internet connection is required to mirror binaries.");
+        isRefreshing_ = false;
+        execFinished_ = true;
+        lastActivityTime_ = std::time(nullptr);
+        render();
+        return;
+    }
+
+    auto progressCb = [this](const std::string& msg) {
+        animFrame_++;
+        lastActivityTime_ = std::time(nullptr);
+        if (msg.rfind("[CACHE", 0) == 0 && !execLogs_.empty() && execLogs_.back().rfind("[CACHE", 0) == 0) {
+            execLogs_.back() = msg;
+        } else {
+            execLogs_.push_back(msg);
+        }
+        if (execLogs_.size() > 18) {
+            execLogs_.erase(execLogs_.begin() + 1);
+        }
+        render();
+    };
+
+    config::ConfigParser::syncFromOnlineCatalog(config_, execLogs_, progressCb);
+    config::ConfigParser::cacheAllCatalogBinaries(config_, execLogs_, progressCb);
+    config::ConfigParser::refreshInstallStates(config_, &execLogs_);
+    rebuildFilteredItems();
+    canvas_.clearImageCache();
+    isRefreshing_ = false;
+    execFinished_ = true;
+    lastActivityTime_ = std::time(nullptr);
+    render();
+}
+
+void PluginManagerView::triggerCacheCurrentItem() {
+    if (filteredItems_.empty()) return;
+    const auto& ref = filteredItems_[selectedIndex_];
+    auto& item = config_.sections[ref.sectionIdx].items[ref.itemIdx];
+
+    uiState_ = UIState::EXEC_SCREEN;
+    animFrame_ = 0;
+    execLogs_.clear();
+    execLogs_.push_back("=== The KikGen Labs: Download & Cache " + item.label + " ===");
+    execFinished_ = false;
+    render();
+
+    std::string pingTarget = config_.ping_host.empty() ? "github.com" : config_.ping_host;
+    isOnline_ = config::ConfigParser::checkInternetReachable(pingTarget, &execLogs_);
+    if (!isOnline_) {
+        execLogs_.push_back("[ERROR] No internet access (ping " + pingTarget + " failed).");
+        execLogs_.push_back("[ERROR] Download aborted: internet connection is required.");
+        isRefreshing_ = false;
+        execFinished_ = true;
+        lastActivityTime_ = std::time(nullptr);
+        render();
+        return;
+    }
+
+    auto stepCb = [this](const std::string& line) {
+        animFrame_++;
+        lastActivityTime_ = std::time(nullptr);
+        if (line.rfind("[CACHE]", 0) == 0 && !execLogs_.empty() && execLogs_.back().rfind("[CACHE]", 0) == 0) {
+            execLogs_.back() = line;
+        } else {
+            execLogs_.push_back(line);
+        }
+        while (execLogs_.size() > 18) {
+            execLogs_.erase(execLogs_.begin() + 1);
+        }
+        render();
+    };
+
+    if (config::ConfigParser::cacheItemBinary(item, execLogs_, stepCb)) {
+        item.isCached = true;
+        config::ConfigParser::isItemBinaryCached(item, &item.cachedZipSize);
+        execLogs_.push_back("[TKGL-CACHE] " + item.label + " is now available for offline install.");
+    }
+    execFinished_ = true;
+    lastActivityTime_ = std::time(nullptr);
+    render();
+}
+
+void PluginManagerView::triggerDeleteCurrentItemBinary() {
+    if (filteredItems_.empty()) return;
+    const auto& ref = filteredItems_[selectedIndex_];
+    auto& item = config_.sections[ref.sectionIdx].items[ref.itemIdx];
+
+    uiState_ = UIState::EXEC_SCREEN;
+    animFrame_ = 0;
+    execLogs_.clear();
+    execLogs_.push_back("=== The KikGen Labs: Purging Cached Binary for " + item.label + " ===");
+    execFinished_ = false;
+    render();
+
+    if (config::ConfigParser::deleteItemBinary(item, execLogs_)) {
+        item.isCached = false;
+        item.cachedZipSize.clear();
+        execLogs_.push_back("[TKGL-CACHE] Local archive removed. (Installed plugin files in /Synth remain untouched).");
+    }
+    execFinished_ = true;
+    lastActivityTime_ = std::time(nullptr);
+    render();
+}
+
 void PluginManagerView::openInstallPopup() {
     synthLocations_ = config::ConfigParser::getSynthContentLocations();
     selectedSynthLocIdx_ = 0;
@@ -220,6 +351,21 @@ void PluginManagerView::closeExitPopup() {
     }
 }
 
+void PluginManagerView::openPurgePopup() {
+    if (uiState_ != UIState::PURGE_POPUP) {
+        prevUiState_ = uiState_;
+        uiState_ = UIState::PURGE_POPUP;
+        render();
+    }
+}
+
+void PluginManagerView::closePurgePopup() {
+    if (uiState_ == UIState::PURGE_POPUP) {
+        uiState_ = (prevUiState_ == UIState::PURGE_POPUP) ? UIState::LAUNCH_SCREEN : prevUiState_;
+        render();
+    }
+}
+
 void PluginManagerView::render() {
     if (isScreensaver_) {
         drawScreensaver();
@@ -247,6 +393,19 @@ void PluginManagerView::render() {
         }
         drawBottomPaginationBar();
         drawExitPopup();
+    } else if (uiState_ == UIState::REFRESH_POPUP) {
+        if (prevUiState_ == UIState::LAUNCH_SCREEN) {
+            drawDetailView();
+        } else {
+            drawFilterBar();
+            drawListView();
+        }
+        drawBottomPaginationBar();
+        drawRefreshPopup();
+    } else if (uiState_ == UIState::PURGE_POPUP) {
+        drawDetailView();
+        drawBottomPaginationBar();
+        drawPurgePopup();
     } else {
         drawExecutionScreen();
     }
@@ -266,11 +425,11 @@ void PluginManagerView::drawTopHeader() {
     canvas_.fillRoundedRect({29, 33, 11, 11}, 3, Color(161, 161, 170));
     canvas_.fillRoundedRect({44, 33, 11, 11}, 3, Palette::AkaiCrimson);
 
-    // 2. Main Title + "By The KikGen Labs - V1.1.2" on same baseline (matching image_22ce5693.png)
+    // 2. Main Title + "By The KikGen Labs - V1.1.7" on same baseline (matching image_22ce5693.png)
     int titleX = 76;
-    canvas_.drawTextClipped({titleX, 21, 430, 22}, config_.app_title, Palette::TextPrimary, 2, true);
-    int titleW = std::min(430, canvas_.measureText(config_.app_title, 2) + 14);
-    canvas_.drawText(titleX + titleW, 26, "By The KikGen Labs - V1.1.2", Palette::TextSecondary, 1, false);
+    canvas_.drawTextClipped({titleX, 21, 380, 22}, config_.app_title, Palette::TextPrimary, 2, true);
+    int titleW = std::min(380, canvas_.measureText(config_.app_title, 2) + 14);
+    canvas_.drawText(titleX + titleW, 26, "By The KikGen Labs - V1.1.7", Palette::TextSecondary, 1, false);
 
     // 3. REFRESH Button with Circular Sync Arrow Icon
     Rect refreshBtn = {W - 442, 13, 128, 36};
@@ -285,7 +444,7 @@ void PluginManagerView::drawTopHeader() {
         canvas_.drawText(refreshBtn.x + 38, refreshBtn.y + 12, "REFRESH", Palette::TextPrimary, 1, true);
     }
 
-    // 4. Glowing ONLINE / OFFLINE Dot + Status Label (verified via ping_host)
+    // 4. Glowing ONLINE / OFFLINE Status Dot + Label (non-interactive indicator)
     if (isOnline_) {
         canvas_.drawGlowDot(W - 292, 31, 5, Palette::StatusGreen);
         canvas_.drawText(W - 278, 23, "ONLINE", Palette::TextPrimary, 2, true);
@@ -600,26 +759,44 @@ void PluginManagerView::drawDetailView() {
     canvas_.drawText(backBtn.x + 36, backBtn.y + 12, "BACK", Palette::TextPrimary, 2, true);
 
     // Bold Plugin Title + Subtitle ("by Author · Category")
-    int maxTitleW = (item.installed || item.broken) ? (W - 530) : (W - 360);
+    // With redundant badges removed, title area gains significant horizontal space
+    int maxTitleW = (item.installed || item.broken) ? (W - 480) : (W - 320);
     canvas_.drawTextClipped({146, 76, maxTitleW, 26}, item.label, Palette::TextPrimary, 3, true);
     std::string subTitle = "by " + item.author + "  .  " + item.category;
     canvas_.drawTextClipped({146, 107, maxTitleW, 16}, subTitle, Palette::TextSecondary, 2, false);
 
     // Top-Right Action Buttons:
+    // User Specification:
+    // - If ZIP is present locally: Display a button "ZIP: <size in MB>". Pressing it opens confirmation to purge it.
+    // - If ZIP is absent locally: Do NOT display "NO LOCAL ZIP", display interactive "CACHE ZIP" button.
     // - If broken: [ ! BROKEN ] badge + Amber [ REPAIR ] button
     // - If installed (and not broken): [ UNINSTALL ] button close to [ REINSTALL ] button
     // - If not installed: Red [ INSTALL ] button
+    std::string cachedZipSize;
+    bool isCached = config::ConfigParser::isItemBinaryCached(item, &cachedZipSize);
+
+    // Cache / Purge ZIP Button (Consolidated Single Button: "ZIP: <size>" or "CACHE ZIP")
+    Rect zipBtn = {W - 496, 79, 130, 44};
+    if (isCached) {
+        canvas_.drawPanel(zipBtn, 8, Color(16, 38, 48), Palette::StatusCyan, 1.2f);
+        canvas_.drawTextCentered(zipBtn, "ZIP: " + cachedZipSize, Palette::StatusCyan, 1, true);
+    } else {
+        canvas_.drawPanel(zipBtn, 8, Color(24, 38, 52), Palette::StatusCyan, 1.2f);
+        canvas_.drawDownloadIcon(zipBtn.x + 10, zipBtn.y + 14, 15, Palette::StatusCyan);
+        canvas_.drawText(zipBtn.x + 30, zipBtn.y + 13, "CACHE ZIP", Palette::StatusCyan, 1, true);
+    }
+
     if (item.broken) {
-        Rect warnBadge = {W - 418, 84, 222, 34};
+        Rect warnBadge = {W - 356, 84, 154, 34};
         canvas_.drawPanel(warnBadge, 7, Color(64, 20, 20), Palette::AkaiCrimson, 1.2f);
-        canvas_.drawTextCentered(warnBadge, "BROKEN (.SO MISSING)", Palette::AmberGold, 1, true);
+        canvas_.drawTextCentered(warnBadge, "BROKEN INSTALL", Palette::AmberGold, 1, true);
 
         Rect repBtn = {W - 186, 79, 162, 44};
         canvas_.drawPanel(repBtn, 8, Color(180, 83, 9), Palette::AmberGold, 1.5f);
         canvas_.drawRefreshIcon(repBtn.x + 22, repBtn.y + 13, 17, Palette::TextPrimary);
         canvas_.drawText(repBtn.x + 48, repBtn.y + 13, "REPAIR", Palette::TextPrimary, 2, true);
     } else if (item.installed) {
-        Rect uninstBtn = {W - 356, 79, 160, 44};
+        Rect uninstBtn = {W - 356, 79, 154, 44};
         canvas_.drawPanel(uninstBtn, 8, Color(42, 24, 28), Palette::AkaiCrimson, 1.5f);
         canvas_.drawTextCentered(uninstBtn, "UNINSTALL", Palette::TextPrimary, 2, true);
 
@@ -692,7 +869,7 @@ void PluginManagerView::drawDetailView() {
 
     // ========================================================================
     // RIGHT COLUMN (x = 424, w = 832):
-    // 1. Verification & Category Badges + GitHub Source Link
+    // 1. Verification & Category Badges + Local ZIP Presence Info
     // 2. Full-Height Rounded Description, Release Notes & #Tags Card
     // ========================================================================
     int rightX = 424;
@@ -720,10 +897,6 @@ void PluginManagerView::drawDetailView() {
     Rect binBadge = {catBadge.x + catBadge.w + 8, 154, binW, 28};
     canvas_.drawPanel(binBadge, 6, Color(34, 34, 43), Color(58, 58, 72), 1.0f);
     canvas_.drawTextCentered(binBadge, item.targetBinary, Palette::TextSecondary, 1, false);
-
-    // Top-right GitHub Source link + icon
-    canvas_.drawTextRight(rightX + rightW - 20, 162, "GitHub Source", Palette::TextSecondary, 1, false);
-    canvas_.drawExternalLinkIcon(rightX + rightW - 15, 161, 13, Palette::TextSecondary);
 
     // 2. LARGE ROUNDED DESCRIPTION, RELEASE NOTES & TAGS CARD (y = 194, h = 514 -> aligns with specsBox bottom at 708)
     Rect descCard = {rightX, 194, rightW, 514};
@@ -995,6 +1168,113 @@ void PluginManagerView::drawExitPopup() {
     canvas_.drawTextRight(quitBtn.x + quitBtn.w - 18, quitBtn.y + 19, "[+] / ENTER", Palette::TextPrimary, 1, false);
 }
 
+void PluginManagerView::drawRefreshPopup() {
+    int W = canvas_.getLogicalWidth();
+    int H = canvas_.getLogicalHeight();
+
+    // Dimmed full-screen backdrop
+    canvas_.fillRect({0, 62, W, H - 62}, Color(6, 6, 10, 215));
+
+    int mw = 680;
+    int mh = 310;
+    int mx = (W - mw) / 2;
+    int my = (H - mh) / 2;
+
+    Rect modalR = {mx, my, mw, mh};
+    canvas_.drawPanel(modalR, 14, Color(22, 22, 29), Palette::BorderLight, 2.0f);
+
+    // Top Header Pill Badge
+    Rect badgeR = {mx + 24, my + 22, 148, 26};
+    canvas_.fillRoundedRect(badgeR, 6, Palette::BorderLight);
+    canvas_.drawTextCentered(badgeR, "CATALOG SYNC", Palette::TextPrimary, 1, true);
+
+    canvas_.drawText(mx + 184, my + 24, "CACHE ALL PLUGIN PACKAGES?", Palette::AmberGold, 2, true);
+    canvas_.drawHLine(mx + 24, my + 62, mw - 48, Palette::BorderLight);
+
+    canvas_.drawTextCentered({mx + 24, my + 82, mw - 48, 24}, "Would you like to mirror all plugin zip archives locally?", Palette::TextPrimary, 2, false);
+    canvas_.drawTextCentered({mx + 24, my + 112, mw - 48, 22}, "- YES: Mirrors all missing .zip packages to disk for full OFFLINE use.", Palette::TextSecondary, 1, false);
+    canvas_.drawTextCentered({mx + 24, my + 138, mw - 48, 22}, "- NO: Refreshes catalog metadata, updates & thumbnails only (FAST).", Palette::TextSecondary, 1, false);
+
+    canvas_.drawHLine(mx + 24, my + 196, mw - 48, Palette::BorderDark);
+
+    // 3 Action Buttons: CANCEL | NO (METADATA ONLY) | YES (CACHE ALL)
+    int btnW = 196;
+    int btnH = 50;
+    int btnY = my + 218;
+
+    // Button 1: CANCEL ([-] MINUS)
+    Rect cancelBtn = {mx + 24, btnY, btnW, btnH};
+    canvas_.drawPanel(cancelBtn, 10, Palette::BgButton, Color(62, 62, 78), 1.0f);
+    canvas_.drawText(cancelBtn.x + 18, cancelBtn.y + 16, "CANCEL", Palette::TextPrimary, 2, true);
+    canvas_.drawTextRight(cancelBtn.x + cancelBtn.w - 14, cancelBtn.y + 19, "[-]", Palette::TextSecondary, 1, false);
+
+    // Button 2: NO (FAST SYNC)
+    Rect noBtn = {mx + 24 + btnW + 18, btnY, btnW, btnH};
+    canvas_.drawPanel(noBtn, 10, Color(28, 38, 48), Color(54, 82, 108), 1.2f);
+    canvas_.drawText(noBtn.x + 18, noBtn.y + 16, "NO (FAST)", Palette::StatusCyan, 2, true);
+    canvas_.drawTextRight(noBtn.x + noBtn.w - 14, noBtn.y + 19, "META ONLY", Palette::StatusCyan, 1, false);
+
+    // Button 3: YES (CACHE ALL)
+    Rect yesBtn = {mx + mw - 24 - btnW, btnY, btnW, btnH};
+    canvas_.fillRoundedRect(yesBtn, 10, Palette::AkaiRed);
+    canvas_.drawText(yesBtn.x + 18, yesBtn.y + 16, "YES (ALL)", Palette::TextPrimary, 2, true);
+    canvas_.drawTextRight(yesBtn.x + yesBtn.w - 14, yesBtn.y + 19, "DOWNLOAD", Palette::TextPrimary, 1, false);
+}
+
+void PluginManagerView::drawPurgePopup() {
+    int W = canvas_.getLogicalWidth();
+    int H = canvas_.getLogicalHeight();
+
+    if (filteredItems_.empty()) return;
+    const auto& ref = filteredItems_[selectedIndex_];
+    const auto& item = config_.sections[ref.sectionIdx].items[ref.itemIdx];
+    std::string cachedZipSize;
+    config::ConfigParser::isItemBinaryCached(item, &cachedZipSize);
+
+    // Dimmed full-screen backdrop
+    canvas_.fillRect({0, 62, W, H - 62}, Color(6, 6, 10, 215));
+
+    int mw = 580;
+    int mh = 280;
+    int mx = (W - mw) / 2;
+    int my = (H - mh) / 2;
+
+    Rect modalR = {mx, my, mw, mh};
+    canvas_.drawPanel(modalR, 14, Color(22, 22, 29), Palette::AkaiCrimson, 2.0f);
+
+    // Top Header Badge
+    Rect badgeR = {mx + 24, my + 22, 110, 26};
+    canvas_.fillRoundedRect(badgeR, 6, Palette::AkaiRed);
+    canvas_.drawTextCentered(badgeR, "PURGE ZIP", Palette::TextPrimary, 1, true);
+
+    canvas_.drawText(mx + 146, my + 24, "DELETE LOCAL ARCHIVE?", Palette::AmberGold, 2, true);
+    canvas_.drawHLine(mx + 24, my + 62, mw - 48, Palette::BorderLight);
+
+    std::string qLine = "Delete local package for " + item.label + "?";
+    canvas_.drawTextCentered({mx + 24, my + 84, mw - 48, 24}, qLine, Palette::TextPrimary, 2, true);
+
+    std::string sizeLine = "Frees " + (cachedZipSize.empty() ? item.sizeMb : cachedZipSize) + " on storage drive.";
+    canvas_.drawTextCentered({mx + 24, my + 114, mw - 48, 22}, sizeLine, Palette::TextSecondary, 1, false);
+    canvas_.drawTextCentered({mx + 24, my + 138, mw - 48, 22}, "(Installed synth files in /Synth remain untouched and active)", Palette::AmberGold, 1, false);
+
+    canvas_.drawHLine(mx + 24, my + 186, mw - 48, Palette::BorderDark);
+
+    // 2 Buttons: CANCEL ([-] MINUS) | PURGE ZIP ([+] PLUS / WHEEL)
+    int btnW = 240;
+    int btnH = 50;
+    int btnY = my + 206;
+
+    Rect cancelBtn = {mx + 24, btnY, btnW, btnH};
+    canvas_.drawPanel(cancelBtn, 10, Palette::BgButton, Color(62, 62, 78), 1.0f);
+    canvas_.drawText(cancelBtn.x + 20, cancelBtn.y + 16, "CANCEL", Palette::TextPrimary, 2, true);
+    canvas_.drawTextRight(cancelBtn.x + cancelBtn.w - 16, cancelBtn.y + 19, "[-] MINUS", Palette::TextSecondary, 1, false);
+
+    Rect purgeBtn = {mx + mw - 24 - btnW, btnY, btnW, btnH};
+    canvas_.fillRoundedRect(purgeBtn, 10, Palette::AkaiRed);
+    canvas_.drawText(purgeBtn.x + 20, purgeBtn.y + 16, "PURGE ZIP", Palette::TextPrimary, 2, true);
+    canvas_.drawTextRight(purgeBtn.x + purgeBtn.w - 16, purgeBtn.y + 19, "[+] / ENTER", Palette::TextPrimary, 1, false);
+}
+
 void PluginManagerView::drawScreensaver() {
     int W = canvas_.getLogicalWidth();
     int H = canvas_.getLogicalHeight();
@@ -1078,6 +1358,16 @@ void PluginManagerView::onWheelPress() {
         shouldExit_ = true;
         return;
     }
+    if (uiState_ == UIState::PURGE_POPUP) {
+        closePurgePopup();
+        triggerDeleteCurrentItemBinary();
+        return;
+    }
+    if (uiState_ == UIState::REFRESH_POPUP) {
+        closeRefreshPopup();
+        triggerCatalogRefresh();
+        return;
+    }
     if (uiState_ == UIState::INSTALL_POPUP) {
         confirmInstall();
         return;
@@ -1103,6 +1393,14 @@ void PluginManagerView::onMenuButton() {
         closeExitPopup();
         return;
     }
+    if (uiState_ == UIState::PURGE_POPUP) {
+        closePurgePopup();
+        return;
+    }
+    if (uiState_ == UIState::REFRESH_POPUP) {
+        closeRefreshPopup();
+        return;
+    }
     if (uiState_ == UIState::INSTALL_POPUP) {
         closeInstallPopup();
         return;
@@ -1123,6 +1421,60 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
     if (wakeIfScreensaver()) return;
     int W = canvas_.getLogicalWidth();
     int H = canvas_.getLogicalHeight();
+
+    if (uiState_ == UIState::PURGE_POPUP) {
+        int mw = 580;
+        int mh = 280;
+        int mx = (W - mw) / 2;
+        int my = (H - mh) / 2;
+        int btnW = 240;
+        int btnY = my + 206;
+
+        // Button 1: CANCEL ([-] MINUS)
+        if (lx >= mx + 20 && lx <= mx + 24 + btnW && ly >= btnY - 5 && ly <= btnY + 55) {
+            closePurgePopup();
+            return;
+        }
+
+        // Button 2: PURGE ZIP ([+] PLUS / ENTER)
+        int purgeX = mx + mw - 24 - btnW;
+        if (lx >= purgeX - 5 && lx <= purgeX + btnW + 5 && ly >= btnY - 5 && ly <= btnY + 55) {
+            closePurgePopup();
+            triggerDeleteCurrentItemBinary();
+            return;
+        }
+        return;
+    }
+
+    if (uiState_ == UIState::REFRESH_POPUP) {
+        int mw = 680;
+        int mh = 310;
+        int mx = (W - mw) / 2;
+        int my = (H - mh) / 2;
+        int btnW = 196;
+        int btnY = my + 218;
+
+        // Button 1: CANCEL
+        if (lx >= mx + 20 && lx <= mx + 24 + btnW && ly >= btnY - 5 && ly <= btnY + 55) {
+            closeRefreshPopup();
+            return;
+        }
+        // Button 2: NO (FAST METADATA SYNC)
+        int noX = mx + 24 + btnW + 18;
+        if (lx >= noX - 5 && lx <= noX + btnW + 5 && ly >= btnY - 5 && ly <= btnY + 55) {
+            closeRefreshPopup();
+            triggerCatalogRefresh();
+            return;
+        }
+        // Button 3: YES (FULL CACHE ALL BINARIES)
+        int yesX = mx + mw - 24 - btnW;
+        if (lx >= yesX - 5 && lx <= yesX + btnW + 5 && ly >= btnY - 5 && ly <= btnY + 55) {
+            closeRefreshPopup();
+            triggerCacheAllBinaries();
+            return;
+        }
+        return;
+    }
 
     if (uiState_ == UIState::EXIT_POPUP) {
         int mw = 560;
@@ -1182,9 +1534,10 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
         return;
     }
 
-    // Top Header REFRESH Button
+    // Top Header: REFRESH Button (opens CACHE ALL PLUGIN PACKAGES? prompt modal)
+    // Positioned at W - 442, width = 128, height = 36 (y: 13..49)
     if (ly >= 8 && ly <= 55 && lx >= W - 448 && lx <= W - 310) {
-        triggerCatalogRefresh();
+        openRefreshPopup();
         return;
     }
 
@@ -1204,16 +1557,33 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
             render();
             return;
         }
+
         if (!filteredItems_.empty()) {
             const auto& ref = filteredItems_[selectedIndex_];
             const auto& item = config_.sections[ref.sectionIdx].items[ref.itemIdx];
-            // UNINSTALL button (close to REINSTALL when installed and not broken)
-            if (item.installed && !item.broken && lx >= W - 360 && lx <= W - 192 && ly >= 72 && ly <= 132) {
+            bool isCached = config::ConfigParser::isItemBinaryCached(item);
+
+            // Single ZIP button:
+            // - If cached: Button displays "ZIP: X.X MB" -> Tapping opens confirmation popup to purge
+            // - If not cached: Button displays "CACHE ZIP" -> Tapping triggers immediate download & cache
+            // Positioned at W - 496, w = 130, h = 44 (x: W - 505 .. W - 360, y: 72..132)
+            if (lx >= W - 505 && lx <= W - 360 && ly >= 72 && ly <= 132) {
+                if (isCached) {
+                    openPurgePopup();
+                } else {
+                    triggerCacheCurrentItem();
+                }
+                return;
+            }
+
+            // UNINSTALL button (close to REINSTALL when installed and not broken, W - 356 .. W - 200)
+            if (item.installed && !item.broken && lx >= W - 360 && lx <= W - 200 && ly >= 72 && ly <= 132) {
                 triggerUninstall();
                 return;
             }
         }
-        // INSTALL / REINSTALL / REPAIR button
+
+        // INSTALL / REINSTALL / REPAIR button (W - 190 .. W - 20, y: 72..132)
         if (lx >= W - 190 && ly >= 72 && ly <= 132) {
             openInstallPopup();
             return;

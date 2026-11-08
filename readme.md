@@ -1,10 +1,15 @@
-# The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.1.2 — v1.1.2)
-
-<img width="954" height="598" alt="image" src="https://github.com/user-attachments/assets/46fcd497-ada7-407e-bf25-5c4532bf7548" />
+# The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.1.4 — v1.1.4)
 
 Standalone VST2 / Addin / Patch manager for **Akai MPC Live / Live II / One / One+ / X / Key 37 / Key 61 / Force** written in native **C++17** (Linux Framebuffer `/dev/fb0`, ALSA RawMIDI & `evdev` Touchscreen, zero external build dependencies).
 
-- **Release Tag**: `V1.1.2` (`v1.1.2`)
+- **Release Tag**: `V1.1.4` (`v1.1.4`)
+- **Key Enhancements in V1.1.3**:
+  - **Online & Local Modes (Toggle)**: Tap the `[ONLINE]` / `[LOCAL]` button in the top bar to switch between online catalog browsing and 100% offline local operation.
+  - **Offline Local Refresh**: In `LOCAL` mode, pressing `[REFRESH]` updates the local UI and installation state without pinging or requiring internet access.
+  - **Binary Mirroring / Caching (`CACHE ALL` / `CACHE ZIP`)**: In `ONLINE` mode, download and store complete plugin archives (`plugins/<id>/<id>.zip`) directly on your external USB drive.
+  - **Offline Direct Installation**: If a plugin binary is present locally on disk (`isCached`), it can be installed immediately offline without downloading.
+  - **Binary Archive Purge (`PURGE ZIP`)**: Safely remove the local `.zip` archive to free USB storage without affecting already-installed `/Synth` files.
+  - **Safe MPC.settings XML Handling**: strictly safeguards existing user `<Location>` entries in `<SynthContentLocations>`.
 
 ---
 

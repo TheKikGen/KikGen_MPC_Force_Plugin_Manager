@@ -16,13 +16,13 @@
 
 namespace tkgl::config {
 
-constexpr const char* TKGL_MANAGER_VERSION = "V1.1.2 (v1.1.2)";
+constexpr const char* TKGL_MANAGER_VERSION = "V1.1.7 (v1.1.7)";
 
 struct MenuItem {
     std::string id;
     std::string label;
     std::string author        = "The KikGen Labs";
-    std::string version       = "v1.1.2";
+    std::string version       = "v1.1.4";
     std::string category      = "Synthesizer";
     std::string shortType     = "INST";
     std::string channel       = "Stable";
@@ -43,6 +43,8 @@ struct MenuItem {
     bool        installed     = false;
     bool        updateAvail   = false;
     bool        broken        = false;
+    bool        isCached      = false;
+    std::string cachedZipSize = "";
     std::vector<std::string> tags;
 };
 
@@ -92,6 +94,10 @@ public:
     static int  executeItemCommand(const LauncherConfig& cfg, const MenuItem& item, std::vector<std::string>& outLogs);
     static void ensureManagerSynthsInMpcSettings(std::vector<std::string>* outLogs = nullptr);
     static void refreshInstallStates(LauncherConfig& config, std::vector<std::string>* outLogs = nullptr);
+    static bool isItemBinaryCached(const MenuItem& item, std::string* outSizeStr = nullptr, std::string* outZipPath = nullptr);
+    static bool cacheItemBinary(const MenuItem& item, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
+    static bool deleteItemBinary(const MenuItem& item, std::vector<std::string>& outLogs);
+    static int  cacheAllCatalogBinaries(LauncherConfig& config, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
 };
 
 using PluginCatalogConfig = LauncherConfig;
