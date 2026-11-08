@@ -12,6 +12,7 @@ Standalone VST2 / Addin / Patch manager for **Akai MPC Live / Live II / One / On
   - **Safe MPC.settings XML Handling**: strictly safeguards existing user `<Location>` entries in `<SynthContentLocations>`.
 
 ---
+<img width="941" height="584" alt="image" src="https://github.com/user-attachments/assets/9f419a45-d5d2-4f16-bcf0-c20d69b04984" />
 
 ## 1. Package Architecture & Directory Tree
 
