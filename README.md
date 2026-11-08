@@ -13,6 +13,7 @@ Standalone VST2 / Addin / Patch manager for **Akai MPC Live / Live II / One / On
 
 ---
 <img width="941" height="584" alt="image" src="https://github.com/user-attachments/assets/9f419a45-d5d2-4f16-bcf0-c20d69b04984" />
+<img width="931" height="584" alt="image" src="https://github.com/user-attachments/assets/4ff0794f-e983-4b2c-8b6d-dccd68c16d12" />
 
 ## 1. Package Architecture & Directory Tree
 
