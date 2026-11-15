@@ -1,4 +1,5 @@
 # The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.2.15)
+<img width="948" height="594" alt="image" src="https://github.com/user-attachments/assets/e8c59a7f-fb9e-4e55-8245-bfd1eda6ea7a" />
 
 Standalone VST2 / Addin / Patch / Companion App manager for **Akai MPC Live / Live II / One / One+ / X / Key 37 / Key 61 / Force** written in native **C++17** (Linux DRM/KMS & `/dev/fb0` Framebuffer, ALSA RawMIDI & `evdev` Touchscreen).
 
@@ -59,10 +60,7 @@ sudo apt-get install -y g++-arm-linux-gnueabihf libasound2-dev libcurl4-openssl-
   make
   # or: make armv7
   ```
-- **Patched build for older target GLIBC (links against `target_libs/` from target device)**:
-  ```bash
-  make patched
-  ```
+ 
   *(Generates `csu_stubs.o` to satisfy `__libc_csu_init`/`__libc_csu_fini`, strips binary, and verifies max GLIBC/GLIBCXX symbols)*
 - **Inspect GLIBC version dependencies**:
   ```bash
@@ -95,7 +93,7 @@ The compiled binary is named `mpc_plugin_manager_fb`.
   Outputs:
   ```text
   The KikGen Labs - Plugins Manager for Akai MPC and Force Devices
-  Version: V1.2.16 (v1.2.16) - Compiled on <Date> <Time>
+  Version: V1.2.15 (v1.2.15) - Compiled on <Date> <Time>
   ```
 - **Direct File Downloader Helper (`--fetch <url> <dest_path>`)**:
   ```bash
@@ -128,7 +126,7 @@ chmod 755 /tmp/mpc_plugin_manager_fb
    - `MPC.settings` contains native Akai synth paths inside `<VALUE name="SynthContentLocations"><SynthContentLocations>` (such as `/usr/share/Akai/Content/Synths` or `/media/<Drive>/Synths`).
    - The Plugin Manager **never deletes or alters** existing `<Location>` entries in `MPC.settings`.
 2. **Multi-Drive Installation Targets (`getSynthContentLocations()`)**:
-   - Third-party VST2 plugins always target a **`VST2 Plugins`** folder:
+   - Third-party VST2 plugins always target a **`VST2 Plugins`** folder (as in the MPC 3.10) :
      1. The Plugin Manager's own directory: `<ManagerRootDir>/VST2 Plugins` (e.g., on the USB stick).
      2. Every writable mounted volume under `/media/<DriveName>` (internal SATA SSD 1, SATA SSD 2, SD card, USB drives — strictly excluding the internal system flash `/media/az01-internal`) is offered as **`/media/<DriveName>/VST2 Plugins`**, **even if the `VST2 Plugins` folder does not exist yet on that drive**.
    - Free space is queried directly via `statvfs()` on the folder (or its parent mount point if the `VST2 Plugins` subfolder has not been created yet), and targets are sorted from largest to smallest available space.
