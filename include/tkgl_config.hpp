@@ -12,11 +12,12 @@
 
 #include <string>
 #include <vector>
+#include <set>
 #include <functional>
 
 namespace tkgl::config {
 
-constexpr const char* TKGL_MANAGER_VERSION = "V1.1.7 (v1.1.7)";
+constexpr const char* TKGL_MANAGER_VERSION = "V1.2.15 (v1.2.15)";
 
 struct MenuItem {
     std::string id;
@@ -40,19 +41,40 @@ struct MenuItem {
     std::string description;
     std::string cmd;
     int         is_inline     = 0;
-    bool        installed     = false;
+    int         installed     = 0; // 0 = uninstalled / not installed, 1 = installed & accessible, 2 = broken (.so path missing)
     bool        updateAvail   = false;
-    bool        broken        = false;
     bool        isCached      = false;
     std::string cachedZipSize = "";
     std::vector<std::string> tags;
+    std::string skinFolderPath = ""; // Complete resolved path from root (/)
 };
 
 struct SynthLocation {
     std::string path;
     std::string label;
     std::string freeSpace;
+    uint64_t    freeBytes = 0;
     bool        isManagerDefault = false;
+};
+
+struct MpcSettingsBackup {
+    std::string filename;
+    std::string fullPath;
+    std::string timestampFormatted;
+    size_t      fileSize = 0;
+    int         pluginCount = 0;
+};
+
+struct SanityCheckIssue {
+    enum Type {
+        ORPHAN_SYNTH_DIR = 1, // Present in writable SynthLocation on disk, absent from MPC.settings KNOWNPLUGINS
+        MISSING_SO_PATH  = 2  // Declared in MPC.settings KNOWNPLUGINS, but .so file not found on disk
+    };
+    int         type = ORPHAN_SYNTH_DIR;
+    std::string pluginName;
+    std::string dirPath;
+    std::string soPath;
+    std::string synthRoot;
 };
 
 struct Section {
@@ -98,6 +120,24 @@ public:
     static bool cacheItemBinary(const MenuItem& item, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
     static bool deleteItemBinary(const MenuItem& item, std::vector<std::string>& outLogs);
     static int  cacheAllCatalogBinaries(LauncherConfig& config, std::vector<std::string>& outLogs, std::function<void(const std::string&)> onProgress = nullptr);
+    static std::string resolveMpcSettingsPath();
+    static std::string resolveBackupDirectory();
+    static std::vector<MpcSettingsBackup> listMpcSettingsBackups();
+    static bool restoreMpcSettingsBackup(const std::string& backupPath, std::vector<std::string>& outLogs);
+    static bool deleteMpcSettingsBackup(const std::string& backupPath, std::vector<std::string>& outLogs);
+    static bool isSynthDirectoryWritable(const std::string& path);
+    static void initLogFile();
+    static void logMessage(const std::string& msg);
+    static void initSession();
+    static bool hasStagedMpcSettings();
+    static bool commitSessionMpcSettings(std::vector<std::string>* outLogs = nullptr);
+    static void enforceBackupRetention(size_t maxKeep = 10, std::vector<std::string>* outLogs = nullptr);
+    static std::vector<std::string> readSystemBootLogs(size_t maxLines = 250);
+    static bool enableSshAccess(bool permanent, std::string& outStatusMsg);
+    static std::vector<SanityCheckIssue> runSanityChecks(const LauncherConfig& config, std::vector<std::string>* outLogs = nullptr);
+    static bool repairSanityIssue(LauncherConfig& config, const SanityCheckIssue& issue, std::string& outStatusMsg, std::vector<std::string>* outLogs = nullptr);
+    static bool deleteSanityIssue(LauncherConfig& config, const SanityCheckIssue& issue, std::string& outStatusMsg, std::vector<std::string>* outLogs = nullptr);
+    static int  applyPresetsPathsForAllInstalled(const LauncherConfig& config, int& outPluginsCount, std::string& outStatusMsg, std::vector<std::string>* outLogs = nullptr);
 };
 
 using PluginCatalogConfig = LauncherConfig;

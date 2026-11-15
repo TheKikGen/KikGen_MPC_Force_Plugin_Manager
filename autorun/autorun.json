@@ -1,12 +1,12 @@
 {
   "value0": {
-    "files": [], 
+    "files": [],
     "scripts": [
       {
-        "askQuestion": true, 
-        "path": "tkgl_static_script.sh", 
-        "message": "Install content? This will execute tkgl_static_script.sh", 
-        "noButtonText": "no", 
+        "askQuestion": true,
+        "path": "tkgl_static_script.sh",
+        "message": "Launch The KikGenLabs Plugin Manager ?",
+        "noButtonText": "no",
         "yesButtonText": "yes"
       }
     ]

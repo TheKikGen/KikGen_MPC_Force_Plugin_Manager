@@ -24,7 +24,10 @@ enum class UIState {
     INSTALL_POPUP = 3, // Installation Popup with SynthContentLocations pick list
     EXIT_POPUP    = 4, // Confirmation Popup to quit the Plugin Manager
     REFRESH_POPUP = 5, // Prompt: CACHE ALL PLUGIN PACKAGES? (YES / NO / CANCEL)
-    PURGE_POPUP   = 6  // Confirmation Popup to delete/purge local cached ZIP package
+    PURGE_POPUP   = 6, // Confirmation Popup to delete/purge local cached ZIP package
+    SETTINGS_SCREEN = 7, // Advanced Settings (Tab 1: Plugin Manager / Tab 2: MPC Settings & Rollback)
+    RESTORE_BACKUP_POPUP = 8, // Confirmation Modal before restoring selected MPC.settings backup
+    DELETE_BACKUP_POPUP  = 9  // Confirmation Modal before permanently deleting selected backup
 };
 
 enum class FilterTab {
@@ -47,6 +50,8 @@ private:
     UIState   prevUiState_   = UIState::MENU;
     FilterTab activeTab_     = FilterTab::DISCOVER;
     int       sectionFilter_ = -1;
+    std::string categoryFilter_ = "ALL";
+    int       sortBy_        = 0; // 0 = UPDATED, 1 = NAME, 2 = SIZE, 3 = DOWNLOADS
     int       selectedIndex_ = 0;
     int       itemsPerPage_  = 3;
 
@@ -59,6 +64,20 @@ private:
     std::vector<config::SynthLocation> synthLocations_;
     int                                selectedSynthLocIdx_ = 0;
 
+    int                                settingsTab_          = 0; // 0 = Plugin Manager, 1 = MPC Settings
+    int                                mpcSettingsSubTab_    = 0; // 0 = ROLL BACK, 1 = LIMITS, 2 = SSH, 3 = BOOT LOG, 4 = SANITY CHECKS
+    std::vector<config::MpcSettingsBackup> mpcBackups_;
+    int                                selectedBackupIdx_    = 0;
+    int                                backupScrollOffset_   = 0;
+    std::vector<std::string>           bootLogLines_;
+    int                                bootLogScrollOffset_  = 0;
+    int                                sshEnabledMode_       = 0; // 0=inactive, 1=session, 2=permanent
+    std::vector<config::SanityCheckIssue> sanityIssues_;
+    int                                selectedSanityIdx_    = 0;
+    int                                sanityScrollOffset_   = 0;
+    std::string                        settingsStatusMsg_;
+    int                                settingsStatusColor_  = 0; // 0=none, 1=green, 2=red
+
     bool                               isScreensaver_       = false;
     std::time_t                        lastActivityTime_    = 0;
     int                                screensaverTick_     = 0;
@@ -66,6 +85,9 @@ private:
     bool                               shouldExit_          = false;
 
     bool wakeIfScreensaver();
+    std::vector<std::string> getAvailableCategories() const;
+    void cycleCategoryFilter();
+    void cycleSortOption();
     void rebuildFilteredItems();
     void triggerCatalogRefresh();
     void triggerCacheAllBinaries();
@@ -75,12 +97,24 @@ private:
     void closeInstallPopup();
     void confirmInstall();
     void triggerUninstall();
+    void triggerRepair();
     void openExitPopup();
     void closeExitPopup();
     void openRefreshPopup();
     void closeRefreshPopup();
     void openPurgePopup();
     void closePurgePopup();
+    void openSettingsScreen();
+    void closeSettingsScreen();
+    void refreshMpcBackups();
+    void refreshBootLogs();
+    void refreshSanityChecks();
+    void openRestoreBackupPopup();
+    void closeRestoreBackupPopup();
+    void openDeleteBackupPopup();
+    void closeDeleteBackupPopup();
+    void executeRestoreSelectedBackup();
+    void executeDeleteSelectedBackup();
     void drawTopHeader();
     void drawFilterBar();
     void drawCardThumbnail(gfx::Rect r, const config::MenuItem& item, int index, bool large = false);
@@ -90,6 +124,16 @@ private:
     void drawExitPopup();
     void drawRefreshPopup();
     void drawPurgePopup();
+    void drawRestoreBackupPopup();
+    void drawDeleteBackupPopup();
+    void drawSettingsScreen();
+    void drawPluginManagerSettingsTab();
+    void drawMpcSettingsTab();
+    void drawMpcRollbackSubTab();
+    void drawMpcLimitsSubTab();
+    void drawMpcSshSubTab();
+    void drawMpcBootLogSubTab();
+    void drawMpcSanitySubTab();
     void drawExecutionScreen();
     void drawBottomPaginationBar();
     void drawScreensaver();

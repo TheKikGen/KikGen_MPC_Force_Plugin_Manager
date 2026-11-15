@@ -138,12 +138,15 @@ public:
     void fillCircleAA(int cx, int cy, float radius, Color c);
     void drawCircleAA(int cx, int cy, float radius, Color borderColor, float thickness = 1.0f);
 
-    // Vector Icons matching Hardware Simulator (image_22ce5693.png)
+    // Vector Icons matching Hardware Simulator (image_22ce5693.png & image_54d88661.png)
     void drawCheckmarkIcon(int x, int y, int size, Color c);
     void drawDownloadIcon(int x, int y, int size, Color c);
     void drawRefreshIcon(int x, int y, int size, Color c);
     void drawChevronIcon(int x, int y, int size, bool pointLeft, Color c);
     void drawExternalLinkIcon(int x, int y, int size, Color c);
+    void drawFilterIcon(int x, int y, int size, Color c);
+    void drawDownTriangle(int x, int y, int size, Color c);
+    void drawSortIcon(int x, int y, int size, Color c);
 
     // Smooth Anti-Aliased Typography with EPX Diagonal Smoothing & Tall Monospace Proportions
     int  charAdvance(int scale) const;

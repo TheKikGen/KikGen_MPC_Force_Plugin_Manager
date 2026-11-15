@@ -559,6 +559,49 @@ void DrmFramebufferCanvas::drawExternalLinkIcon(int x, int y, int size, Color c)
     drawLineAA(x + s * 0.88f, y + s * 0.12f, x + s * 0.88f, y + s * 0.42f, c, 1.5f);
 }
 
+// Vector Filter Funnel Icon (matching image_54d88661.png)
+void DrmFramebufferCanvas::drawFilterIcon(int x, int y, int size, Color c) {
+    float s = static_cast<float>(size);
+    float cx = x + s * 0.5f;
+    // Top horizontal rim
+    drawLineAA(x + s * 0.12f, y + s * 0.16f, x + s * 0.88f, y + s * 0.16f, c, 1.6f);
+    // Left diagonal down to neck
+    drawLineAA(x + s * 0.12f, y + s * 0.16f, cx - s * 0.10f, y + s * 0.52f, c, 1.6f);
+    // Right diagonal down to neck
+    drawLineAA(x + s * 0.88f, y + s * 0.16f, cx + s * 0.10f, y + s * 0.52f, c, 1.6f);
+    // Left neck down
+    drawLineAA(cx - s * 0.10f, y + s * 0.52f, cx - s * 0.10f, y + s * 0.88f, c, 1.6f);
+    // Right neck down
+    drawLineAA(cx + s * 0.10f, y + s * 0.52f, cx + s * 0.10f, y + s * 0.78f, c, 1.6f);
+    // Bottom spout diagonal
+    drawLineAA(cx - s * 0.10f, y + s * 0.88f, cx + s * 0.10f, y + s * 0.78f, c, 1.6f);
+}
+
+// Vector Down Triangle (▼)
+void DrmFramebufferCanvas::drawDownTriangle(int x, int y, int size, Color c) {
+    float s = static_cast<float>(size);
+    float cx = x + s * 0.5f;
+    for (float i = 0; i <= s * 0.65f; i += 1.0f) {
+        float halfW = (s * 0.5f) * (1.0f - i / (s * 0.65f));
+        drawLineAA(cx - halfW, y + i, cx + halfW, y + i, c, 1.2f);
+    }
+}
+
+// Vector Up/Down Sort Icon (⇅ matching image_54d88661.png)
+void DrmFramebufferCanvas::drawSortIcon(int x, int y, int size, Color c) {
+    float s = static_cast<float>(size);
+    float leftX = x + s * 0.32f;
+    float rightX = x + s * 0.68f;
+    // Up arrow on the left
+    drawLineAA(leftX, y + s * 0.82f, leftX, y + s * 0.20f, c, 1.6f);
+    drawLineAA(leftX - s * 0.18f, y + s * 0.40f, leftX, y + s * 0.18f, c, 1.6f);
+    drawLineAA(leftX + s * 0.18f, y + s * 0.40f, leftX, y + s * 0.18f, c, 1.6f);
+    // Down arrow on the right
+    drawLineAA(rightX, y + s * 0.18f, rightX, y + s * 0.80f, c, 1.6f);
+    drawLineAA(rightX - s * 0.18f, y + s * 0.60f, rightX, y + s * 0.82f, c, 1.6f);
+    drawLineAA(rightX + s * 0.18f, y + s * 0.60f, rightX, y + s * 0.82f, c, 1.6f);
+}
+
 // ============================================================================
 // Smooth Anti-Aliased EPX / Subpixel Monospace Font Engine
 // ============================================================================

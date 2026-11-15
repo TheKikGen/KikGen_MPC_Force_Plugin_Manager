@@ -229,13 +229,24 @@ static void touch_thread_func(tkgl::gfx::DrmFramebufferCanvas* canvas, tkgl::ui:
 }
 
 int main(int argc, char* argv[]) {
+    // Check command line option -v / --version anywhere in arguments
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--version") == 0) {
+            std::printf("The KikGen Labs - Plugins Manager for Akai MPC and Force Devices\n");
+            std::printf("Version: %s - Compiled on %s %s\n", tkgl::config::TKGL_MANAGER_VERSION, __DATE__, __TIME__);
+            return 0;
+        }
+    }
+
     // 1. Startup Prompt & Version identification per specification
     std::printf("The KikGen Labs - Plugins Manager for Akai MPC and Force Devices\n");
     std::printf("Version: %s - Compiled on %s %s\n", tkgl::config::TKGL_MANAGER_VERSION, __DATE__, __TIME__);
 
-    if (argc >= 2 && (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0)) {
-        return 0;
-    }
+    // Initialize clean persistent log file at manager startup (cleared on every launch)
+    tkgl::config::ConfigParser::initLogFile();
+
+    // Initialize session staging in /tmp/MPC.settings.new and clean up obsolete tmp files
+    tkgl::config::ConfigParser::initSession();
 
     // Headless helper mode: mpc_plugin_manager_fb --fetch <url> <dest> (uses libcurl IPv4)
     if (argc >= 4 && std::strcmp(argv[1], "--fetch") == 0) {
@@ -295,6 +306,17 @@ int main(int argc, char* argv[]) {
 
     if (midiThread.joinable()) midiThread.join();
     if (touchThread.joinable()) touchThread.join();
+
+    // Commit session staged changes in /tmp/MPC.settings.new if dirty
+    if (tkgl::config::ConfigParser::hasStagedMpcSettings()) {
+        std::vector<std::string> exitLogs;
+        std::printf("[TKGL-MAIN] Committing session staged MPC.settings changes...\n");
+        tkgl::config::ConfigParser::commitSessionMpcSettings(&exitLogs);
+        for (const auto& log : exitLogs) {
+            std::printf("%s\n", log.c_str());
+        }
+    }
+
     canvas.clearScreenBlack();
     canvas.shutdown();
     return 0;

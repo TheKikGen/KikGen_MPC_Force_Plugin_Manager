@@ -1,19 +1,19 @@
-# The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.1.4 — v1.1.4)
+# The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.2.15 — v1.2.15)
 
 Standalone VST2 / Addin / Patch manager for **Akai MPC Live / Live II / One / One+ / X / Key 37 / Key 61 / Force** written in native **C++17** (Linux Framebuffer `/dev/fb0`, ALSA RawMIDI & `evdev` Touchscreen, zero external build dependencies).
 
-- **Release Tag**: `V1.1.4` (`v1.1.4`)
-- **Key Enhancements in V1.1.3**:
-  - **Online & Local Modes (Toggle)**: Tap the `[ONLINE]` / `[LOCAL]` button in the top bar to switch between online catalog browsing and 100% offline local operation.
-  - **Offline Local Refresh**: In `LOCAL` mode, pressing `[REFRESH]` updates the local UI and installation state without pinging or requiring internet access.
-  - **Binary Mirroring / Caching (`CACHE ALL` / `CACHE ZIP`)**: In `ONLINE` mode, download and store complete plugin archives (`plugins/<id>/<id>.zip`) directly on your external USB drive.
-  - **Offline Direct Installation**: If a plugin binary is present locally on disk (`isCached`), it can be installed immediately offline without downloading.
-  - **Binary Archive Purge (`PURGE ZIP`)**: Safely remove the local `.zip` archive to free USB storage without affecting already-installed `/Synth` files.
-  - **Safe MPC.settings XML Handling**: strictly safeguards existing user `<Location>` entries in `<SynthContentLocations>`.
+- **Release Tag**: `V1.2.15` (`v1.2.15`)
+- **Key Enhancements in V1.2.15**:
+  - **Persistent Logging (`plgman_log.txt`)**: Full execution and diagnostic log generated in root directory (`PLG_MAN_DIR` or local), cleared on each launch.
+  - **Command-Line Version Option (`-v` / `--version`)**: Outputs the manager banner, version, and compile timestamp to stdout and exits immediately (code 0).
+  - **Reliable XML Atomic Buffer Writing**: XML writes are safely staged to RAM (`/tmp/mpc_settings_new.tmp`) before copying directly over active `MPC.settings`, eliminating write failures on internal storage partitions.
+  - **Robust MPC.Settings Restore**: Direct stream file copy of backup files over active `MPC.settings` with automatic safety backup (`MPC.settings.bak-YYYYMMDDHHMMSS`).
+  - **Plugin Count in Backup History**: Backup list now clearly displays registered plugin count (e.g. `18 plugins`) for each backup copy; list is smoothly scrolled with the physical data wheel.
+  - **Dual UNINSTALL & REPAIR on Broken Plugins**: Broken plugins (`installed == 2`) provide both `[ UNINSTALL ]` (thorough cleanup of all SynthLocations and settings) and `[ REPAIR ]` (clean reinstallation with location selection).
+  - **Strict Broken State Definition**: A plugin is only considered broken if registered in `MPC.settings` `KNOWNPLUGINS` but missing on storage. Orphan directories without registry entries remain clean (`installed = 0`).
+  - **3-Level Hierarchical Filtering**: Level 1 (`DISCOVER` / `INSTALLED` / `UPDATES`), Level 2 (`ALL` / `INSTRUMENTS` / `MIDI` / `EFFECTS` / `ADDINS` / `DEVICE PATCHES` / `COMPANION APPS`), and Level 3 (dynamic Category Sub-Filter button `[ ▽ ALL ▼ ]` cycling through available sub-categories of the active section, plus `Sort` button).
 
 ---
-<img width="941" height="584" alt="image" src="https://github.com/user-attachments/assets/9f419a45-d5d2-4f16-bcf0-c20d69b04984" />
-<img width="931" height="584" alt="image" src="https://github.com/user-attachments/assets/4ff0794f-e983-4b2c-8b6d-dccd68c16d12" />
 
 ## 1. Package Architecture & Directory Tree
 
@@ -38,7 +38,7 @@ KikGen_MPC_Force_Plugin_Manager/
 │       ├── manifest.json         # Plugin metadata
 │       ├── install.sh            # Standalone installation script
 │       └── uninstall.sh          # Standalone uninstallation script
-└── Synths/                       # Default local directory for VST plugin installations
+└── VST2 Plugins/                 # Default local directory for VST2 plugin installations
 ```
 
 ---
@@ -57,6 +57,15 @@ sudo apt-get install -y g++-arm-linux-gnueabihf libasound2-dev
   ```bash
   make
   # or: make armv7
+  ```
+- **Patched build for GLIBC conflicts (links against `target_libs/` from target device)**:
+  ```bash
+  make patched
+  ```
+  *(Generates `csu_stubs.o` to satisfy `__libc_csu_init`/`__libc_csu_fini`, strips binary, and verifies max GLIBC/GLIBCXX symbols)*
+- **Inspect GLIBC version dependencies**:
+  ```bash
+  make check-glibc BIN=mpc_plugin_manager_fb
   ```
 - **Single-file amalgamated build (`mpc_plugin_manager_fb.cpp`)**:
   ```bash
@@ -77,7 +86,7 @@ The compiled binary is named `mpc_plugin_manager_fb`.
 On launch (or with `--version` / `-v`), the binary outputs its identification banner with the compilation timestamp:
 ```text
 The KikGen Labs - Plugins Manager for Akai MPC and Force Devices
-Version: V1.1.2 (v1.1.2) - Compiled on Nov  7 2026 02:53:01
+Version: V1.2.15 (v1.2.15) - Compiled on Nov  7 2026 02:53:01
 ```
 
 ### Case A — Direct Execution (`ext4` partition or executable storage)
@@ -103,12 +112,12 @@ chmod 755 /tmp/mpc_plugin_manager_fb
 ```
 
 #### Root Directory Resolution Priority (`ConfigParser::getManagerRootDir()`):
-1. **`PLG_MAN_DIR`**: If the `PLG_MAN_DIR` environment variable is set and non-empty, its value defines the root directory (`mpc_plugins.conf`, `plugins/`, `Synths/`).
+1. **`PLG_MAN_DIR`**: If the `PLG_MAN_DIR` environment variable is set and non-empty, its value defines the root directory (`mpc_plugins.conf`, `plugins/`, `VST2 Plugins/`, `backups/`).
 2. **`/proc/self/exe`**: Otherwise, the directory containing the running executable is used.
 3. **`getcwd()`**: Fallback to the current working directory.
 
 #### Automatic `<SynthContentLocations>` Verification on Startup:
-Because the Akai MPC OS application periodically cleans up `MPC.settings`, the Plugin Manager automatically verifies on every launch (`ConfigParser::ensureManagerSynthsInMpcSettings()`) that `<Location><ManagerRootDir>/Synths</Location>` is present inside `<VALUE name="SynthContentLocations"><SynthContentLocations>`. If missing, it creates a human-readable backup (`MPC.settings.bak-YYYYMMDDHHMMSS`), validates the XML structure, and restores the `Synths` location so plugins stored on the USB drive remain visible to the MPC.
+Because the Akai MPC OS application periodically cleans up `MPC.settings`, the Plugin Manager automatically verifies on every launch (`ConfigParser::ensureManagerSynthsInMpcSettings()`) that `<Location><ManagerRootDir>/VST2 Plugins</Location>` is present inside `<VALUE name="SynthContentLocations"><SynthContentLocations>`. If missing, it stages the update in `/tmp/MPC.settings.new`, validates the XML structure, and restores the `VST2 Plugins` location so plugins stored on the USB drive remain visible to the MPC.
 
 ---
 
@@ -125,7 +134,7 @@ Pressing the **`[REFRESH]`** button in the top bar performs a complete online sy
    - For every plugin in the catalog, checks whether `plugins/<plugin-id>/thumb.png` exists on disk. If the file is missing, it is automatically downloaded from `screenshotUrl` via `libcurl` (IPv4), verified against the 8-byte PNG signature, and linked in `mpc_plugins.conf`.
 4. **Verification of Previously Installed Plugins in `MPC.settings`**:
    - For every plugin registered or previously detected as installed, scans `/media/az01-internal/Settings/MPC/MPC.settings` inside `<VALUE name="pluginList-arm"><KNOWNPLUGINS><PLUGIN ... file="..."/>` (supporting both single-line and JUCE multi-line `<PLUGIN>` tags) and verifies that the referenced `.so` binary exists on disk so the plugin and its skin load properly.
-   - **Auto-Relocation**: If the `.so` file is missing at the registered path, the manager searches all directories listed in `<SynthContentLocations>` (requiring both subdir and binary filename to match when `targetSubdir` is specified). If found in another `SynthContentLocations` path, `MPC.settings` is backed up (`MPC.settings.bak-YYYYMMDDHHMMSS`), the `file="..."` attribute is automatically updated to the valid path, and a `[WARNING]` is logged.
+   - **Auto-Relocation**: If the `.so` file is missing at the registered path, the manager searches all directories listed in `<SynthContentLocations>` (requiring both subdir and binary filename to match when `targetSubdir` is specified). If found in another `SynthContentLocations` path, `MPC.settings` is backed up to the Manager backups directory (`MPC.settings.bak-YYYYMMDDHHMMSS`), the `file="..."` attribute is automatically updated to the valid path, and a `[WARNING]` is logged.
    - **Broken Installation Detection**: If the `.so` file cannot be found in any `SynthContentLocations` directory, the plugin installation is marked as **`BROKEN`** (`! BROKEN (.SO MISSING)`).
 
 ---
@@ -133,15 +142,15 @@ Pressing the **`[REFRESH]`** button in the top bar performs a complete online sy
 ## 5. Plugin Installation, Uninstall, Reinstall & Repair Workflows
 
 1. **Target Drive Selection**:
-   Scans `SynthContentLocations` from `MPC.settings`, mounted drives under `/media/*/Synths`, and `<PLG_MAN_DIR>/Synths`, displaying available free space for each location.
+   Scans `SynthContentLocations` from `MPC.settings`, mounted drives under `/media/*/VST2 Plugins`, and `<PLG_MAN_DIR>/VST2 Plugins`, displaying available free space for each location.
 2. **Step 1/4 — Safety Backup (Gold Rule — `YYYYMMDDHHMMSS`)**:
-   Creates a human-readable timestamped backup `MPC.settings.bak-YYYYMMDDHHMMSS` before any modification, and validates the XML document structure before atomically replacing `MPC.settings`.
+   Creates a human-readable timestamped backup `MPC.settings.bak-YYYYMMDDHHMMSS` in the dedicated backups directory (`$PLG_MAN_DIR/backups`) before any modification (retaining the 10 most recent backups), stages the new XML in `/tmp/MPC.settings.new` (RAM tmpfs), and safely overwrites active `MPC.settings` by direct copy.
 3. **Step 2/4 — `SynthContentLocations` Registration**:
-   Ensures the selected `Synths` directory is registered inside `<VALUE name="SynthContentLocations">` in `MPC.settings`.
+   Ensures the selected `VST2 Plugins` directory is registered inside `<VALUE name="SynthContentLocations">` in `MPC.settings`.
 4. **Step 3/4 — Download via `libcurl` (IPv4) & Archive Extraction**:
    - Verifies Internet connectivity via `ping_host`, then downloads the release archive via `libcurl` (IPv4) with automatic parent directory creation.
    - If `libcurl` fails or does not respond, download is aborted with an error message (no fallback).
-   - Extracts `portable/<Author> - VST - <Plugin>/` into the target `Synths` directory.
+   - Extracts `portable/<Author> - VST - <Plugin>/` into the target `VST2 Plugins` directory.
 5. **Step 4/4 — Registration in `pluginList-arm` (`INSTALL` / `REINSTALL` / `REPAIR`)**:
    - **Healthy Installed Plugins**: Opening the Detail View displays **`UNINSTALL`** right next to **`REINSTALL`**.
    - **Broken Installations (`REPAIR`)**: When a plugin installation is marked **`BROKEN`**, the Detail View proposes **`REPAIR`**. Repairing performs a full installation while purging all broken, stale, or invalid `<PLUGIN .../>` entries from `MPC.settings` before inserting a single clean `<PLUGIN .../>` registration.
