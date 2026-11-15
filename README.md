@@ -2,8 +2,7 @@
 
 Standalone VST2 / Addin / Patch / Companion App manager for **Akai MPC Live / Live II / One / One+ / X / Key 37 / Key 61 / Force** written in native **C++17** (Linux DRM/KMS & `/dev/fb0` Framebuffer, ALSA RawMIDI & `evdev` Touchscreen).
 
-- **Release Tag**: `V1.2.16` (`v1.2.16`)
-- **Key Highlights in V1.2.16**:
+- **Key Highlights
   - **Multi-Drive `"VST2 Plugins"` Architecture**: Uses `VST2 Plugins` as the standard third-party plugin folder across the Plugin Manager root (`<PLG_MAN_DIR>/VST2 Plugins`) and all writable external/internal drives (`/media/<Drive>/VST2 Plugins` on USB sticks, internal SATA SSD 1 / SATA SSD 2, SD cards), while preserving Akai's native `<Location>` entries in `MPC.settings` untouched.
   - **RAM Session Staging (`/tmp/MPC.settings.new`) & Single Commit on Exit**: All `MPC.settings` modifications during a session (install, reinstall, uninstall, repair, sanity check fixes, `<SynthContentLocations>` registration) are staged and validated in RAM (`/tmp/MPC.settings.new`) and committed once upon clean exit.
   - **UBIFS-Safe Atomic Commit & Strict Backup Integrity**: Pre-truncates and `fsync()`s active `/media/az01-internal/Settings/MPC/MPC.settings` before streaming the validated XML buffer to reclaim UBIFS Logical Erase Blocks (LEBs) immediately on saturated internal flash. Backups are exclusively stored in `<PLG_MAN_DIR>/backups/MPC.settings.bak-YYYYMMDDHHMMSS` after passing full XML integrity validation (`validateMpcSettingsXml`), and manual files inside `/media/az01-internal/Settings/MPC/` are never touched.
