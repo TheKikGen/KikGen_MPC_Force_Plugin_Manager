@@ -1,15 +1,20 @@
-# The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.2.15)
-<img width="948" height="594" alt="image" src="https://github.com/user-attachments/assets/e8c59a7f-fb9e-4e55-8245-bfd1eda6ea7a" />
+# The KikGen Labs — MPC & Force Standalone Plugin Manager (Release V1.2.23 — v1.2.23)
 
 Standalone VST2 / Addin / Patch / Companion App manager for **Akai MPC Live / Live II / One / One+ / X / Key 37 / Key 61 / Force** written in native **C++17** (Linux DRM/KMS & `/dev/fb0` Framebuffer, ALSA RawMIDI & `evdev` Touchscreen).
 
-- **Key Highlights
-  - **Multi-Drive `"VST2 Plugins"` Architecture**: Uses `VST2 Plugins` as the standard third-party plugin folder across the Plugin Manager root (`<PLG_MAN_DIR>/VST2 Plugins`) and all writable external/internal drives (`/media/<Drive>/VST2 Plugins` on USB sticks, internal SATA SSD 1 / SATA SSD 2, SD cards), while preserving Akai's native `<Location>` entries in `MPC.settings` untouched.
-  - **RAM Session Staging (`/tmp/MPC.settings.new`) & Single Commit on Exit**: All `MPC.settings` modifications during a session (install, reinstall, uninstall, repair, sanity check fixes, `<SynthContentLocations>` registration) are staged and validated in RAM (`/tmp/MPC.settings.new`) and committed once upon clean exit.
-  - **UBIFS-Safe Atomic Commit & Strict Backup Integrity**: Pre-truncates and `fsync()`s active `/media/az01-internal/Settings/MPC/MPC.settings` before streaming the validated XML buffer to reclaim UBIFS Logical Erase Blocks (LEBs) immediately on saturated internal flash. Backups are exclusively stored in `<PLG_MAN_DIR>/backups/MPC.settings.bak-YYYYMMDDHHMMSS` after passing full XML integrity validation (`validateMpcSettingsXml`), and manual files inside `/media/az01-internal/Settings/MPC/` are never touched.
-  - **Sanity Checks & Presets (`.xpl`) Path Synchronizer**: Built-in diagnostic and repair suite scanning all writable `VST2 Plugins` locations for orphan plugins, relinking or purging broken `<PLUGIN>` references in `MPC.settings`, and updating `<PLUGIN file="..."/>` inside `Presets/*.xpl` files while preserving `<version file="1"/>` and binary `<state>` payloads.
+- **Release Tag**: `V1.2.23` (`v1.2.23`)
+- **Key Highlights in V1.2.23**:
+  - **External Hotplug-Only Drive Scanning**: VST2 Plugins root discovery (`getSynthContentLocations()`, `getExternalHotplugMounts()`, install/uninstall/sanity scans) now inspects `/proc/mounts` + `/sys/block/` and strictly scans **external hotplug drives only** (USB drives and external SD card slots), excluding internal flash/eMMC (`az01-internal*`, `mmcblk0`), fixed internal partitions, virtual filesystems, and unmounted `/media/*` directories.
+  - **Broken Installation Uninstall Support**: Broken plugins (`installed == 2`) can now be cleanly uninstalled both from the **Detail View** `[UNINSTALL]` button and directly inside the **`REPAIR POPUP`**, purging residual folders and any legacy `MPC.settings` entries.
+  - **RAM-Safe Two-Phase Install & Automatic `plugin.json` Reconstitution**: Extracts only `.so` files to `/tmp` for 32/64-bit ELF architecture verification (preventing `/tmp` RAMFS exhaustion on large bundles), then unpacks directly onto the target storage drive; automatically reconstitutes missing `plugin.json` manifests from `mpc-plugin.json` / `plugin-meta.xml` and logs the reconstitution in `plgman_log.txt`.
+  - **MPC Binary Version Detection (`/usr/bin/MPC`) & Native VST2 Support (`>= 3.10`)**: Automatically parses the `"MPC" + "V.X.Y.Z (xxx)"` header from `/usr/bin/MPC` and displays it first inside **MPC Settings**. Starting with MPC OS **3.10**, native VST2 loading requires zero edits to `MPC.settings`; the manager leaves `MPC.settings` untouched during install/uninstall/init and detects plugins directly from disk `VST2 Plugins` folders at mount roots.
+  - **Mount-Root `"VST2 Plugins"` Architecture (`>= 3.10`)**: Since MPC OS 3.10 scans `<MountPoint>/VST2 Plugins` at the root of every writable mounted drive (excluding RO volumes and internal MPC flash), the Plugin Manager resolves the mount point on which it resides (`/media/<Mount>/VST2 Plugins`) rather than using a nested subfolder, alongside all writable `/media/<Drive>/VST2 Plugins` targets.
+  - **Startup Migration Alert & Sequenced Sanity Checks (`>= 3.10`)**: On launch under MPC OS `>= 3.10`, warns if `MPC.settings` still contains `VST2 Plugins` entries in `<SynthContentLocations>` or entries in `<KNOWNPLUGINS>` and directs the user to **MPC Settings -> Sanity Checks**. Once `<KNOWNPLUGINS>` are purged and outside-`VST2 Plugins` plugins are relocated, Sanity Checks proposes purging `VST2 Plugins` entries from `<SynthContentLocations>` with a pre-edit safety backup.
+  - **Sleep-Safe Dual-Port ALSA MIDI Session Listener**: Opens and keeps **both** Public and Private ALSA RawMIDI ports open across the entire Plugin Manager session (closing cleanly at session exit and tracing all port open/activity/close events in `plgman_log.txt`), ensuring zero dropped Jog Wheel or button inputs if either controller port enters sleep.
+  - **RAM Session Staging (`/tmp/MPC.settings.new`) & Single Commit on Exit**: When `MPC.settings` edits or Sanity Check purges occur, modifications are staged and validated in RAM (`/tmp/MPC.settings.new`) and committed once upon clean exit with UBIFS-safe pre-truncate + `fsync()`.
+  - **Sanity Checks & Presets (`.xpl`) Path Synchronizer**: Adapts automatically to MPC OS version: on `>= 3.10`, purges legacy `<KNOWNPLUGINS>`, relocates outside-`VST2 Plugins` installs to mount-root `VST2 Plugins`, then purges legacy `VST2 Plugins` `<SynthContentLocations>` entries; on `< 3.10`, repairs orphan plugins and broken `.so` paths, plus synchronizes `Presets/*.xpl` on all OS versions.
   - **Offline Binary Package Cache (`.zip`)**: Supports caching individual or all plugin release archives locally in `plugins/<plugin-id>/<plugin-id>.zip` for 100% offline installation and reinstallation, with one-tap cache purge.
-  - **Advanced Settings Suite**: Dedicated **Plugin Manager** and **MPC Settings** tabs including **ROLL BACK** (backup restore/delete with plugin count inspection), **LIMITS** (audio track/plugin instance unlocked limits), **SSH** (session or permanent Dropbear/OpenSSH activation on Port 22), **BOOT LOG** (`syslog`/`dmesg`/`plgman_log.txt` viewer), and **SANITY CHECKS**.
+  - **Advanced Settings Suite**: Dedicated **Plugin Manager** tab (including interactive **Screen Rotation** `No rotation` / `90` / `180` / `270` saved to `mpc_plugins.conf`) and **MPC Settings** tab (**ROLL BACK**, **BOOT LOG**, and **SANITY CHECKS**).
   - **3-Level Hierarchical Filtering & Sorting**: Level 1 (`DISCOVER` / `INSTALLED` / `UPDATES`), Level 2 (`ALL` / `INSTRUMENTS` / `MIDI` / `EFFECTS` / `ADDINS` / `DEVICE PATCHES` / `COMPANION APPS`), and Level 3 (dynamic Sub-Category filter `[ ▽ ALL ▼ ]` + multi-criteria `Sort` by Updated, Name, Size, or Downloads).
 
 ---
@@ -40,7 +45,7 @@ KikGen_MPC_Force_Plugin_Manager/
 │       ├── manifest.json         # Plugin metadata
 │       ├── install.sh            # Standalone installation script
 │       └── uninstall.sh          # Standalone uninstallation script
-└── VST2 Plugins/                 # Default local directory for third-party VST2 plugin installations
+└── VST2 Plugins/                 # Legacy (< 3.10) subfolder; on >= 3.10 created at <MountPoint>/VST2 Plugins/
 ```
 
 ---
@@ -60,7 +65,10 @@ sudo apt-get install -y g++-arm-linux-gnueabihf libasound2-dev libcurl4-openssl-
   make
   # or: make armv7
   ```
- 
+- **Patched build for older target GLIBC (links against `target_libs/` from target device)**:
+  ```bash
+  make patched
+  ```
   *(Generates `csu_stubs.o` to satisfy `__libc_csu_init`/`__libc_csu_fini`, strips binary, and verifies max GLIBC/GLIBCXX symbols)*
 - **Inspect GLIBC version dependencies**:
   ```bash
@@ -93,7 +101,7 @@ The compiled binary is named `mpc_plugin_manager_fb`.
   Outputs:
   ```text
   The KikGen Labs - Plugins Manager for Akai MPC and Force Devices
-  Version: V1.2.15 (v1.2.15) - Compiled on <Date> <Time>
+  Version: V1.2.23 (v1.2.23) - Compiled on <Date> <Time>
   ```
 - **Direct File Downloader Helper (`--fetch <url> <dest_path>`)**:
   ```bash
@@ -120,19 +128,18 @@ chmod 755 /tmp/mpc_plugin_manager_fb
 
 ---
 
-## 4. Multi-Drive `"VST2 Plugins"` Discovery & `<SynthContentLocations>` Management
+## 4. Multi-Drive `"VST2 Plugins"` Discovery & `<SynthContentLocations>`
 
-1. **Preservation of Existing Akai `<Location>` Entries**:
-   - `MPC.settings` contains native Akai synth paths inside `<VALUE name="SynthContentLocations"><SynthContentLocations>` (such as `/usr/share/Akai/Content/Synths` or `/media/<Drive>/Synths`).
-   - The Plugin Manager **never deletes or alters** existing `<Location>` entries in `MPC.settings`.
-2. **Multi-Drive Installation Targets (`getSynthContentLocations()`)**:
-   - Third-party VST2 plugins always target a **`VST2 Plugins`** folder (as in the MPC 3.10) :
-     1. The Plugin Manager's own directory: `<ManagerRootDir>/VST2 Plugins` (e.g., on the USB stick).
-     2. Every writable mounted volume under `/media/<DriveName>` (internal SATA SSD 1, SATA SSD 2, SD card, USB drives — strictly excluding the internal system flash `/media/az01-internal`) is offered as **`/media/<DriveName>/VST2 Plugins`**, **even if the `VST2 Plugins` folder does not exist yet on that drive**.
-   - Free space is queried directly via `statvfs()` on the folder (or its parent mount point if the `VST2 Plugins` subfolder has not been created yet), and targets are sorted from largest to smallest available space.
-3. **Automatic Registration in `<SynthContentLocations>`**:
-   - **On Startup & Refresh (`ensureManagerSynthsInMpcSettings()`)**: Automatically verifies that `<ManagerRootDir>/VST2 Plugins`, any existing `/media/*/VST2 Plugins` folders on mounted drives, and any `.../VST2 Plugins` parent folders referenced in `KNOWNPLUGINS` are registered inside `<SynthContentLocations>` in `/tmp/MPC.settings.new`.
-   - **On Plugin Installation (`executeItemInstall()`)**: Creates `/media/<DriveName>/VST2 Plugins` on the chosen target drive if not yet present, and appends `<Location>/media/<DriveName>/VST2 Plugins</Location>` into `<SynthContentLocations>` if missing.
+1. **Mount-Root `"VST2 Plugins"` Discovery (`MPC OS >= 3.10` Native VST2)**:
+   - Starting with MPC OS **3.10**, the Akai MPC binary natively scans `<MountPoint>/VST2 Plugins` at the **root** of every writable mounted volume (excluding read-only volumes and `/media/az01-internal`). Subfolders such as `<ManagerRootDir>/VST2 Plugins` are **not** scanned by MPC 3.10+.
+   - Accordingly, `getManagerMountRoot()` parses `/proc/mounts` to resolve the writable mount point hosting the manager (e.g., `/media/PLGMAN`) and creates `<MountPoint>/VST2 Plugins` (`/media/PLGMAN/VST2 Plugins`) as the manager's default VST2 folder.
+   - `MPC.settings` is **never modified** during startup, catalog refresh, installation, or uninstallation on `>= 3.10`; installed plugins and `Presets/*.xpl` paths are managed directly on disk.
+2. **Legacy Mode (`MPC OS < 3.10`) & `<SynthContentLocations>` Preservation**:
+   - `MPC.settings` contains native Akai synth paths inside `<VALUE name="SynthContentLocations"><SynthContentLocations>` (such as `/usr/share/Akai/Content/Synths` or `/media/<Drive>/Synths`). The manager **never alters or removes** native Akai `<Location>` entries.
+   - On `< 3.10`, third-party VST2 plugins target `<ManagerRootDir>/VST2 Plugins` or `/media/<DriveName>/VST2 Plugins`, and the manager registers those `VST2 Plugins` folders in `<SynthContentLocations>` via `ensureManagerSynthsInMpcSettings()` / `executeItemInstall()`.
+3. **External Hotplug-Only Enumeration (`getExternalHotplugMounts()` & `getSynthContentLocations()`)**:
+   - Inspects `/proc/mounts` and `/sys/block/<dev>` to scan **exclusively active writable external hotplug drives** (USB flash/SSD on `/usb` bus or removable `sd*`, and external SD cards `mmcblk1+` with non-`MMC` card type), while strictly excluding internal flash/eMMC (`az01-internal*`, `mmcblk0*`), virtual/system filesystems, read-only mounts, and unmounted `/media/*` directories.
+   - Each detected external hotplug drive is offered as `/media/<HotplugDrive>/VST2 Plugins`, queried via `statvfs()` and sorted largest-first.
 
 ---
 
@@ -167,7 +174,9 @@ To protect the Akai internal flash (`/media/az01-internal/Settings/MPC/MPC.setti
 - When cached (`CACHED (<size>)`), `executeItemInstall()` installs directly from the local `.zip` archive without requiring an Internet connection.
 - Tap **`[PURGE]`** to delete the cached `.zip` archive from storage and free up USB/SD space (without affecting the installed plugin).
 
-### Installation States & Detail View Actions
+### Installation States, ELF 32/64-bit Check, `plugin.json` & Detail View Actions
+- **RAM-Safe Pre-Install 32-bit / 64-bit Check (`getSystemElfBitness()` & `getElfFileBitness()`)**: Only the `.so` binary file(s) are extracted to `/tmp` for ELF class verification (`ELF32` on 32-bit OS, `ELF64` on 64-bit OS), and `/tmp` is cleaned immediately. Any mismatch aborts cleanly; only verified bundles are unzipped directly onto the target storage drive (preventing `/tmp` RAM exhaustion on large plugins).
+- **Automatic `plugin.json` Reconstitution**: If `plugin.json` is missing in the deployed plugin folder, it is automatically reconstituted from `mpc-plugin.json`, `plugin-meta.xml`, and catalog metadata (using `file32` / `file64` matching the verified ELF binary) and traced in `plgman_log.txt`.
 - **Not Installed (`installed == 0`)**: Displays **`[INSTALL]`**, opening the target `VST2 Plugins` drive selector popup.
 - **Installed & Healthy (`installed == 1`)**: Registered in `MPC.settings` `KNOWNPLUGINS` and its `.so` binary exists on disk. Displays **`[UNINSTALL]`** and **`[REINSTALL]`** (allowing seamless migration to another drive's `VST2 Plugins` folder while cleaning the old location).
 - **Broken (`installed == 2`)**: Registered in `MPC.settings` `KNOWNPLUGINS`, but the referenced `.so` binary is missing or inaccessible on storage. Displays both **`[UNINSTALL]`** (clean removal of broken XML tags and residual files) and **`[REPAIR]`** (reinstallation and clean registration).
@@ -179,42 +188,41 @@ To protect the Akai internal flash (`/media/az01-internal/Settings/MPC/MPC.setti
 Tap the **Gear icon (`[SETTINGS]`)** in the top header to access two main tabs:
 
 ### Tab 1: `Plugin Manager`
-- Displays active manager paths (`PLG_MAN_DIR`, `mpc_plugins.conf`, `catalog_url`, `ping_host`, active `VST2 Plugins` mount locations, and free storage meters).
+- Displays active manager paths (`PLG_MAN_DIR`, `mpc_plugins.conf`, `catalog_url`, `ping_host`, active `VST2 Plugins` mount locations) and allows changing **Screen Rotation** (**`No rotation`**, **`90`**, **`180`**, **`270`**) immediately with persistent saving to `mpc_plugins.conf`.
 
-### Tab 2: `MPC Settings` (5 Sub-Tabs)
+### Tab 2: `MPC Settings` (MPC Version Header + 3 Sub-Tabs)
+- **MPC Binary Version Banner (Displayed First)**: Scans `/usr/bin/MPC` for the `"MPC"` signature followed immediately by `"V.X.Y.Z (xxx)"` (`Y`, `Z`, and build tag optional) and displays whether the device runs **Native VST2 mode (`>= 3.10`, `MPC.settings` untouched)** or **Legacy mode (`< 3.10`)**.
 1. **`ROLL BACK`**:
    - Lists all healthy backups in `<ManagerRootDir>/backups/` with timestamp, file size, and registered plugin count (e.g., `18 plugins`).
    - Scrollable via the physical **Data Wheel** or touchscreen; supports **`[RESTORE]`** (with automatic pre-restore safety backup) and **`[DELETE]`**.
-2. **`LIMITS`**:
-   - Inspects and configures unlocked audio track and plugin instance limits in `MPC.settings`.
-3. **`SSH`**:
-   - Enables root SSH access (Port 22 via Dropbear/sshd) either for the **Current Session** or **Permanently** across reboots.
-4. **`BOOT LOG`**:
+2. **`BOOT LOG`**:
    - Live scrollable viewer aggregating `/var/log/messages` (`syslog`), `/var/log/boot.log`, `dmesg`, and `plgman_log.txt`.
-5. **`SANITY CHECKS`**:
-   - **Orphan Plugin Detection (`ORPHAN_SYNTH_DIR`)**: Scans all writable `VST2 Plugins` directories for plugin folders containing a `.so` or `plugin-meta.xml` that are missing from `MPC.settings` `KNOWNPLUGINS`.
-     - **`[REPAIR]`**: Registers the orphan plugin (and its `VST2 Plugins` location) into staged `/tmp/MPC.settings.new`, deduplicating any stale entries and updating `Presets/*.xpl`.
-     - **`[DELETE]`**: Permanently deletes the orphan plugin folder from disk.
-   - **Broken `.so` Reference Detection (`MISSING_SO_PATH`)**: Scans all `<PLUGIN .../>` entries in `MPC.settings` `KNOWNPLUGINS` whose `file="..."` binary no longer exists.
-     - **`[REPAIR]`**: Searches all writable `VST2 Plugins` locations across mounted drives to relink the moved `.so` (and updates `Presets/*.xpl`), or falls back to reinstalling from the catalog/cache into `/tmp/MPC.settings.new`.
-     - **`[DELETE]`**: Cleanly removes the broken `<PLUGIN .../>` line from staged `/tmp/MPC.settings.new`.
+3. **`SANITY CHECKS`**:
+   - **On MPC OS `>= 3.10` (Native VST2)**:
+     - **Obsolete `<KNOWNPLUGINS>` Check (`LEGACY_KNOWNPLUGINS`)**: Detects legacy `<KNOWNPLUGINS>` entries still present in `MPC.settings` and offers **`[PURGE ALL]`** (with pre-edit safety backup).
+     - **Outside Mount-Root `VST2 Plugins` Relocation (`OUTSIDE_VST2_LOCATION`)**: Detects third-party VST2 plugins placed in `SynthContentLocations`, `/media/*/Synths`, or legacy manager subfolders outside `<MountPoint>/VST2 Plugins` and offers **`[REINSTALL]`** to move them into mount-root `VST2 Plugins` or **`[DELETE]`**.
+     - **Sequenced `<SynthContentLocations>` Cleanup (`LEGACY_SYNTH_VST2_LOCATIONS`)**: Once `<KNOWNPLUGINS>` and outside-`VST2 Plugins` issues are resolved, detects `VST2 Plugins` `<Location>` entries still remaining in `<SynthContentLocations>` and offers **`[PURGE ALL]`** (with pre-edit safety backup) while keeping Akai's native locations intact.
+   - **On MPC OS `< 3.10` (Legacy)**:
+     - **Orphan Plugin Detection (`ORPHAN_SYNTH_DIR`)** & **Broken `.so` Reference Detection (`MISSING_SO_PATH`)**: Registers or relinks orphan/broken plugins in staged `/tmp/MPC.settings.new`.
    - **Global Presets Path Synchronizer (`[APPLY PRESETS PATHS (.XPL)]` / `applyPresetsPathsForAllInstalled()`)**:
-     - Scans `Presets/*.xpl` for every installed plugin in `/tmp/MPC.settings.new` and updates `<PLUGIN file="..."/>` with the active target `.so` path while strictly preserving `<version file="1"/>` and the binary `<state>` preset payload.
+     - Scans `Presets/*.xpl` for every installed plugin (directly from `VST2 Plugins` on `>= 3.10` or staged `MPC.settings` on `< 3.10`) and updates `<PLUGIN file="..."/>` with the active target `.so` path while strictly preserving `<version file="1"/>` and the binary `<state>` preset payload.
 
 ---
 
-## 8. Hardware Controls (Touchscreen & MPC Internal ALSA MIDI)
+## 8. Hardware Controls (Touchscreen & Persistent Dual-Port ALSA MIDI)
 
-| Action | Touchscreen (`/dev/input/event*`) | MPC Physical Controls (ALSA Private RawMIDI) |
+- **Dual-Port Persistent Monitoring**: Both **Public** and **Private** ALSA RawMIDI ports (`hw:X,0,0` & `hw:X,0,1`) are opened at launch, continuously scanned together for the entire Plugin Manager session (protecting against unexpected port sleep on MPC/Force controllers), and closed cleanly on exit. All port open, first-activity, and close events are logged to `plgman_log.txt`.
+
+| Action | Touchscreen (`/dev/input/event*`) | MPC & Akai Force Physical Controls (ALSA Public + Private RawMIDI `hw:X,0,0` & `hw:X,0,1`) |
 | :--- | :--- | :--- |
-| **Browse / Scroll List** | Tap a plugin card, backup, or log row | **Data Wheel** (`CC 0x64`) |
-| **Open Detail / Confirm** | Tap card or **`[INSTALL]`** / **`[REPAIR]`** | **Push Data Wheel** (`Note 0x6F`) or **`[+]`** (`Note 0x36`) |
+| **Browse / Scroll List** | Tap a plugin card, backup, or log row | **Jog Wheel** (`B0 64 01` CW / `B0 64 7F` CCW) or **Cursor Up/Down/Left/Right** (`0x21`/`0x22`/`0x3D`/`0x3E`) |
+| **Open Detail / Confirm** | Tap card or **`[INSTALL]`** / **`[REPAIR]`** | **Push Jog Wheel** (`90 6F 7F` press / `90 6F 00` release) or **`[+]`** (`Note 0x36`) |
 | **Uninstall / Delete** | Tap **`[UNINSTALL]`** / **`[DELETE]`** | — |
 | **Cache / Purge ZIP** | Tap **`[CACHE]`** / **`[PURGE]`** in Detail View | — |
-| **Back / Cancel** | Tap **`[< BACK]`** / **`[RETURN]`** / **`[CANCEL]`** | **`[-]`** (`Note 0x37`), **`[MENU]`** (`0x7B`) or **`[MAIN]`** (`0x34`) |
+| **Back / Cancel** | Tap **`[< BACK]`** / **`[RETURN]`** / **`[CANCEL]`** | **Force**: **`[MENU]`** (`Note 0x02`) or **`[NAVIGATE]`** (`Note 0x00`) • **MPC**: **`[-]`** (`Note 0x37`), **`[MENU]`** (`Note 0x7B`) or **`[MAIN]`** (`Note 0x34`) |
 | **Refresh Catalog** | Tap **`[REFRESH]`** in Top Header | — |
 | **Open Settings** | Tap **Gear Icon** in Top Header | — |
-| **Quit & Commit Session** | Tap **`[EXIT]`** in Bottom Bar | Press **`[-]`** or **`[MENU]`** from root List View |
+| **Quit & Commit Session** | Tap **`[EXIT]`** in Bottom Bar | Press **`[MENU]`** / **`[NAVIGATE]`** (Force) or **`[-]`** / **`[MENU]`** / **`[MAIN]`** (MPC) from root List View |
 
 ### Automatic Standby / Screensaver
 After **60 seconds of inactivity**, an animated anti-burn-in screensaver activates automatically. Any touchscreen tap or MIDI input (pads, Q-Links, buttons, or Data Wheel) immediately wakes the display without triggering unintended actions.

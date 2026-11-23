@@ -28,6 +28,12 @@ PluginManagerView::PluginManagerView(DrmFramebufferCanvas& canvas, config::Launc
     lastActivityTime_ = std::time(nullptr);
     isOnline_ = config::ConfigParser::checkInternetReachable(config_.ping_host);
     rebuildFilteredItems();
+    if (config::ConfigParser::isMpcNativeVst2Supported()) {
+        v310Warnings_ = config::ConfigParser::checkMpcV310StartupWarnings();
+        if (v310Warnings_.needsAttention()) {
+            uiState_ = UIState::V310_WARNING_POPUP;
+        }
+    }
 }
 
 bool PluginManagerView::wakeIfScreensaver() {
@@ -361,7 +367,10 @@ void PluginManagerView::confirmInstall() {
         render();
     };
 
-    config::ConfigParser::executeItemInstall(config_, item, targetDir, execLogs_, stepCb);
+    int instRc = config::ConfigParser::executeItemInstall(config_, item, targetDir, execLogs_, stepCb);
+    if (instRc != 0) {
+        execLogs_.push_back("[ERROR] Installation ABORTED (status " + std::to_string(instRc) + ").");
+    }
     config::ConfigParser::refreshInstallStates(config_, &execLogs_);
     config::ConfigParser::saveToFile(config_.config_path, config_);
     rebuildFilteredItems();
@@ -445,8 +454,29 @@ void PluginManagerView::openSettingsScreen() {
 }
 
 void PluginManagerView::closeSettingsScreen() {
-    uiState_ = (prevUiState_ == UIState::SETTINGS_SCREEN) ? UIState::MENU : prevUiState_;
+    uiState_ = (prevUiState_ == UIState::SETTINGS_SCREEN || prevUiState_ == UIState::V310_WARNING_POPUP)
+        ? UIState::MENU
+        : prevUiState_;
     render();
+}
+
+void PluginManagerView::openSanityChecksFromWarning() {
+    prevUiState_ = UIState::MENU;
+    settingsTab_ = 1;
+    mpcSettingsSubTab_ = 2;
+    uiState_ = UIState::SETTINGS_SCREEN;
+    settingsStatusMsg_.clear();
+    settingsStatusColor_ = 0;
+    refreshMpcBackups();
+    refreshSanityChecks();
+    render();
+}
+
+void PluginManagerView::closeV310WarningPopup() {
+    if (uiState_ == UIState::V310_WARNING_POPUP) {
+        uiState_ = UIState::MENU;
+        render();
+    }
 }
 
 void PluginManagerView::refreshMpcBackups() {
@@ -621,6 +651,11 @@ void PluginManagerView::render() {
         drawDetailView();
         drawBottomPaginationBar();
         drawPurgePopup();
+    } else if (uiState_ == UIState::V310_WARNING_POPUP) {
+        drawFilterBar();
+        drawListView();
+        drawBottomPaginationBar();
+        drawV310WarningPopup();
     } else {
         drawExecutionScreen();
     }
@@ -640,11 +675,11 @@ void PluginManagerView::drawTopHeader() {
     canvas_.fillRoundedRect({29, 33, 11, 11}, 3, Color(161, 161, 170));
     canvas_.fillRoundedRect({44, 33, 11, 11}, 3, Palette::AkaiCrimson);
 
-    // 2. Main Title + "By The KikGen Labs - V1.2.15" on same baseline (matching image_22ce5693.png)
+    // 2. Main Title + "By The KikGen Labs - V1.2.23" on same baseline (matching image_22ce5693.png)
     int titleX = 76;
     canvas_.drawTextClipped({titleX, 21, 380, 22}, config_.app_title, Palette::TextPrimary, 2, true);
     int titleW = std::min(380, canvas_.measureText(config_.app_title, 2) + 14);
-    canvas_.drawText(titleX + titleW, 26, "By The KikGen Labs - V1.2.15", Palette::TextSecondary, 1, false);
+    canvas_.drawText(titleX + titleW, 26, "By The KikGen Labs - V1.2.23", Palette::TextSecondary, 1, false);
 
     // 3. REFRESH Button with Circular Sync Arrow Icon
     Rect refreshBtn = {W - 442, 13, 128, 36};
@@ -1265,7 +1300,7 @@ void PluginManagerView::drawInstallPopup() {
         canvas_.drawText(infoBox.x + 14, infoBox.y + 76, "3. Registration: Injects <pluginList-arm><KNOWNPLUGINS> with %payload-path% replaced", Palette::TextSecondary, 1, false);
     }
 
-    // Bottom Action Buttons: RETURN on Left, INSTALL / REPAIR on Right
+    // Bottom Action Buttons: RETURN on Left, optional UNINSTALL for broken installs in Middle, INSTALL / REPAIR on Right
     canvas_.drawHLine(mx + 20, my + 566, mw - 40, Palette::BorderDark);
 
     Rect retBtn = {mx + 20, my + 578, 180, 48};
@@ -1273,6 +1308,12 @@ void PluginManagerView::drawInstallPopup() {
     canvas_.drawChevronIcon(retBtn.x + 16, retBtn.y + 15, 17, true, Palette::TextSecondary);
     canvas_.drawText(retBtn.x + 42, retBtn.y + 15, "RETURN", Palette::TextPrimary, 2, true);
     canvas_.drawTextRight(retBtn.x + retBtn.w - 14, retBtn.y + 18, "[-] MINUS", Palette::TextSecondary, 1, false);
+
+    if (item.installed == 2) {
+        Rect uninstBtn = {mx + 220, my + 578, 180, 48};
+        canvas_.drawPanel(uninstBtn, 10, Color(42, 24, 28), Palette::AkaiCrimson, 1.5f);
+        canvas_.drawTextCentered(uninstBtn, "UNINSTALL", Palette::TextPrimary, 2, true);
+    }
 
     Rect instBtn = {mx + mw - 20 - 220, my + 578, 220, 48};
     canvas_.fillRoundedRect(instBtn, 10, item.installed == 2 ? Color(180, 83, 9) : Palette::AkaiRed);
@@ -1289,7 +1330,14 @@ void PluginManagerView::drawExecutionScreen() {
 
     int ly = termBox.y + 20;
     for (size_t i = 0; i < execLogs_.size() && ly < termBox.y + termBox.h - 28; ++i) {
-        canvas_.drawTextClipped({termBox.x + 20, ly, termBox.w - 40, 20}, execLogs_[i], Palette::StatusGreen, 2, false);
+        const std::string& logLine = execLogs_[i];
+        Color col = Palette::StatusGreen;
+        if (logLine.find("[ERROR]") != std::string::npos || logLine.find("ABORTED") != std::string::npos) {
+            col = Color(255, 100, 110);
+        } else if (logLine.find("[WARN]") != std::string::npos || logLine.find("[TKGL-ARCH]") != std::string::npos) {
+            col = Palette::AmberGold;
+        }
+        canvas_.drawTextClipped({termBox.x + 20, ly, termBox.w - 40, 20}, logLine, col, 2, false);
         ly += 26;
     }
 
@@ -1581,6 +1629,74 @@ void PluginManagerView::drawDeleteBackupPopup() {
     canvas_.drawTextCentered(confBtn, "PERMANENT DELETE", Palette::TextPrimary, 1, true);
 }
 
+void PluginManagerView::drawV310WarningPopup() {
+    int W = canvas_.getLogicalWidth();
+    int H = canvas_.getLogicalHeight();
+    canvas_.fillRect({0, 62, W, H - 62}, Color(6, 6, 10, 222));
+
+    int mw = 820;
+    int mh = 430;
+    int mx = (W - mw) / 2;
+    int my = (H - mh) / 2;
+
+    Rect modal = {mx, my, mw, mh};
+    canvas_.drawPanel(modal, 14, Color(22, 22, 29), Palette::AmberGold, 2.0f);
+
+    Rect badgeR = {mx + 26, my + 22, 130, 28};
+    canvas_.fillRoundedRect(badgeR, 6, Color(180, 83, 9));
+    canvas_.drawTextCentered(badgeR, "MPC >= 3.10", Palette::TextPrimary, 1, true);
+
+    canvas_.drawText(mx + 170, my + 25, "LEGACY MPC.SETTINGS ENTRIES DETECTED", Palette::AmberGold, 2, true);
+    canvas_.drawHLine(mx + 26, my + 62, mw - 52, Palette::BorderLight);
+
+    canvas_.drawText(mx + 28, my + 78, "To prevent plugin conflicts or disappearance on MPC OS >= 3.10, please review:", Palette::TextPrimary, 1, false);
+
+    int cy = my + 112;
+    if (v310Warnings_.hasSynthVst2Locations) {
+        Rect r1 = {mx + 28, cy, mw - 56, 78};
+        canvas_.drawPanel(r1, 8, Color(30, 24, 18), Color(180, 120, 30), 1.0f);
+        std::string sTitle = ". SynthContentLocations in MPC.settings points to VST2 Plugins folder(s) (" +
+                             std::to_string(v310Warnings_.synthVst2Locations.size()) + " entry(ies))";
+        canvas_.drawTextClipped({r1.x + 14, r1.y + 12, r1.w - 28, 22}, sTitle, Palette::AmberGold, 1, true);
+        std::string sDetail = v310Warnings_.synthVst2Locations[0];
+        if (v310Warnings_.synthVst2Locations.size() > 1) {
+            sDetail += "  (+ " + std::to_string(v310Warnings_.synthVst2Locations.size() - 1) + " more)";
+        }
+        canvas_.drawTextClipped({r1.x + 18, r1.y + 42, r1.w - 36, 20}, sDetail, Palette::TextSecondary, 1, false);
+        cy += 88;
+    }
+
+    if (v310Warnings_.hasLegacyKnownPlugins) {
+        Rect r2 = {mx + 28, cy, mw - 56, 78};
+        canvas_.drawPanel(r2, 8, Color(34, 20, 24), Palette::AkaiCrimson, 1.0f);
+        std::string kTitle = ". VST2 Plugins still declared inside <KNOWNPLUGINS> of MPC.settings (" +
+                             std::to_string(v310Warnings_.knownPluginsCount) + " entry(ies))";
+        canvas_.drawTextClipped({r2.x + 14, r2.y + 12, r2.w - 28, 22}, kTitle, Color(255, 130, 140), 1, true);
+        canvas_.drawTextClipped({r2.x + 18, r2.y + 42, r2.w - 36, 20},
+                                "MPC >= 3.10 scans <MountPoint>/VST2 Plugins natively and no longer uses KNOWNPLUGINS.",
+                                Palette::TextSecondary, 1, false);
+        cy += 88;
+    }
+
+    Rect tipBox = {mx + 28, my + 294, mw - 56, 46};
+    canvas_.drawPanel(tipBox, 8, Color(16, 34, 26), Palette::StatusGreen, 1.0f);
+    canvas_.drawGlowDot(tipBox.x + 20, tipBox.y + 23, 4, Palette::StatusGreen);
+    canvas_.drawText(tipBox.x + 38, tipBox.y + 15, "=> Go to MPC Settings and select SANITY CHECKS to migrate & purge safely.", Palette::StatusGreen, 1, true);
+
+    canvas_.drawHLine(mx + 26, my + 350, mw - 52, Palette::BorderDark);
+
+    int btnY = my + 362;
+    Rect dismissBtn = {mx + 28, btnY, 240, 48};
+    canvas_.drawPanel(dismissBtn, 10, Palette::BgButton, Color(62, 62, 78), 1.0f);
+    canvas_.drawText(dismissBtn.x + 18, dismissBtn.y + 15, "DISMISS", Palette::TextPrimary, 2, true);
+    canvas_.drawTextRight(dismissBtn.x + dismissBtn.w - 14, dismissBtn.y + 18, "[-] MINUS", Palette::TextSecondary, 1, false);
+
+    Rect sanityBtn = {mx + mw - 28 - 350, btnY, 350, 48};
+    canvas_.fillRoundedRect(sanityBtn, 10, Palette::AkaiRed);
+    canvas_.drawText(sanityBtn.x + 18, sanityBtn.y + 15, "OPEN SANITY CHECKS", Palette::TextPrimary, 2, true);
+    canvas_.drawTextRight(sanityBtn.x + sanityBtn.w - 14, sanityBtn.y + 18, "[+] / ENTER", Palette::TextPrimary, 1, false);
+}
+
 void PluginManagerView::drawScreensaver() {
     int W = canvas_.getLogicalWidth();
     int H = canvas_.getLogicalHeight();
@@ -1678,7 +1794,7 @@ void PluginManagerView::drawSettingsScreen() {
     }
 
     // Top Header Version badge
-    canvas_.drawText(W - 190, 26, "V1.2.15", Palette::TextSecondary, 1, true);
+    canvas_.drawText(W - 190, 26, "V1.2.23", Palette::TextSecondary, 1, true);
 
     // Body
     if (settingsTab_ == 0) {
@@ -1692,51 +1808,101 @@ void PluginManagerView::drawPluginManagerSettingsTab() {
     int W = canvas_.getLogicalWidth();
 
     // Card 1: Manager Configuration (mpc_plugins.conf)
-    Rect card1 = {30, 80, W - 60, 350};
+    Rect card1 = {30, 80, W - 60, 372};
     canvas_.drawPanel(card1, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
     canvas_.drawText(card1.x + 20, card1.y + 18, "GENERAL CONFIGURATION (mpc_plugins.conf)", Palette::AmberGold, 1, true);
+    if (!settingsStatusMsg_.empty()) {
+        Color stCol = (settingsStatusColor_ == 2) ? Color(255, 110, 120) : Palette::StatusGreen;
+        canvas_.drawTextClipped({card1.x + 560, card1.y + 18, card1.w - 580, 22}, settingsStatusMsg_, stCol, 1, true);
+    }
     canvas_.drawHLine(card1.x + 20, card1.y + 42, card1.w - 40, Color(46, 46, 58));
 
     int y = card1.y + 58;
-    auto drawParamRow = [&](const std::string& key, const std::string& val) {
+    auto drawParamRow = [&](const std::string& key, const std::string& val, int stepY = 34) {
         canvas_.drawText(card1.x + 24, y, key, Palette::TextSecondary, 1, false);
         canvas_.drawTextClipped({card1.x + 330, y, card1.w - 360, 22}, val, Palette::TextPrimary, 1, true);
-        y += 34;
+        y += stepY;
     };
 
     drawParamRow("Application Title", config_.app_title);
     drawParamRow("Online Catalog URL", config_.catalog_url);
     drawParamRow("Ping Connectivity Host", config_.ping_host);
-    drawParamRow("Framebuffer Rotation", std::to_string(config_.screen_rotation) + " deg (/dev/fb0 DRM landscape)");
-    drawParamRow("Active Manager Root Dir", config::ConfigParser::getManagerRootDir());
-    drawParamRow("Resolved Backups Dir", config::ConfigParser::resolveBackupDirectory());
-    drawParamRow("Resolved MPC.settings", config::ConfigParser::resolveMpcSettingsPath());
-    drawParamRow("Total Catalog Plugins", std::to_string(filteredItems_.size()) + " items currently indexed");
+
+    // Interactive Screen Rotation row (y = 240): No rotation (0), 90, 180, 270
+    canvas_.drawText(card1.x + 24, y, "Screen Rotation", Palette::TextSecondary, 1, false);
+    const int rotVals[4] = {0, 90, 180, 270};
+    const char* rotLabels[4] = {"No rotation", "90", "180", "270"};
+    const int rotBtnX[4] = {360, 507, 654, 801};
+    for (int i = 0; i < 4; ++i) {
+        bool isAct = (config_.screen_rotation == rotVals[i]);
+        Rect rBtn = {rotBtnX[i], y - 7, 135, 28};
+        canvas_.drawPanel(
+            rBtn, 6,
+            isAct ? Palette::AkaiCrimson : Color(32, 32, 42),
+            isAct ? Color(255, 110, 130) : Color(60, 60, 74),
+            isAct ? 2.0f : 1.0f
+        );
+        canvas_.drawTextCentered(rBtn, rotLabels[i], isAct ? Palette::TextPrimary : Palette::TextSecondary, 1, isAct);
+    }
+    y += 36;
+
+    drawParamRow("Active Manager Root Dir", config::ConfigParser::getManagerRootDir(), 32);
+    drawParamRow("Manager VST2 Plugins Dir", config::ConfigParser::getManagerVst2Dir(), 32);
+    drawParamRow("Resolved Backups Dir", config::ConfigParser::resolveBackupDirectory(), 32);
+    drawParamRow("Resolved MPC.settings", config::ConfigParser::resolveMpcSettingsPath(), 32);
+    drawParamRow("Total Catalog Plugins", std::to_string(filteredItems_.size()) + " items currently indexed", 32);
 
     // Card 2: System & Hardware Environment
-    Rect card2 = {30, 450, W - 60, 310};
+    Rect card2 = {30, 466, W - 60, 294};
     canvas_.drawPanel(card2, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
     canvas_.drawText(card2.x + 20, card2.y + 18, "RUNTIME ENVIRONMENT & SAFETY POLICIES", Palette::StatusGreen, 1, true);
     canvas_.drawHLine(card2.x + 20, card2.y + 42, card2.w - 40, Color(46, 46, 58));
 
     y = card2.y + 58;
-    drawParamRow("Target Architecture", "ARMv7-A Cortex-A9 (Akai MPC Live, One, X, Key 61, Force)");
-    drawParamRow("Gold Rule Safety Backups", "Automatic backups stored in Manager ($PLG_MAN_DIR/backups)");
-    drawParamRow("External /media Mounting", "VST2 Plugins folder only added when executed from mounted drive (/media)");
-    drawParamRow("Internet Reachability", isOnline_ ? "ONLINE (Verified via ping_host)" : "OFFLINE (Local USB only)");
-    drawParamRow("Offline Binary Caching", "Local .zip archives stored in plugins/<id>/<id>.zip");
-    drawParamRow("Version Release Tag", "The KikGen Labs - V1.2.15 (v1.2.15)");
+    drawParamRow("Target Architecture", "ARMv7-A Cortex-A9 (Akai MPC Live, One, X, Key 61, Force)", 32);
+    drawParamRow("Gold Rule Safety Backups", "Automatic backups stored in Manager ($PLG_MAN_DIR/backups)", 32);
+    drawParamRow("Mount Root VST2 Policy", "On >= 3.10, VST2 Plugins is created at manager mount root (<Mount>/VST2 Plugins)", 32);
+    drawParamRow("Internet Reachability", isOnline_ ? "ONLINE (Verified via ping_host)" : "OFFLINE (Local USB only)", 32);
+    drawParamRow("Offline Binary Caching", "Local .zip archives stored in plugins/<id>/<id>.zip", 32);
+    drawParamRow("Version Release Tag", "The KikGen Labs - V1.2.23 (v1.2.23)", 32);
 }
 
 void PluginManagerView::drawMpcSettingsTab() {
-    // Sub-tab selector bar: 5 buttons (0=ROLL BACK, 1=LIMITS, 2=SSH, 3=BOOT LOG, 4=SANITY CHECKS)
-    const char* subLabels[5] = {"ROLL BACK", "LIMITS", "SSH", "BOOT LOG", "SANITY CHECKS"};
-    int subX[5] = {30, 277, 524, 771, 1018};
-    int subW = 232;
-    int subY = 74;
+    int W = canvas_.getLogicalWidth();
+
+    // 1. Detected MPC OS Binary Version banner (displayed FIRST in MPC Settings)
+    auto mpcVer = config::ConfigParser::detectMpcBinaryVersion();
+    Rect verCard = {30, 70, W - 60, 42};
+    canvas_.drawPanel(
+        verCard, 8,
+        mpcVer.isNativeVst2 ? Color(16, 34, 26) : Color(32, 26, 20),
+        mpcVer.isNativeVst2 ? Palette::StatusGreen : Palette::AmberGold,
+        1.5f
+    );
+    canvas_.drawGlowDot(verCard.x + 20, verCard.y + 21, 5, mpcVer.isNativeVst2 ? Palette::StatusGreen : Palette::AmberGold);
+    std::string verText = "MPC Binary (/usr/bin/MPC): " + (mpcVer.found ? ("MPC " + mpcVer.fullVersionStr) : "Version not detected");
+    canvas_.drawTextClipped({verCard.x + 38, verCard.y + 12, 650, 22}, verText, Palette::TextPrimary, 1, true);
+
+    std::string modeBadge = mpcVer.isNativeVst2
+        ? ">= 3.10 NATIVE VST2 (MPC.settings untouched)"
+        : "< 3.10 LEGACY MODE (MPC.settings sync active)";
+    Rect modePill = {verCard.x + verCard.w - 460, verCard.y + 6, 444, 30};
+    canvas_.drawPanel(
+        modePill, 6,
+        mpcVer.isNativeVst2 ? Color(20, 62, 42) : Color(52, 36, 16),
+        mpcVer.isNativeVst2 ? Palette::StatusGreen : Palette::AmberGold,
+        1.0f
+    );
+    canvas_.drawTextCentered(modePill, modeBadge, mpcVer.isNativeVst2 ? Palette::StatusGreen : Palette::AmberGold, 1, true);
+
+    // 2. Sub-tab selector bar: 3 buttons (0=ROLL BACK, 1=BOOT LOG, 2=SANITY CHECKS)
+    const char* subLabels[3] = {"ROLL BACK", "BOOT LOG", "SANITY CHECKS"};
+    int subX[3] = {30, 443, 856};
+    int subW = 394;
+    int subY = 122;
     int subH = 40;
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 3; ++i) {
         bool isAct = (mpcSettingsSubTab_ == i);
         Rect rSub = {subX[i], subY, subW, subH};
         canvas_.drawPanel(rSub, 8, isAct ? Color(48, 24, 32) : Color(26, 26, 34), isAct ? Palette::AkaiCrimson : Color(52, 52, 64), isAct ? 2.0f : 1.0f);
@@ -1747,10 +1913,6 @@ void PluginManagerView::drawMpcSettingsTab() {
     if (mpcSettingsSubTab_ == 0) {
         drawMpcRollbackSubTab();
     } else if (mpcSettingsSubTab_ == 1) {
-        drawMpcLimitsSubTab();
-    } else if (mpcSettingsSubTab_ == 2) {
-        drawMpcSshSubTab();
-    } else if (mpcSettingsSubTab_ == 3) {
         drawMpcBootLogSubTab();
     } else {
         drawMpcSanitySubTab();
@@ -1760,18 +1922,18 @@ void PluginManagerView::drawMpcSettingsTab() {
 void PluginManagerView::drawMpcRollbackSubTab() {
     int W = canvas_.getLogicalWidth();
 
-    Rect b1 = {30, 126, W - 60, 634};
+    Rect b1 = {30, 174, W - 60, 588};
     canvas_.drawPanel(b1, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
     canvas_.drawText(b1.x + 20, b1.y + 16, "MPC.SETTINGS ROLLBACK (RESTORATION)", Palette::TextPrimary, 1, true);
     canvas_.drawText(b1.x + 430, b1.y + 18, "Backups stored in Manager ($PLG_MAN_DIR/backups, max 10)", Palette::TextSecondary, 1, false);
     canvas_.drawHLine(b1.x + 20, b1.y + 38, b1.w - 40, Color(46, 46, 58));
 
-    int rowY = b1.y + 50;
+    int rowY = b1.y + 48;
     int rowH = 44;
-    int maxVisible = 10;
+    int maxVisible = 9;
     if (mpcBackups_.empty()) {
         canvas_.drawText(b1.x + 36, rowY + 30, "No timestamped backup files (MPC.settings.bak-*) found in Manager backups directory.", Palette::TextSecondary, 1, false);
-        canvas_.drawText(b1.x + 36, rowY + 60, "Backups are automatically generated prior to every install, repair or sync.", Palette::TextMuted, 1, false);
+        canvas_.drawText(b1.x + 36, rowY + 60, "Backups are automatically generated before any MPC.settings modification.", Palette::TextMuted, 1, false);
     } else {
         int maxOffset = std::max(0, static_cast<int>(mpcBackups_.size()) - maxVisible);
         if (backupScrollOffset_ > maxOffset) backupScrollOffset_ = maxOffset;
@@ -1810,7 +1972,7 @@ void PluginManagerView::drawMpcRollbackSubTab() {
     canvas_.drawTextCentered(delBtn, "DELETE BACKUP", Color(255, 140, 150), 1, true);
 
     // Info box on right bottom
-    Rect infoBox = {b1.x + 940, b1.y + 250, 240, 160};
+    Rect infoBox = {b1.x + 940, b1.y + 244, 240, 160};
     canvas_.drawPanel(infoBox, 8, Color(18, 18, 24), Color(42, 42, 54), 1.0f);
     canvas_.drawText(infoBox.x + 14, infoBox.y + 16, "GOLD RULE SAFETY", Palette::AmberGold, 1, true);
     canvas_.drawText(infoBox.x + 14, infoBox.y + 42, "Max retention: 10 files", Palette::TextSecondary, 1, false);
@@ -1821,136 +1983,14 @@ void PluginManagerView::drawMpcRollbackSubTab() {
 
     if (!settingsStatusMsg_.empty()) {
         Color col = (settingsStatusColor_ == 1) ? Palette::StatusGreen : Palette::AkaiCrimson;
-        canvas_.drawTextClipped({b1.x + 940, b1.y + 430, 240, 60}, settingsStatusMsg_, col, 1, true);
-    }
-}
-
-void PluginManagerView::drawMpcLimitsSubTab() {
-    int W = canvas_.getLogicalWidth();
-
-    // Card 1: MPC Track Limits (Left column: x = 30, y = 126, w = 595, h = 290)
-    Rect b2 = {30, 126, 595, 290};
-    canvas_.drawPanel(b2, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
-    canvas_.drawText(b2.x + 18, b2.y + 16, "1. MPC TRACK & PROJECT LIMITS", Palette::TextPrimary, 1, true);
-    canvas_.drawText(b2.x + 380, b2.y + 16, "[PLANNED NEXT RELEASE]", Palette::AmberGold, 1, false);
-    canvas_.drawHLine(b2.x + 18, b2.y + 40, b2.w - 36, Color(46, 46, 58));
-
-    canvas_.drawText(b2.x + 22, b2.y + 54, "Parameter", Palette::TextMuted, 1, false);
-    canvas_.drawText(b2.x + 360, b2.y + 54, "Factory", Palette::TextMuted, 1, false);
-    canvas_.drawText(b2.x + 480, b2.y + 54, "Custom", Palette::AmberGold, 1, false);
-
-    int lY = b2.y + 88;
-    auto drawLimitRow = [&](Rect box, const std::string& name, const std::string& fVal, const std::string& cVal) {
-        canvas_.drawText(box.x + 22, lY, name, Palette::TextSecondary, 1, false);
-        canvas_.drawText(box.x + 380, lY, fVal, Palette::TextPrimary, 1, false);
-        canvas_.drawText(box.x + 500, lY, cVal, Palette::StatusGreen, 1, true);
-        lY += 44;
-    };
-    drawLimitRow(b2, "Number of plugin tracks max", "8", "32");
-    drawLimitRow(b2, "Number of audio tracks max", "8", "32");
-    drawLimitRow(b2, "Max tracks per project", "128", "256");
-
-    // Card 2: Simultaneous Plugin Instances (Right column: x = 655, y = 126, w = 595, h = 290)
-    Rect b3 = {655, 126, 595, 290};
-    canvas_.drawPanel(b3, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
-    canvas_.drawText(b3.x + 18, b3.y + 16, "2. SIMULTANEOUS PLUGIN INSTANCES", Palette::TextPrimary, 1, true);
-    canvas_.drawText(b3.x + 380, b3.y + 16, "[PLANNED NEXT RELEASE]", Palette::AmberGold, 1, false);
-    canvas_.drawHLine(b3.x + 18, b3.y + 40, b3.w - 36, Color(46, 46, 58));
-
-    canvas_.drawText(b3.x + 22, b3.y + 54, "Plugin Instrument / FX", Palette::TextMuted, 1, false);
-    canvas_.drawText(b3.x + 360, b3.y + 54, "Factory", Palette::TextMuted, 1, false);
-    canvas_.drawText(b3.x + 480, b3.y + 54, "Custom", Palette::AmberGold, 1, false);
-
-    lY = b3.y + 84;
-    auto drawInstRow = [&](const std::string& name, const std::string& fVal, const std::string& cVal) {
-        canvas_.drawText(b3.x + 22, lY, name, Palette::TextSecondary, 1, false);
-        canvas_.drawText(b3.x + 380, lY, fVal, Palette::TextPrimary, 1, false);
-        canvas_.drawText(b3.x + 500, lY, cVal, Palette::StatusGreen, 1, true);
-        lY += 36;
-    };
-    drawInstRow("AIR Vocal Harmonizer", "1", "4");
-    drawInstRow("AIR Sprite", "2", "4");
-    drawInstRow("AIR Ether", "2", "4");
-    drawInstRow("DrumSynth:Multi", "1", "4");
-    drawInstRow("AIR Reverb Pro", "4", "8");
-
-    // Card 3: Memory Management (Full width bottom: x = 30, y = 434, w = W - 60, h = 326)
-    Rect b4 = {30, 434, W - 60, 326};
-    canvas_.drawPanel(b4, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
-    canvas_.drawText(b4.x + 20, b4.y + 16, "3. MEMORY MANAGEMENT & RAM GUARD THRESHOLDS", Palette::TextPrimary, 1, true);
-    canvas_.drawText(b4.x + 680, b4.y + 16, "[PLANNED NEXT RELEASE]", Palette::AmberGold, 1, false);
-    canvas_.drawHLine(b4.x + 20, b4.y + 40, b4.w - 40, Color(46, 46, 58));
-
-    canvas_.drawText(b4.x + 24, b4.y + 56, "Threshold Check Level", Palette::TextMuted, 1, false);
-    canvas_.drawText(b4.x + 580, b4.y + 56, "Factory Default", Palette::TextMuted, 1, false);
-    canvas_.drawText(b4.x + 860, b4.y + 56, "Custom Unlocked", Palette::AmberGold, 1, false);
-
-    lY = b4.y + 94;
-    auto drawMemRow = [&](const std::string& name, const std::string& desc, const std::string& fVal, const std::string& cVal) {
-        Rect rCard = {b4.x + 20, lY, b4.w - 40, 68};
-        canvas_.drawPanel(rCard, 6, Color(18, 18, 24), Color(42, 42, 54), 1.0f);
-        canvas_.drawText(rCard.x + 18, rCard.y + 14, name, Palette::TextPrimary, 1, true);
-        canvas_.drawText(rCard.x + 18, rCard.y + 38, desc, Palette::TextMuted, 1, false);
-        canvas_.drawText(rCard.x + 580, rCard.y + 24, fVal, Palette::TextSecondary, 2, false);
-        canvas_.drawText(rCard.x + 880, rCard.y + 24, cVal, Palette::StatusGreen, 2, true);
-        lY += 84;
-    };
-    drawMemRow("Memory threshold % L1 (standard warning check)", "Soft warning threshold before loading additional large synth plugins", "80.0%", "88.0%");
-    drawMemRow("Memory threshold % L2 (critical allocation lock)", "Hard allocation ceiling preventing project sample/plugin load", "90.0%", "97.0%");
-}
-
-void PluginManagerView::drawMpcSshSubTab() {
-    int W = canvas_.getLogicalWidth();
-
-    Rect b5 = {30, 126, W - 60, 634};
-    canvas_.drawPanel(b5, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
-    canvas_.drawText(b5.x + 22, b5.y + 18, "SSH REMOTE ACCESS & SYSTEM SHELL CONTROL (PORT 22)", Palette::TextPrimary, 1, true);
-    std::string modeBadge = (sshEnabledMode_ == 2) ? "STATUS: PERMANENT SSH ACTIVE" : ((sshEnabledMode_ == 1) ? "STATUS: TEMPORARY SSH ACTIVE" : "STATUS: STANDBY");
-    Color badgeCol = (sshEnabledMode_ > 0) ? Palette::StatusGreen : Palette::AmberGold;
-    canvas_.drawText(b5.x + 760, b5.y + 18, modeBadge, badgeCol, 1, true);
-    canvas_.drawHLine(b5.x + 22, b5.y + 44, b5.w - 44, Color(46, 46, 58));
-
-    // Option 1: Temporary SSH
-    Rect opt1 = {b5.x + 30, b5.y + 70, b5.w - 60, 160};
-    bool isTemp = (sshEnabledMode_ == 1);
-    canvas_.drawPanel(opt1, 10, isTemp ? Color(20, 38, 32) : Color(30, 30, 38), isTemp ? Palette::StatusGreen : Color(56, 56, 70), isTemp ? 2.0f : 1.0f);
-    canvas_.drawGlowDot(opt1.x + 26, opt1.y + 34, 5, isTemp ? Palette::StatusGreen : Palette::AmberGold);
-    canvas_.drawText(opt1.x + 48, opt1.y + 24, "1. ENABLE SSH TEMPORARY (CURRENT SESSION ONLY)", Palette::TextPrimary, 2, true);
-    canvas_.drawText(opt1.x + 48, opt1.y + 62, "Starts the dropbear/sshd daemon on TCP Port 22 for the current boot session.", Palette::TextSecondary, 1, false);
-    canvas_.drawText(opt1.x + 48, opt1.y + 88, "Leaves system root partition untouched. Automatically resets on next device reboot.", Palette::TextMuted, 1, false);
-
-    Rect btnTemp = {opt1.x + opt1.w - 280, opt1.y + 48, 250, 64};
-    canvas_.drawPanel(btnTemp, 8, isTemp ? Color(22, 163, 74) : Color(42, 42, 54), isTemp ? Color(74, 222, 128) : Palette::AmberGold, 1.5f);
-    canvas_.drawTextCentered(btnTemp, isTemp ? "SESSION SSH ACTIVE" : "ENABLE TEMPORARY", Palette::TextPrimary, 1, true);
-
-    // Option 2: Permanent SSH
-    Rect opt2 = {b5.x + 30, b5.y + 260, b5.w - 60, 160};
-    bool isPerm = (sshEnabledMode_ == 2);
-    canvas_.drawPanel(opt2, 10, isPerm ? Color(42, 22, 28) : Color(30, 30, 38), isPerm ? Palette::AkaiCrimson : Color(56, 56, 70), isPerm ? 2.0f : 1.0f);
-    canvas_.drawGlowDot(opt2.x + 26, opt2.y + 34, 5, isPerm ? Palette::StatusGreen : Palette::AkaiCrimson);
-    canvas_.drawText(opt2.x + 48, opt2.y + 24, "2. ENABLE SSH PERMANENT (PERSISTENT ACROSS REBOOTS)", Palette::TextPrimary, 2, true);
-    canvas_.drawText(opt2.x + 48, opt2.y + 62, "Starts SSH immediately and patches system init so port 22 remains open after reboot.", Palette::TextSecondary, 1, false);
-    canvas_.drawText(opt2.x + 48, opt2.y + 88, "Recommended for developers, SFTP transfers, and remote terminal diagnostics.", Palette::TextMuted, 1, false);
-
-    Rect btnPerm = {opt2.x + opt2.w - 280, opt2.y + 48, 250, 64};
-    canvas_.drawPanel(btnPerm, 8, isPerm ? Color(22, 163, 74) : Palette::AkaiCrimson, isPerm ? Color(74, 222, 128) : Color(255, 100, 120), 1.5f);
-    canvas_.drawTextCentered(btnPerm, isPerm ? "PERMANENT SSH ACTIVE" : "ENABLE PERMANENT", Palette::TextPrimary, 1, true);
-
-    // Connection Help Footer Box
-    Rect infoCard = {b5.x + 30, b5.y + 450, b5.w - 60, 150};
-    canvas_.drawPanel(infoCard, 8, Color(16, 16, 22), Color(44, 44, 56), 1.0f);
-    canvas_.drawText(infoCard.x + 22, infoCard.y + 18, "SSH CONNECTION DETAILS:", Palette::AmberGold, 1, true);
-    canvas_.drawText(infoCard.x + 22, infoCard.y + 48, "Command : ssh root@<mpc-ip-address>   (Port 22)", Palette::TextPrimary, 1, true);
-    canvas_.drawText(infoCard.x + 22, infoCard.y + 76, "Default : User 'root' - Inspect MPC Settings > Info for current Wi-Fi/Ethernet IP.", Palette::TextSecondary, 1, false);
-    if (!settingsStatusMsg_.empty()) {
-        canvas_.drawText(infoCard.x + 22, infoCard.y + 110, settingsStatusMsg_, Palette::StatusGreen, 1, true);
+        canvas_.drawTextClipped({b1.x + 940, b1.y + 420, 240, 60}, settingsStatusMsg_, col, 1, true);
     }
 }
 
 void PluginManagerView::drawMpcBootLogSubTab() {
     int W = canvas_.getLogicalWidth();
 
-    Rect bLog = {30, 126, W - 60, 634};
+    Rect bLog = {30, 174, W - 60, 588};
     canvas_.drawPanel(bLog, 10, Color(14, 16, 22), Color(46, 46, 58), 1.0f);
     canvas_.drawText(bLog.x + 20, bLog.y + 16, "SYSTEM BOOTLOG / SYSLOG / DMESG CONSOLE", Palette::AmberGold, 1, true);
     std::string countInfo = std::to_string(bootLogLines_.size()) + " lines captured (/var/log/messages, syslog, dmesg, plgman_log)";
@@ -1968,7 +2008,7 @@ void PluginManagerView::drawMpcBootLogSubTab() {
     Rect termRect = {bLog.x + 16, bLog.y + 56, bLog.w - 110, bLog.h - 72};
     canvas_.drawPanel(termRect, 6, Color(8, 10, 14), Color(32, 36, 46), 1.0f);
 
-    int maxVisible = 18;
+    int maxVisible = 16;
     int maxOffset = std::max(0, static_cast<int>(bootLogLines_.size()) - maxVisible);
     if (bootLogScrollOffset_ > maxOffset) bootLogScrollOffset_ = maxOffset;
     if (bootLogScrollOffset_ < 0) bootLogScrollOffset_ = 0;
@@ -1988,7 +2028,7 @@ void PluginManagerView::drawMpcBootLogSubTab() {
             lineCol = Color(140, 200, 255);
         }
         canvas_.drawTextClipped({termRect.x + 12, ly, termRect.w - 24, 22}, line, lineCol, 1, false);
-        ly += 29;
+        ly += 31;
     }
 
     // Up / Down Scroll Buttons on right edge of log window
@@ -2003,11 +2043,15 @@ void PluginManagerView::drawMpcBootLogSubTab() {
 
 void PluginManagerView::drawMpcSanitySubTab() {
     int W = canvas_.getLogicalWidth();
+    bool isNativeVst2 = config::ConfigParser::isMpcNativeVst2Supported();
 
-    // Top Box: Checks 1 & 2 (Orphan Plugins in writable VST2 Plugins / SynthContentLocations & Missing .so in staged /tmp/MPC.settings.new)
-    Rect bTop = {30, 126, W - 60, 456};
+    // Top Box: Sanity Checks
+    Rect bTop = {30, 174, W - 60, 416};
     canvas_.drawPanel(bTop, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
-    canvas_.drawText(bTop.x + 20, bTop.y + 16, "1 & 2. ORPHAN PLUGINS & MISSING .SO (STAGED: /tmp/MPC.settings.new)", Palette::TextPrimary, 1, true);
+    std::string sanityTitle = isNativeVst2
+        ? "1, 2 & 3. NATIVE VST2 SANITY CHECKS (MPC >= 3.10: KNOWNPLUGINS, RELOCATE, SYNTHLOCATIONS)"
+        : "1 & 2. ORPHAN PLUGINS & MISSING .SO (STAGED: /tmp/MPC.settings.new)";
+    canvas_.drawText(bTop.x + 20, bTop.y + 16, sanityTitle, Palette::TextPrimary, 1, true);
 
     if (config::ConfigParser::hasStagedMpcSettings()) {
         Rect stBadge = {bTop.x + bTop.w - 410, bTop.y + 10, 198, 30};
@@ -2022,16 +2066,28 @@ void PluginManagerView::drawMpcSanitySubTab() {
 
     canvas_.drawHLine(bTop.x + 20, bTop.y + 46, bTop.w - 40, Color(46, 46, 58));
 
-    int rowY = bTop.y + 56;
+    int rowY = bTop.y + 54;
     int rowH = 58;
-    int maxVisible = 6;
+    int maxVisible = 5;
 
     if (sanityIssues_.empty()) {
-        Rect okBox = {bTop.x + 24, rowY + 30, bTop.w - 48, 86};
+        Rect okBox = {bTop.x + 24, rowY + 26, bTop.w - 48, 86};
         canvas_.drawPanel(okBox, 8, Color(16, 34, 26), Palette::StatusGreen, 1.5f);
         canvas_.drawGlowDot(okBox.x + 24, okBox.y + 43, 5, Palette::StatusGreen);
-        canvas_.drawText(okBox.x + 46, okBox.y + 22, "ALL SANITY CHECKS PASSED (0 ANOMALIES IN STAGED /tmp/MPC.settings.new)", Palette::StatusGreen, 1, true);
-        canvas_.drawText(okBox.x + 46, okBox.y + 48, "Every plugin folder in writable VST2 Plugins locations is registered in KNOWNPLUGINS, and all .so paths exist.", Palette::TextSecondary, 1, false);
+        canvas_.drawText(
+            okBox.x + 46, okBox.y + 22,
+            isNativeVst2
+                ? "ALL NATIVE VST2 SANITY CHECKS PASSED (MPC OS >= 3.10)"
+                : "ALL SANITY CHECKS PASSED (0 ANOMALIES IN STAGED /tmp/MPC.settings.new)",
+            Palette::StatusGreen, 1, true
+        );
+        canvas_.drawText(
+            okBox.x + 46, okBox.y + 48,
+            isNativeVst2
+                ? "No KNOWNPLUGINS or VST2 SynthContentLocations entries in MPC.settings; plugins reside at <Mount>/VST2 Plugins."
+                : "Every plugin folder in writable VST2 Plugins locations is registered in KNOWNPLUGINS, and all .so paths exist.",
+            Palette::TextSecondary, 1, false
+        );
     } else {
         int maxOffset = std::max(0, static_cast<int>(sanityIssues_.size()) - maxVisible);
         if (sanityScrollOffset_ > maxOffset) sanityScrollOffset_ = maxOffset;
@@ -2043,31 +2099,63 @@ void PluginManagerView::drawMpcSanitySubTab() {
         for (size_t i = start; i < end; ++i) {
             bool isSel = (static_cast<int>(i) == selectedSanityIdx_);
             const auto& iss = sanityIssues_[i];
-            bool isOrphan = (iss.type == config::SanityCheckIssue::ORPHAN_SYNTH_DIR);
+
+            std::string badgeLabel = "1. ORPHAN SYNTH";
+            Color badgeBg = Color(54, 38, 14);
+            Color badgeFg = Palette::AmberGold;
+            std::string detailPath = "Dir: " + iss.dirPath;
+            std::string primaryBtnLabel = "REPAIR";
+            bool allowDelete = true;
+
+            if (iss.type == config::SanityCheckIssue::MISSING_SO_PATH) {
+                badgeLabel = "2. MISSING .SO";
+                badgeBg = Color(58, 18, 24);
+                badgeFg = Color(255, 110, 120);
+                detailPath = "Missing: " + iss.soPath;
+            } else if (iss.type == config::SanityCheckIssue::LEGACY_KNOWNPLUGINS) {
+                badgeLabel = "1. KNOWNPLUGINS";
+                badgeBg = Color(54, 38, 14);
+                badgeFg = Palette::AmberGold;
+                detailPath = iss.dirPath;
+                primaryBtnLabel = "PURGE ALL";
+                allowDelete = false;
+            } else if (iss.type == config::SanityCheckIssue::OUTSIDE_VST2_LOCATION) {
+                badgeLabel = "2. OUTSIDE VST2";
+                badgeBg = Color(24, 42, 62);
+                badgeFg = Color(120, 200, 255);
+                detailPath = "Outside mount-root VST2 Plugins: " + iss.dirPath;
+                primaryBtnLabel = "REINSTALL";
+            } else if (iss.type == config::SanityCheckIssue::LEGACY_SYNTH_VST2_LOCATIONS) {
+                badgeLabel = "3. SYNTHLOCATIONS";
+                badgeBg = Color(48, 28, 56);
+                badgeFg = Color(216, 160, 255);
+                detailPath = "Purge VST2 Plugins <Location> entries in MPC.settings: " + iss.dirPath;
+                primaryBtnLabel = "PURGE ALL";
+                allowDelete = false;
+            }
 
             Rect rRow = {bTop.x + 18, rowY, bTop.w - 36, rowH};
             canvas_.drawPanel(rRow, 6, isSel ? Color(40, 24, 32) : Color(18, 18, 24), isSel ? Palette::AkaiCrimson : Color(44, 44, 56), isSel ? 2.0f : 1.0f);
 
             // Type Badge
             Rect rBadge = {rRow.x + 10, rRow.y + 12, 150, 34};
-            Color badgeBg = isOrphan ? Color(54, 38, 14) : Color(58, 18, 24);
-            Color badgeFg = isOrphan ? Palette::AmberGold : Color(255, 110, 120);
             canvas_.drawPanel(rBadge, 4, badgeBg, badgeFg, 1.0f);
-            canvas_.drawTextCentered(rBadge, isOrphan ? "1. ORPHAN SYNTH" : "2. MISSING .SO", badgeFg, 1, true);
+            canvas_.drawTextCentered(rBadge, badgeLabel, badgeFg, 1, true);
 
             // Plugin Name & Path
             canvas_.drawTextClipped({rRow.x + 172, rRow.y + 8, 610, 22}, iss.pluginName, Palette::TextPrimary, 1, true);
-            std::string detailPath = isOrphan ? ("Dir: " + iss.dirPath) : ("Missing: " + iss.soPath);
             canvas_.drawTextClipped({rRow.x + 172, rRow.y + 32, 610, 20}, detailPath, Palette::TextSecondary, 1, false);
 
-            // 3 Action Buttons: REPAIR, DELETE, IGNORE
+            // Action Buttons
             Rect btnRep = {rRow.x + 796, rRow.y + 9, 122, 40};
             canvas_.drawPanel(btnRep, 6, Color(20, 82, 46), Palette::StatusGreen, 1.0f);
-            canvas_.drawTextCentered(btnRep, "REPAIR", Palette::TextPrimary, 1, true);
+            canvas_.drawTextCentered(btnRep, primaryBtnLabel, Palette::TextPrimary, 1, true);
 
-            Rect btnDel = {rRow.x + 926, rRow.y + 9, 122, 40};
-            canvas_.drawPanel(btnDel, 6, Color(88, 22, 32), Palette::AkaiCrimson, 1.0f);
-            canvas_.drawTextCentered(btnDel, "DELETE", Palette::TextPrimary, 1, true);
+            if (allowDelete) {
+                Rect btnDel = {rRow.x + 926, rRow.y + 9, 122, 40};
+                canvas_.drawPanel(btnDel, 6, Color(88, 22, 32), Palette::AkaiCrimson, 1.0f);
+                canvas_.drawTextCentered(btnDel, "DELETE", Palette::TextPrimary, 1, true);
+            }
 
             Rect btnIgn = {rRow.x + 1056, rRow.y + 9, 118, 40};
             canvas_.drawPanel(btnIgn, 6, Color(36, 36, 46), Color(82, 82, 98), 1.0f);
@@ -2078,20 +2166,26 @@ void PluginManagerView::drawMpcSanitySubTab() {
     }
 
     // Bottom Box: Check 3 (Apply .so path modifications to all installed plugin presets .xpl)
-    Rect bBot = {30, 594, W - 60, 166};
+    Rect bBot = {30, 602, W - 60, 158};
     canvas_.drawPanel(bBot, 10, Color(24, 24, 30), Color(46, 46, 58), 1.0f);
     canvas_.drawText(bBot.x + 20, bBot.y + 16, "3. APPLY .SO PATHS TO INSTALLED PLUGIN PRESETS (.XPL)", Palette::AmberGold, 1, true);
     canvas_.drawHLine(bBot.x + 20, bBot.y + 40, bBot.w - 40, Color(46, 46, 58));
 
-    canvas_.drawText(bBot.x + 20, bBot.y + 54, "Scans Presets/*.xpl for every plugin in staged /tmp/MPC.settings.new and updates <PLUGIN file='...'/>", Palette::TextSecondary, 1, false);
+    canvas_.drawText(
+        bBot.x + 20, bBot.y + 54,
+        isNativeVst2
+            ? "Scans Presets/*.xpl for every plugin in VST2 Plugins folders and updates <PLUGIN file='...'/>"
+            : "Scans Presets/*.xpl for every plugin in staged /tmp/MPC.settings.new and updates <PLUGIN file='...'/>",
+        Palette::TextSecondary, 1, false
+    );
     canvas_.drawText(bBot.x + 20, bBot.y + 78, "with the target .so path (preserving <version file='1'/> and binary <state> payload).", Palette::TextMuted, 1, false);
 
     if (!settingsStatusMsg_.empty()) {
         Color stCol = (settingsStatusColor_ == 2) ? Color(255, 110, 120) : Palette::StatusGreen;
-        canvas_.drawTextClipped({bBot.x + 20, bBot.y + 116, 780, 26}, settingsStatusMsg_, stCol, 1, true);
+        canvas_.drawTextClipped({bBot.x + 20, bBot.y + 114, 780, 26}, settingsStatusMsg_, stCol, 1, true);
     }
 
-    Rect applyPresetsBtn = {bBot.x + bBot.w - 380, bBot.y + 56, 360, 64};
+    Rect applyPresetsBtn = {bBot.x + bBot.w - 380, bBot.y + 52, 360, 64};
     canvas_.drawPanel(applyPresetsBtn, 8, Palette::AkaiCrimson, Color(255, 100, 120), 1.5f);
     canvas_.drawTextCentered(applyPresetsBtn, "APPLY TO ALL PRESETS (.XPL)", Palette::TextPrimary, 1, true);
 }
@@ -2104,24 +2198,27 @@ void PluginManagerView::onWheelDelta(int delta) {
                 selectedBackupIdx_ = std::max(0, std::min(static_cast<int>(mpcBackups_.size()) - 1, selectedBackupIdx_ + delta));
                 if (selectedBackupIdx_ < backupScrollOffset_) {
                     backupScrollOffset_ = selectedBackupIdx_;
-                } else if (selectedBackupIdx_ >= backupScrollOffset_ + 10) {
-                    backupScrollOffset_ = selectedBackupIdx_ - 9;
+                } else if (selectedBackupIdx_ >= backupScrollOffset_ + 9) {
+                    backupScrollOffset_ = selectedBackupIdx_ - 8;
                 }
                 render();
-            } else if (mpcSettingsSubTab_ == 3 && !bootLogLines_.empty()) {
-                int maxOffset = std::max(0, static_cast<int>(bootLogLines_.size()) - 18);
+            } else if (mpcSettingsSubTab_ == 1 && !bootLogLines_.empty()) {
+                int maxOffset = std::max(0, static_cast<int>(bootLogLines_.size()) - 16);
                 bootLogScrollOffset_ = std::max(0, std::min(maxOffset, bootLogScrollOffset_ + delta * 3));
                 render();
-            } else if (mpcSettingsSubTab_ == 4 && !sanityIssues_.empty()) {
+            } else if (mpcSettingsSubTab_ == 2 && !sanityIssues_.empty()) {
                 selectedSanityIdx_ = std::max(0, std::min(static_cast<int>(sanityIssues_.size()) - 1, selectedSanityIdx_ + delta));
                 if (selectedSanityIdx_ < sanityScrollOffset_) {
                     sanityScrollOffset_ = selectedSanityIdx_;
-                } else if (selectedSanityIdx_ >= sanityScrollOffset_ + 6) {
-                    sanityScrollOffset_ = selectedSanityIdx_ - 5;
+                } else if (selectedSanityIdx_ >= sanityScrollOffset_ + 5) {
+                    sanityScrollOffset_ = selectedSanityIdx_ - 4;
                 }
                 render();
             }
         }
+        return;
+    }
+    if (uiState_ == UIState::V310_WARNING_POPUP) {
         return;
     }
     if (uiState_ == UIState::INSTALL_POPUP) {
@@ -2143,10 +2240,10 @@ void PluginManagerView::onWheelPress() {
         if (settingsTab_ == 1) {
             if (mpcSettingsSubTab_ == 0) {
                 openRestoreBackupPopup();
-            } else if (mpcSettingsSubTab_ == 3) {
+            } else if (mpcSettingsSubTab_ == 1) {
                 refreshBootLogs();
                 render();
-            } else if (mpcSettingsSubTab_ == 4) {
+            } else if (mpcSettingsSubTab_ == 2) {
                 if (!sanityIssues_.empty() && selectedSanityIdx_ >= 0 && selectedSanityIdx_ < static_cast<int>(sanityIssues_.size())) {
                     std::string msg;
                     bool ok = config::ConfigParser::repairSanityIssue(config_, sanityIssues_[selectedSanityIdx_], msg);
@@ -2189,6 +2286,10 @@ void PluginManagerView::onWheelPress() {
         triggerCatalogRefresh();
         return;
     }
+    if (uiState_ == UIState::V310_WARNING_POPUP) {
+        openSanityChecksFromWarning();
+        return;
+    }
     if (uiState_ == UIState::INSTALL_POPUP) {
         confirmInstall();
         return;
@@ -2213,6 +2314,10 @@ void PluginManagerView::onWheelPress() {
 
 void PluginManagerView::onMenuButton() {
     if (wakeIfScreensaver()) return;
+    if (uiState_ == UIState::V310_WARNING_POPUP) {
+        closeV310WarningPopup();
+        return;
+    }
     if (uiState_ == UIState::RESTORE_BACKUP_POPUP) {
         closeRestoreBackupPopup();
         return;
@@ -2257,6 +2362,26 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
     if (wakeIfScreensaver()) return;
     int W = canvas_.getLogicalWidth();
     int H = canvas_.getLogicalHeight();
+
+    if (uiState_ == UIState::V310_WARNING_POPUP) {
+        int mw = 820;
+        int mh = 430;
+        int mx = (W - mw) / 2;
+        int my = (H - mh) / 2;
+        int btnY = my + 362;
+        // DISMISS button: {mx + 28, btnY, 240, 48}
+        if (lx >= mx + 24 && lx <= mx + 272 && ly >= btnY - 6 && ly <= btnY + 54) {
+            closeV310WarningPopup();
+            return;
+        }
+        // OPEN SANITY CHECKS button: {mx + mw - 28 - 350, btnY, 350, 48}
+        int sanityX = mx + mw - 28 - 350;
+        if (lx >= sanityX - 6 && lx <= sanityX + 356 && ly >= btnY - 6 && ly <= btnY + 54) {
+            openSanityChecksFromWarning();
+            return;
+        }
+        return;
+    }
 
     if (uiState_ == UIState::PURGE_POPUP) {
         int mw = 580;
@@ -2351,6 +2476,16 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
             closeInstallPopup();
             return;
         }
+        if (lx >= mx + 215 && lx <= mx + 405 && ly >= my + 570 && ly <= my + 635) {
+            if (!filteredItems_.empty()) {
+                const auto& ref = filteredItems_[selectedIndex_];
+                const auto& item = config_.sections[ref.sectionIdx].items[ref.itemIdx];
+                if (item.installed == 2) {
+                    triggerUninstall();
+                    return;
+                }
+            }
+        }
         if (lx >= mx + mw - 240 && lx <= mx + mw - 20 && ly >= my + 570 && ly <= my + 635) {
             confirmInstall();
             return;
@@ -2399,28 +2534,59 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
         // 2. Tab 0: PLUGIN MANAGER (x: 550..785, y: 8..55)
         if (lx >= 550 && lx <= 785 && ly >= 8 && ly <= 55) {
             settingsTab_ = 0;
+            settingsStatusMsg_.clear();
             render();
             return;
         }
         // 3. Tab 1: MPC SETTINGS (x: 795..1030, y: 8..55)
         if (lx >= 795 && lx <= 1030 && ly >= 8 && ly <= 55) {
             settingsTab_ = 1;
+            settingsStatusMsg_.clear();
             refreshMpcBackups();
+            if (mpcSettingsSubTab_ == 1) refreshBootLogs();
+            if (mpcSettingsSubTab_ == 2) refreshSanityChecks();
             render();
             return;
         }
-        // 4. Tab 1 interactions (MPC Settings with 5 sub-tabs)
+        // 4. Tab 0 interactions (Plugin Manager: Screen Rotation selector)
+        if (settingsTab_ == 0) {
+            if (ly >= 228 && ly <= 268) {
+                const int rotVals[4] = {0, 90, 180, 270};
+                const char* rotLabels[4] = {"No rotation", "90", "180", "270"};
+                const int rotBtnX[4] = {360, 507, 654, 801};
+                for (int i = 0; i < 4; ++i) {
+                    if (lx >= rotBtnX[i] - 4 && lx <= rotBtnX[i] + 139) {
+                        config_.screen_rotation = rotVals[i];
+                        canvas_.setRotation(rotVals[i]);
+                        bool saved = config::ConfigParser::saveToFile(config_.config_path, config_);
+                        config::ConfigParser::logMessage(
+                            "[TKGL-CFG] Screen rotation set to " + std::string(rotLabels[i]) +
+                            " (" + std::to_string(rotVals[i]) + " deg)" +
+                            (saved ? " and saved to mpc_plugins.conf." : " (warning: saveToFile failed).")
+                        );
+                        settingsStatusMsg_ = saved
+                            ? ("Rotation saved: " + std::string(rotLabels[i]))
+                            : "Error saving rotation to mpc_plugins.conf";
+                        settingsStatusColor_ = saved ? 1 : 2;
+                        render();
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        // 5. Tab 1 interactions (MPC Settings with 3 sub-tabs: ROLL BACK, BOOT LOG, SANITY CHECKS)
         if (settingsTab_ == 1) {
-            // Sub-tab selector row (y: 70..118)
-            if (ly >= 70 && ly <= 118) {
-                int subX[5] = {30, 277, 524, 771, 1018};
-                for (int i = 0; i < 5; ++i) {
-                    if (lx >= subX[i] && lx <= subX[i] + 232) {
+            // Sub-tab selector row (y: 118..166)
+            if (ly >= 118 && ly <= 166) {
+                int subX[3] = {30, 443, 856};
+                for (int i = 0; i < 3; ++i) {
+                    if (lx >= subX[i] && lx <= subX[i] + 394) {
                         mpcSettingsSubTab_ = i;
                         settingsStatusMsg_.clear();
                         if (i == 0) refreshMpcBackups();
-                        if (i == 3) refreshBootLogs();
-                        if (i == 4) refreshSanityChecks();
+                        if (i == 1) refreshBootLogs();
+                        if (i == 2) refreshSanityChecks();
                         render();
                         return;
                     }
@@ -2429,9 +2595,9 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
 
             if (mpcSettingsSubTab_ == 0) {
                 // Sub-tab 0: ROLL BACK
-                // Backup list item rows (y: 176..696, x: 40..940)
-                if (lx >= 40 && lx <= 940 && ly >= 176 && ly <= 696) {
-                    int row = (ly - 176) / 52;
+                // Backup list item rows (y: 222..690, stride 52, x: 40..940)
+                if (lx >= 40 && lx <= 940 && ly >= 222 && ly <= 690) {
+                    int row = (ly - 222) / 52;
                     int actualIdx = backupScrollOffset_ + row;
                     if (actualIdx >= 0 && actualIdx < static_cast<int>(mpcBackups_.size())) {
                         selectedBackupIdx_ = actualIdx;
@@ -2439,85 +2605,63 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
                         return;
                     }
                 }
-                // [ REFRESH LIST ] button (x: 960..1220, y: 172..226)
-                if (lx >= 960 && lx <= 1220 && ly >= 172 && ly <= 226) {
+                // [ REFRESH LIST ] button (x: 960..1220, y: 220..276)
+                if (lx >= 960 && lx <= 1220 && ly >= 220 && ly <= 276) {
                     refreshMpcBackups();
                     settingsStatusMsg_ = "Backup list refreshed.";
                     settingsStatusColor_ = 1;
                     render();
                     return;
                 }
-                // [ RESTORE BACKUP ] button (x: 960..1220, y: 234..294)
-                if (lx >= 960 && lx <= 1220 && ly >= 234 && ly <= 294) {
+                // [ RESTORE BACKUP ] button (x: 960..1220, y: 282..344)
+                if (lx >= 960 && lx <= 1220 && ly >= 282 && ly <= 344) {
                     openRestoreBackupPopup();
                     return;
                 }
-                // [ DELETE BACKUP ] button (x: 960..1220, y: 302..358)
-                if (lx >= 960 && lx <= 1220 && ly >= 302 && ly <= 358) {
+                // [ DELETE BACKUP ] button (x: 960..1220, y: 350..406)
+                if (lx >= 960 && lx <= 1220 && ly >= 350 && ly <= 406) {
                     openDeleteBackupPopup();
                     return;
                 }
-            } else if (mpcSettingsSubTab_ == 2) {
-                // Sub-tab 2: SSH
-                // Option 1 button / card: y: 196..356
-                if (lx >= 60 && lx <= W - 60 && ly >= 196 && ly <= 356) {
-                    std::string msg;
-                    config::ConfigParser::enableSshAccess(false, msg);
-                    sshEnabledMode_ = 1;
-                    settingsStatusMsg_ = msg;
-                    settingsStatusColor_ = 1;
-                    render();
-                    return;
-                }
-                // Option 2 button / card: y: 386..546
-                if (lx >= 60 && lx <= W - 60 && ly >= 386 && ly <= 546) {
-                    std::string msg;
-                    config::ConfigParser::enableSshAccess(true, msg);
-                    sshEnabledMode_ = 2;
-                    settingsStatusMsg_ = msg;
-                    settingsStatusColor_ = 1;
-                    render();
-                    return;
-                }
-            } else if (mpcSettingsSubTab_ == 3) {
-                // Sub-tab 3: BOOT LOG
-                // [ REFRESH LOG ] button: x: 1030..1240, y: 130..172
-                if (lx >= 1030 && lx <= 1240 && ly >= 130 && ly <= 172) {
+            } else if (mpcSettingsSubTab_ == 1) {
+                // Sub-tab 1: BOOT LOG
+                // [ REFRESH LOG ] button: x: 1040..1240, y: 178..220
+                if (lx >= 1040 && lx <= 1240 && ly >= 178 && ly <= 220) {
                     refreshBootLogs();
                     render();
                     return;
                 }
-                // [ UP ] button: x: 1150..1250, y: 180..310
-                if (lx >= 1150 && lx <= 1250 && ly >= 180 && ly <= 310) {
+                // [ UP ] button: x: 1158..1244, y: 226..354
+                if (lx >= 1158 && lx <= 1244 && ly >= 226 && ly <= 354) {
                     bootLogScrollOffset_ = std::max(0, bootLogScrollOffset_ - 8);
                     render();
                     return;
                 }
-                // [ DOWN ] button: x: 1150..1250, y: 615..750
-                if (lx >= 1150 && lx <= 1250 && ly >= 615 && ly <= 750) {
-                    int maxOffset = std::max(0, static_cast<int>(bootLogLines_.size()) - 18);
+                // [ DOWN ] button: x: 1158..1244, y: 622..750
+                if (lx >= 1158 && lx <= 1244 && ly >= 622 && ly <= 750) {
+                    int maxOffset = std::max(0, static_cast<int>(bootLogLines_.size()) - 16);
                     bootLogScrollOffset_ = std::min(maxOffset, bootLogScrollOffset_ + 8);
                     render();
                     return;
                 }
-            } else if (mpcSettingsSubTab_ == 4) {
-                // Sub-tab 4: SANITY CHECKS
-                // [ SCAN NOW ] button: x: 1030..1240, y: 130..172
-                if (lx >= 1030 && lx <= 1240 && ly >= 130 && ly <= 172) {
+            } else if (mpcSettingsSubTab_ == 2) {
+                // Sub-tab 2: SANITY CHECKS
+                // [ SCAN NOW ] button: x: 1040..1240, y: 178..220
+                if (lx >= 1040 && lx <= 1240 && ly >= 178 && ly <= 220) {
                     refreshSanityChecks();
                     settingsStatusMsg_ = "Sanity check scan completed (" + std::to_string(sanityIssues_.size()) + " issue(s) found).";
                     settingsStatusColor_ = 1;
                     render();
                     return;
                 }
-                // Issue rows (y: 182..566, row stride = 64)
-                if (ly >= 182 && ly <= 566 && !sanityIssues_.empty()) {
-                    int row = (ly - 182) / 64;
+                // Issue rows (y: 228..548, row stride = 64)
+                if (ly >= 228 && ly <= 548 && !sanityIssues_.empty()) {
+                    int row = (ly - 228) / 64;
                     int actualIdx = sanityScrollOffset_ + row;
                     if (actualIdx >= 0 && actualIdx < static_cast<int>(sanityIssues_.size())) {
                         selectedSanityIdx_ = actualIdx;
                         const auto issueCopy = sanityIssues_[actualIdx];
-                        // [ REPAIR ] button: x: 840..968
+                        // [ REPAIR / PURGE ALL / REINSTALL ] button: x: 840..968
                         if (lx >= 840 && lx <= 968) {
                             std::string msg;
                             bool ok = config::ConfigParser::repairSanityIssue(config_, issueCopy, msg);
@@ -2528,8 +2672,10 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
                             render();
                             return;
                         }
-                        // [ DELETE ] button: x: 970..1098
-                        if (lx >= 970 && lx <= 1098) {
+                        // [ DELETE ] button: x: 970..1098 (not applicable to LEGACY_KNOWNPLUGINS or LEGACY_SYNTH_VST2_LOCATIONS)
+                        if (issueCopy.type != config::SanityCheckIssue::LEGACY_KNOWNPLUGINS &&
+                            issueCopy.type != config::SanityCheckIssue::LEGACY_SYNTH_VST2_LOCATIONS &&
+                            lx >= 970 && lx <= 1098) {
                             std::string msg;
                             bool ok = config::ConfigParser::deleteSanityIssue(config_, issueCopy, msg);
                             settingsStatusMsg_ = msg;
@@ -2554,8 +2700,8 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
                         return;
                     }
                 }
-                // [ APPLY TO ALL PRESETS (.XPL) ] button: x: 860..1240, y: 645..725
-                if (lx >= 860 && lx <= 1240 && ly >= 645 && ly <= 725) {
+                // [ APPLY TO ALL PRESETS (.XPL) ] button: x: 860..1240, y: 648..724
+                if (lx >= 860 && lx <= 1240 && ly >= 648 && ly <= 724) {
                     int plugCnt = 0;
                     std::string msg;
                     config::ConfigParser::applyPresetsPathsForAllInstalled(config_, plugCnt, msg);
@@ -2620,8 +2766,8 @@ void PluginManagerView::onTouchDown(int lx, int ly) {
                 return;
             }
 
-            // UNINSTALL button (close to REINSTALL when installed & healthy (installed == 1), W - 356 .. W - 200)
-            if (item.installed == 1 && lx >= W - 360 && lx <= W - 200 && ly >= 72 && ly <= 132) {
+            // UNINSTALL button (available when installed & healthy (1) OR broken (2), W - 356 .. W - 200)
+            if ((item.installed == 1 || item.installed == 2) && lx >= W - 360 && lx <= W - 200 && ly >= 72 && ly <= 132) {
                 triggerUninstall();
                 return;
             }

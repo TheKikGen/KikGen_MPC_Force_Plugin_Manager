@@ -33,7 +33,23 @@ static void sig_handler(int) {
     g_running = false;
 }
 
-static bool find_mpc_private_midi(char* out_device, size_t max_len) {
+struct AkaiMidiPortCandidate {
+    std::string device; // e.g. "hw:1,0,0" or "hw:1,0,1"
+    std::string label;  // e.g. "Akai Pro Force Public" or "MPC Private"
+};
+
+static std::vector<AkaiMidiPortCandidate> find_mpc_public_private_midi_ports() {
+    std::vector<AkaiMidiPortCandidate> ports;
+
+    auto addUniquePort = [&](const std::string& devStr, const std::string& labelStr) {
+        for (const auto& p : ports) {
+            if (p.device == devStr) return;
+        }
+        ports.push_back({ devStr, labelStr });
+    };
+
+    // Pass 1: Scan all ALSA RawMIDI subdevices whose name explicitly contains "Public" or "Private"
+    // (e.g. "Akai Pro Force Public", "Akai Pro Force Private", "MPC Public", "MPC Private", "MPC Studio Live Public/Private")
     int card = -1;
     while (snd_card_next(&card) >= 0 && card >= 0) {
         snd_ctl_t* ctl = nullptr;
@@ -47,63 +63,172 @@ static bool find_mpc_private_midi(char* out_device, size_t max_len) {
             snd_rawmidi_info_alloca(&info);
             snd_rawmidi_info_set_device(info, dev);
             snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
-            snd_ctl_rawmidi_info(ctl, info);
+            snd_rawmidi_info_set_subdevice(info, 0);
+            if (snd_ctl_rawmidi_info(ctl, info) < 0) continue;
 
             int subs = snd_rawmidi_info_get_subdevices_count(info);
             for (int sub = 0; sub < subs; ++sub) {
                 snd_rawmidi_info_set_subdevice(info, sub);
                 if (snd_ctl_rawmidi_info(ctl, info) == 0) {
                     const char* sub_name = snd_rawmidi_info_get_subdevice_name(info);
-                    if (sub_name && std::strstr(sub_name, "Private") != nullptr) {
-                        std::snprintf(out_device, max_len, "hw:%d,%d,%d", card, dev, sub);
-                        snd_ctl_close(ctl);
-                        return true;
+                    if (sub_name && (std::strstr(sub_name, "Public") != nullptr || std::strstr(sub_name, "Private") != nullptr)) {
+                        char hw_buf[32];
+                        std::snprintf(hw_buf, sizeof(hw_buf), "hw:%d,%d,%d", card, dev, sub);
+                        addUniquePort(hw_buf, sub_name);
                     }
                 }
             }
         }
         snd_ctl_close(ctl);
     }
-    return false;
-}
 
-static void midi_thread_func(tkgl::ui::PluginManagerView* ui) {
-    char midi_dev[64] = {0};
-    if (!find_mpc_private_midi(midi_dev, sizeof(midi_dev))) {
-        std::snprintf(midi_dev, sizeof(midi_dev), "hw:0,0,1");
-    }
+    // Pass 2: If no subdevice explicitly named "Public" or "Private" was returned by the kernel driver,
+    // check any ALSA card/rawmidi device matching "Force", "MPC", or "Akai" and include Subdevice 0 (Public) & Subdevice 1 (Private)
+    if (ports.empty()) {
+        card = -1;
+        while (snd_card_next(&card) >= 0 && card >= 0) {
+            snd_ctl_t* ctl = nullptr;
+            char ctl_name[32];
+            std::snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
+            if (snd_ctl_open(&ctl, ctl_name, 0) < 0) continue;
 
-    snd_rawmidi_t* midi_in = nullptr;
-    if (snd_rawmidi_open(&midi_in, nullptr, midi_dev, SND_RAWMIDI_NONBLOCK) < 0) {
-        std::snprintf(midi_dev, sizeof(midi_dev), "hw:1,0,1");
-        if (snd_rawmidi_open(&midi_in, nullptr, midi_dev, SND_RAWMIDI_NONBLOCK) < 0) {
-            std::fprintf(stderr, "[TKGL-MIDI] Could not open ALSA Private MIDI port.\n");
-            return;
+            char* card_name_ptr = nullptr;
+            snd_card_get_name(card, &card_name_ptr);
+            std::string cardName = card_name_ptr ? card_name_ptr : "";
+            if (card_name_ptr) std::free(card_name_ptr);
+
+            int dev = -1;
+            while (snd_ctl_rawmidi_next_device(ctl, &dev) >= 0 && dev >= 0) {
+                snd_rawmidi_info_t* info;
+                snd_rawmidi_info_alloca(&info);
+                snd_rawmidi_info_set_device(info, dev);
+                snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
+                snd_rawmidi_info_set_subdevice(info, 0);
+                if (snd_ctl_rawmidi_info(ctl, info) < 0) continue;
+
+                const char* rm_name = snd_rawmidi_info_get_name(info);
+                std::string rmName = rm_name ? rm_name : "";
+                int subs = snd_rawmidi_info_get_subdevices_count(info);
+
+                bool isAkaiSurface =
+                    cardName.find("Force") != std::string::npos ||
+                    cardName.find("MPC")   != std::string::npos ||
+                    cardName.find("Akai")  != std::string::npos ||
+                    rmName.find("Force")   != std::string::npos ||
+                    rmName.find("MPC")     != std::string::npos ||
+                    rmName.find("Akai")    != std::string::npos;
+
+                if (isAkaiSurface && subs >= 1) {
+                    std::string baseLabel = !rmName.empty() ? rmName : cardName;
+                    char hw0[32];
+                    std::snprintf(hw0, sizeof(hw0), "hw:%d,%d,0", card, dev);
+                    addUniquePort(hw0, baseLabel + " Public");
+                    if (subs >= 2) {
+                        char hw1[32];
+                        std::snprintf(hw1, sizeof(hw1), "hw:%d,%d,1", card, dev);
+                        addUniquePort(hw1, baseLabel + " Private");
+                    }
+                }
+            }
+            snd_ctl_close(ctl);
         }
     }
-    std::printf("[TKGL-MIDI] Listening on ALSA Private port: %s\n", midi_dev);
 
-    uint8_t status = 0;
-    uint8_t data[2] = {0, 0};
-    int data_idx = 0;
-    uint8_t raw_buf[32];
+    return ports;
+}
+
+struct OpenMidiPortState {
+    std::string    device;
+    std::string    label;
+    snd_rawmidi_t* handle         = nullptr;
+    uint8_t        status         = 0;
+    uint8_t        data[2]        = {0, 0};
+    int            data_idx       = 0;
+    bool           activityLogged = false;
+};
+
+static void midi_thread_func(tkgl::ui::PluginManagerView* ui) {
+    auto candidates = find_mpc_public_private_midi_ports();
+    if (candidates.empty()) {
+        candidates.push_back({ "hw:1,0,0", "Fallback Public (hw:1,0,0)" });
+        candidates.push_back({ "hw:1,0,1", "Fallback Private (hw:1,0,1)" });
+        candidates.push_back({ "hw:0,0,0", "Fallback Public (hw:0,0,0)" });
+        candidates.push_back({ "hw:0,0,1", "Fallback Private (hw:0,0,1)" });
+    }
+
+    std::vector<OpenMidiPortState> openPorts;
+    for (const auto& cand : candidates) {
+        snd_rawmidi_t* h = nullptr;
+        if (snd_rawmidi_open(&h, nullptr, cand.device.c_str(), SND_RAWMIDI_NONBLOCK) >= 0 && h != nullptr) {
+            OpenMidiPortState st;
+            st.device = cand.device;
+            st.label  = cand.label;
+            st.handle = h;
+            openPorts.push_back(st);
+
+            std::string scanMsg = "[TKGL-MIDI] Opened persistent Public/Private port: " + st.device + " [" + st.label + "]";
+            std::printf("%s\n", scanMsg.c_str());
+            tkgl::config::ConfigParser::logMessage(scanMsg);
+        }
+    }
+
+    if (openPorts.empty()) {
+        std::string errMsg = "[TKGL-MIDI] ERROR: Could not open any ALSA Public or Private MIDI port (hw:X,0,0 / hw:X,0,1).";
+        std::fprintf(stderr, "%s\n", errMsg.c_str());
+        tkgl::config::ConfigParser::logMessage(errMsg);
+        return;
+    }
+
+    {
+        std::string sessMsg = "[TKGL-MIDI] Dual-port session scan active across " +
+            std::to_string(openPorts.size()) + " port(s) for entire session (Public + Private sleep-safe monitoring).";
+        std::printf("%s\n", sessMsg.c_str());
+        tkgl::config::ConfigParser::logMessage(sessMsg);
+    }
+
+    uint8_t raw_buf[64];
 
     while (g_running) {
-        ssize_t n = snd_rawmidi_read(midi_in, raw_buf, sizeof(raw_buf));
-        if (n > 0) {
+        bool anyRead = false;
+
+        // Maintain scan across ALL opened Public & Private ports for the entire session
+        // (either port may enter controller sleep unexpectedly on MPC/Force firmware).
+        for (size_t p = 0; p < openPorts.size(); ++p) {
+            auto& port = openPorts[p];
+            if (!port.handle) continue;
+
+            ssize_t n = snd_rawmidi_read(port.handle, raw_buf, sizeof(raw_buf));
+            if (n <= 0) continue;
+            anyRead = true;
+
             for (ssize_t i = 0; i < n; ++i) {
                 uint8_t b = raw_buf[i];
+                // Ignore MIDI Real-Time bytes (0xF8..0xFF) without disrupting running status
                 if (b >= 0xF8) continue;
+                // Ignore System Common / SysEx framing (0xF0..0xF7) and clear running status so SysEx payload bytes are skipped
+                if (b >= 0xF0) {
+                    port.status = 0;
+                    port.data_idx = 0;
+                    continue;
+                }
                 if (b & 0x80) {
-                    status = b & 0xF0;
-                    data_idx = 0;
-                } else if (status != 0) {
-                    data[data_idx++] = b;
-                    int expected = (status == 0xC0 || status == 0xD0) ? 1 : 2;
-                    if (data_idx >= expected) {
-                        uint8_t d1 = data[0];
-                        uint8_t d2 = (expected == 2) ? data[1] : 0;
-                        data_idx = 0;
+                    port.status = b & 0xF0;
+                    port.data_idx = 0;
+                } else if (port.status != 0) {
+                    port.data[port.data_idx++] = b;
+                    int expected = (port.status == 0xC0 || port.status == 0xD0) ? 1 : 2;
+                    if (port.data_idx >= expected) {
+                        uint8_t d1 = port.data[0];
+                        uint8_t d2 = (expected == 2) ? port.data[1] : 0;
+                        port.data_idx = 0;
+
+                        if (!port.activityLogged) {
+                            port.activityLogged = true;
+                            std::string actMsg = "[TKGL-MIDI] Active MIDI traffic received on persistent port: " +
+                                port.device + " [" + port.label + "]";
+                            std::printf("%s\n", actMsg.c_str());
+                            tkgl::config::ConfigParser::logMessage(actMsg);
+                        }
 
                         std::lock_guard<std::mutex> lock(g_ui_mutex);
                         // Wake from screensaver on ANY MIDI message (pads, Q-Links, buttons, wheel)
@@ -112,21 +237,31 @@ static void midi_thread_func(tkgl::ui::PluginManagerView* ui) {
                             continue;
                         }
                         ui->onAnyInput();
-                        if (status == 0xB0 && d1 == 0x64) {
-                            // Data Wheel rotation: B0 64 01 (CW) / B0 64 7F (CCW)
+
+                        if (port.status == 0xB0 && d1 == 0x64) {
+                            // Hardware-confirmed JOG WHEEL rotation across all MPC & Force devices:
+                            //   CW  Turn: B0 64 01 (0x01..0x3F)
+                            //   CCW Turn: B0 64 7F (0x7F..0x40)
                             int delta = (d2 < 64) ? static_cast<int>(d2) : (static_cast<int>(d2) - 128);
                             ui->onWheelDelta(delta);
-                        } else if (status == 0x90 && d2 > 0) {
-                            // MPC Internal MIDI Controller Note Mapping (TheKikGen MPC-LiveXplore):
-                            // - 0x6F (90 6F 7F): Data Wheel Push -> Enter / Install
-                            // - 0x37 (90 37 7F): Minus (-) Button -> Back (same as < BACK touch button)
-                            // - 0x36 (90 36 7F): Plus (+) Button  -> Next / Enter
-                            // - 0x7B (90 7B 7F): MENU Button      -> Back to Menu
-                            // - 0x34 (90 34 7F): MAIN Button      -> Back to Menu
-                            if (d1 == 0x37 || d1 == 0x7B || d1 == 0x34) {
+                        } else if (port.status == 0x90 && d2 > 0) {
+                            // Hardware-confirmed JOG WHEEL Push & Buttons:
+                            // - 0x6F (90 6F 7F): JOG WHEEL APPUI (Release = 90 6F 00) -> Enter / Confirm
+                            // - 0x36 (90 36 7F): PLUS (+) Button  -> Enter / Confirm
+                            // - 0x20 (90 20 7F): ENCODER PUSH alt -> Enter / Confirm
+                            // - 0x02 (90 02 7F): MENU Button (Akai Force) -> Back / Menu
+                            // - 0x00 (90 00 7F): NAVIGATE Button (Akai Force) -> Back / Menu
+                            // - 0x7B (90 7B 7F): MENU Button (MPC) -> Back / Menu
+                            // - 0x34 (90 34 7F): MAIN Button (MPC) -> Back / Menu
+                            // - 0x37 (90 37 7F): MINUS (-) Button (MPC) -> Back / Menu
+                            if (d1 == 0x02 || d1 == 0x00 || d1 == 0x37 || d1 == 0x7B || d1 == 0x34) {
                                 ui->onMenuButton();
-                            } else if (d1 == 0x6F || d1 == 0x36) {
+                            } else if (d1 == 0x6F || d1 == 0x36 || d1 == 0x20) {
                                 ui->onWheelPress();
+                            } else if (d1 == 0x21 || d1 == 0x3D) {
+                                ui->onWheelDelta(-1);
+                            } else if (d1 == 0x22 || d1 == 0x3E) {
+                                ui->onWheelDelta(1);
                             }
                             if (ui->shouldExit()) {
                                 g_running = false;
@@ -135,11 +270,23 @@ static void midi_thread_func(tkgl::ui::PluginManagerView* ui) {
                     }
                 }
             }
-        } else {
+        }
+
+        if (!anyRead) {
             usleep(4000);
         }
     }
-    snd_rawmidi_close(midi_in);
+
+    for (auto& port : openPorts) {
+        if (port.handle) {
+            snd_rawmidi_close(port.handle);
+            port.handle = nullptr;
+            std::string closeMsg = "[TKGL-MIDI] Closed persistent MIDI port cleanly at session end: " +
+                port.device + " [" + port.label + "]";
+            std::printf("%s\n", closeMsg.c_str());
+            tkgl::config::ConfigParser::logMessage(closeMsg);
+        }
+    }
 }
 
 static void touch_thread_func(tkgl::gfx::DrmFramebufferCanvas* canvas, tkgl::ui::PluginManagerView* ui) {

@@ -27,7 +27,8 @@ enum class UIState {
     PURGE_POPUP   = 6, // Confirmation Popup to delete/purge local cached ZIP package
     SETTINGS_SCREEN = 7, // Advanced Settings (Tab 1: Plugin Manager / Tab 2: MPC Settings & Rollback)
     RESTORE_BACKUP_POPUP = 8, // Confirmation Modal before restoring selected MPC.settings backup
-    DELETE_BACKUP_POPUP  = 9  // Confirmation Modal before permanently deleting selected backup
+    DELETE_BACKUP_POPUP  = 9, // Confirmation Modal before permanently deleting selected backup
+    V310_WARNING_POPUP   = 10 // MPC OS >= 3.10 startup alert when legacy VST2/KNOWNPLUGINS exist in MPC.settings
 };
 
 enum class FilterTab {
@@ -65,18 +66,18 @@ private:
     int                                selectedSynthLocIdx_ = 0;
 
     int                                settingsTab_          = 0; // 0 = Plugin Manager, 1 = MPC Settings
-    int                                mpcSettingsSubTab_    = 0; // 0 = ROLL BACK, 1 = LIMITS, 2 = SSH, 3 = BOOT LOG, 4 = SANITY CHECKS
+    int                                mpcSettingsSubTab_    = 0; // 0 = ROLL BACK, 1 = BOOT LOG, 2 = SANITY CHECKS
     std::vector<config::MpcSettingsBackup> mpcBackups_;
     int                                selectedBackupIdx_    = 0;
     int                                backupScrollOffset_   = 0;
     std::vector<std::string>           bootLogLines_;
     int                                bootLogScrollOffset_  = 0;
-    int                                sshEnabledMode_       = 0; // 0=inactive, 1=session, 2=permanent
     std::vector<config::SanityCheckIssue> sanityIssues_;
     int                                selectedSanityIdx_    = 0;
     int                                sanityScrollOffset_   = 0;
     std::string                        settingsStatusMsg_;
     int                                settingsStatusColor_  = 0; // 0=none, 1=green, 2=red
+    config::MpcV310StartupWarnings     v310Warnings_;
 
     bool                               isScreensaver_       = false;
     std::time_t                        lastActivityTime_    = 0;
@@ -106,6 +107,8 @@ private:
     void closePurgePopup();
     void openSettingsScreen();
     void closeSettingsScreen();
+    void openSanityChecksFromWarning();
+    void closeV310WarningPopup();
     void refreshMpcBackups();
     void refreshBootLogs();
     void refreshSanityChecks();
@@ -126,12 +129,11 @@ private:
     void drawPurgePopup();
     void drawRestoreBackupPopup();
     void drawDeleteBackupPopup();
+    void drawV310WarningPopup();
     void drawSettingsScreen();
     void drawPluginManagerSettingsTab();
     void drawMpcSettingsTab();
     void drawMpcRollbackSubTab();
-    void drawMpcLimitsSubTab();
-    void drawMpcSshSubTab();
     void drawMpcBootLogSubTab();
     void drawMpcSanitySubTab();
     void drawExecutionScreen();
